@@ -276,14 +276,14 @@ version = "57.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "582f1459cdc77a082b345f03c7be047ec9b80221d50325398d47c88fad54188e"
 dependencies = [
- "arrow-array 57.3.0",
- "arrow-buffer 57.3.0",
- "arrow-schema 57.3.0",
+ "arrow-array 57.3.1",
+ "arrow-buffer 57.3.1",
+ "arrow-schema 57.3.1",
  "bzip2 0.6.1",
  "crc",
  "flate2",
  "indexmap",
- "rand 0.9.2",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "snap",
@@ -2484,9 +2484,9 @@ name = "daft-avro"
 version = "0.3.0-dev0"
 dependencies = [
  "arrow",
- "arrow-array 57.3.0",
+ "arrow-array 57.3.1",
  "arrow-avro",
- "arrow-schema 57.3.0",
+ "arrow-schema 57.3.1",
  "common-error",
  "common-py-serde",
  "common-runtime",
