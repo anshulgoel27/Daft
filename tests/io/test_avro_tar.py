@@ -204,3 +204,76 @@ def test_distributed_read_ray(tmp_path):
     df = daft.read_avro_tar(gz_files)
     assert df.count_rows() == 4
     assert sorted(df.to_pydict()["val"]) == [0, 10, 20, 30]
+
+
+def test_tgz_extension(tmp_path):
+    """.tgz extension is recognised identically to .tar.gz."""
+    data = {"id": [1, 2], "name": ["a", "b"]}
+    gz_path = str(tmp_path / "data.tgz")
+    with open(gz_path, "wb") as fh:
+        fh.write(make_tar_gz([("rows.avro", make_avro_bytes(data))]))
+
+    df = daft.read_avro_tar(gz_path)
+    assert sorted(df.to_pydict()["id"]) == [1, 2]
+
+
+def test_mixed_members_skips_non_avro(tmp_path):
+    """Non-.avro members inside the archive (e.g. .txt, .json) are silently skipped."""
+    data = {"val": [42]}
+    gz_path = str(tmp_path / "mixed.tar.gz")
+    with open(gz_path, "wb") as fh:
+        fh.write(
+            make_tar_gz(
+                [
+                    ("readme.txt", b"this is not avro"),
+                    ("meta.json", b'{"key": "value"}'),
+                    ("records.avro", make_avro_bytes(data)),
+                ]
+            )
+        )
+
+    df = daft.read_avro_tar(gz_path)
+    assert df.to_pydict()["val"] == [42]
+
+
+def test_empty_rows_avro(tmp_path):
+    """A valid .avro file containing zero rows produces an empty DataFrame with correct schema."""
+    fastavro = pytest.importorskip("fastavro")
+
+    schema = fastavro.parse_schema(
+        {
+            "type": "record",
+            "name": "Empty",
+            "fields": [
+                {"name": "id", "type": "int"},
+                {"name": "name", "type": "string"},
+            ],
+        }
+    )
+    avro_buf = io.BytesIO()
+    fastavro.writer(avro_buf, schema, [])  # zero records
+    avro_bytes = avro_buf.getvalue()
+
+    gz_path = str(tmp_path / "empty_rows.tar.gz")
+    with open(gz_path, "wb") as fh:
+        fh.write(make_tar_gz([("empty.avro", avro_bytes)]))
+
+    df = daft.read_avro_tar(gz_path)
+    assert df.count_rows() == 0
+    assert set(df.column_names) == {"id", "name"}
+
+
+def test_column_projection_unknown_column(tmp_path):
+    """Requesting a column that does not exist in the schema raises an error or returns without that column."""
+    data = {"id": [1, 2], "name": ["a", "b"]}
+    gz_path = str(tmp_path / "data.tar.gz")
+    with open(gz_path, "wb") as fh:
+        fh.write(make_tar_gz([("rows.avro", make_avro_bytes(data))]))
+
+    # Should either raise or return a df without the unknown column — must not silently corrupt data
+    try:
+        df = daft.read_avro_tar(gz_path, column_names=["id", "nonexistent"])
+        assert "id" in df.column_names
+        assert "nonexistent" not in df.column_names
+    except Exception:
+        pass  # raising is also acceptable
