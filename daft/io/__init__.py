@@ -20,7 +20,13 @@ from daft.io._avro import read_avro
 from daft.io.avro_tar import read_avro_tar
 from daft.io._csv import read_csv
 from daft.io._text import read_text
-from daft.io.delta_lake._deltalake import delete_deltalake, history_deltalake, read_deltalake, update_deltalake
+from daft.io.delta_lake._deltalake import (
+    delete_deltalake,
+    history_deltalake,
+    merge_deltalake,
+    read_deltalake,
+    update_deltalake,
+)
 from daft.io.hudi._hudi import read_hudi
 from daft.io.iceberg._iceberg import read_iceberg
 from daft.io.paimon._paimon import read_paimon
@@ -67,14 +73,15 @@ __all__ = [
     "TosConfig",
     "UnityConfig",
     "_range",
+    "delete_deltalake",
     "from_files",
     "from_glob_path",
-    "delete_deltalake",
+    "history_deltalake",
+    "merge_deltalake",
     "read_avro",
     "read_avro_tar",
     "read_csv",
     "read_deltalake",
-    "history_deltalake",
     "read_hudi",
     "read_huggingface",
     "read_iceberg",
