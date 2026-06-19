@@ -244,7 +244,6 @@ exclude = [
 
 [workspace.dependencies]
 arrow = "57.1.0"
-half = {version = "2.7.1", features = ["num-traits", "bytemuck", "serde"]}
 arrow-array = {version = "57.1.0", features = ["chrono-tz"]}
 arrow-buffer = "57.1.0"
 arrow-csv = "57.1.0"
@@ -318,7 +317,8 @@ geo = "0.29"
 geohash = "0.13"
 geojson = "1.0"
 h3o = "0.6"
-wkt = { version = "0.14", features = ["geo-types"] }
+half = {version = "2.7.1", features = ["num-traits", "bytemuck", "serde"]}
+wkt = {version = "0.14", features = ["geo-types"]}
 hashbrown = "0.16"
 html-escape = "0.2.13"
 image = {version = "0.25.10", default-features = false}
@@ -336,7 +336,7 @@ num-derive = "0.4.2"
 num-format = "0.4.4"
 num-traits = "0.2"
 numpy = {version = "0.28", features = ["half"]}
-opendal = {version = "0.55", default-features = false}
+opendal = {version = "0.57", default-features = false}
 opentelemetry = {version = "0.31", features = ["trace", "metrics", "logs"]}
 opentelemetry-otlp = {version = "0.31", features = ["grpc-tonic", "logs"]}
 opentelemetry_sdk = {version = "0.31", features = ["logs"]}

@@ -82,6 +82,7 @@ from daft.convert import (
     from_pydict,
     from_pylist,
     from_ray_dataset,
+    concat,
 )
 from daft.daft import ImageFormat, ImageMode, UnionMode, ImageProperty, ResourceRequest
 from daft.dataframe import DataFrame
@@ -221,6 +222,7 @@ __all__ = [
     "attach_view",
     "cls",
     "col",
+    "concat",
     "context",
     "create_namespace",
     "create_namespace_if_not_exists",
@@ -234,6 +236,7 @@ __all__ = [
     "current_provider",
     "current_session",
     "datasets",
+    "delete_deltalake",
     "detach_catalog",
     "detach_function",
     "detach_provider",
@@ -243,7 +246,6 @@ __all__ = [
     "drop_table",
     "element",
     "execution_config_ctx",
-    "delete_deltalake",
     "from_arrow",
     "from_dask_dataframe",
     "from_files",
@@ -267,6 +269,7 @@ __all__ = [
     "has_namespace",
     "has_provider",
     "has_table",
+    "history_deltalake",
     "interval",
     "io",
     "list_catalogs",
@@ -280,7 +283,6 @@ __all__ = [
     "range",
     "read_csv",
     "read_deltalake",
-    "history_deltalake",
     "read_hudi",
     "read_huggingface",
     "read_iceberg",
@@ -293,7 +295,6 @@ __all__ = [
     "read_sql",
     "read_table",
     "read_text",
-    "update_deltalake",
     "read_video_frames",
     "read_warc",
     "refresh_logger",
@@ -313,6 +314,7 @@ __all__ = [
     "sql_expr",
     "udaf",
     "udf",
+    "update_deltalake",
     "with_subscriber",
     "write_table",
 ]

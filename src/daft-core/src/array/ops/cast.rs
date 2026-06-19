@@ -18,7 +18,8 @@ use crate::lit::Literal;
 use crate::prelude::PythonArray;
 use crate::{
     array::{
-        DataArray, FixedSizeListArray, GeometryArray, ListArray, StructArray, UnionArray, UuidArray,
+        DataArray, FixedSizeListArray, GeometryArray, ListArray, StructArray, UnionArray,
+        UuidArray,
         growable::make_growable,
         image_array::ImageArraySidecarData,
         ops::{DaftCompare, full::FullNull},
@@ -1665,11 +1666,18 @@ impl ListArray {
                     }
                 }
             }
-            DataType::Map { .. } => Ok(MapArray::new(
-                Field::new(self.name(), dtype.clone()),
-                self.clone(),
-            )
-            .into_series()),
+            DataType::Map { key, value } => {
+                let physical_dtype = DataType::List(Box::new(DataType::Struct(vec![
+                    Field::new("key", *key.clone()),
+                    Field::new("value", *value.clone()),
+                ])));
+                let result = self.cast(&physical_dtype)?;
+                let map_array = MapArray::new(
+                    Field::new(self.name(), dtype.clone()),
+                    result.list()?.clone(),
+                );
+                Ok(map_array.into_series())
+            }
             DataType::Embedding(..) => {
                 let result = self.cast(&dtype.to_physical())?;
                 let embedding_array = EmbeddingArray::new(

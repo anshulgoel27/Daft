@@ -33,9 +33,9 @@ use daft_shuffles::server::flight_server::ShuffleFlightServer;
 use daft_writers::make_physical_writer_factory;
 use indexmap::IndexSet;
 use snafu::ResultExt;
+
 #[cfg(feature = "python")]
 use crate::intermediate_ops::distributed_actor_pool_project::DistributedActorPoolProjectOperator;
-
 use crate::{
     ExecutionRuntimeContext, PipelineCreationSnafu,
     channel::create_unbounded_channel,
@@ -279,6 +279,7 @@ pub struct BuilderContext {
             daft_dsl::expr::bound_expr::BoundExpr,
         )>,
     >,
+    pub skipped_corrupt_files: std::sync::Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
 }
 
 impl BuilderContext {
@@ -300,6 +301,7 @@ impl BuilderContext {
             context,
             shuffle_server,
             checkpoint: std::cell::RefCell::new(None),
+            skipped_corrupt_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -448,8 +450,8 @@ fn auto_spill_threshold(explicit: Option<usize>, divisor: usize) -> Option<usize
         Some(n) => Some(n),
         None => {
             let total = crate::resource_manager::get_or_init_memory_manager().total_bytes();
-            let derived =
-                ((total as f64 * SPILL_FRACTION) as usize / divisor.max(1)).max(MIN_THRESHOLD_BYTES);
+            let derived = ((total as f64 * SPILL_FRACTION) as usize / divisor.max(1))
+                .max(MIN_THRESHOLD_BYTES);
             Some(derived)
         }
     }
@@ -483,6 +485,7 @@ fn physical_plan_to_pipeline(
                 pushdowns.clone(),
                 schema.clone(),
                 cfg,
+                Some(ctx.skipped_corrupt_files.clone()),
             );
             SourceNode::new(
                 Box::new(scan_task_source),
@@ -981,11 +984,16 @@ fn physical_plan_to_pipeline(
             // Total spill budget for the operator; split across hash buckets inside the sink.
             let spill_config = auto_spill_threshold(cfg.agg_spill_threshold_bytes, 1)
                 .map(|t| SpillConfig::new(t, cfg.flight_shuffle_dirs.clone()));
-            let agg_sink =
-                GroupedAggregateSink::new(aggregations, group_by, input.schema(), cfg, spill_config)
-                    .with_context(|_| PipelineCreationSnafu {
-                        plan_name: physical_plan.name(),
-                    })?;
+            let agg_sink = GroupedAggregateSink::new(
+                aggregations,
+                group_by,
+                input.schema(),
+                cfg,
+                spill_config,
+            )
+            .with_context(|_| PipelineCreationSnafu {
+                plan_name: physical_plan.name(),
+            })?;
             BlockingSinkNode::new(
                 Arc::new(agg_sink),
                 child_node,
@@ -1400,15 +1408,18 @@ fn physical_plan_to_pipeline(
             let probe_child = left;
             let build_child = right;
 
-            let build_child_node =
-                physical_plan_to_pipeline(build_child, cfg, ctx, input_senders)?;
-            let probe_child_node =
-                physical_plan_to_pipeline(probe_child, cfg, ctx, input_senders)?;
+            let build_child_node = physical_plan_to_pipeline(build_child, cfg, ctx, input_senders)?;
+            let probe_child_node = physical_plan_to_pipeline(probe_child, cfg, ctx, input_senders)?;
 
             // Convert partition_key from plan-level [usize; 2] to operator-level Option<(usize,usize)>.
             let pk = partition_key.map(|[bk, pk]| (bk, pk));
-            let nested_loop_op =
-                NestedLoopJoinOperator::new(filter.clone(), schema.clone(), *build_side, build_child.schema().len(), pk);
+            let nested_loop_op = NestedLoopJoinOperator::new(
+                filter.clone(),
+                schema.clone(),
+                *build_side,
+                build_child.schema().len(),
+                pk,
+            );
 
             JoinNode::new(
                 Arc::new(nested_loop_op),

@@ -12,8 +12,8 @@ use common_display::DisplayAs;
 use common_error::DaftError;
 use daft_parquet::DaftParquetMetadata;
 use daft_schema::schema::{Schema, SchemaRef};
-use daft_stats::{TableMetadata, TableStatistics};
 pub use daft_stats::PartitionSpec;
+use daft_stats::{TableMetadata, TableStatistics};
 use either::Either;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -910,6 +910,7 @@ mod test {
             field_id_mapping: None,
             row_groups: None,
             chunk_size: None,
+            ignore_corrupt_files: false,
         }));
 
         ScanTask::new(
@@ -928,6 +929,7 @@ mod test {
             field_id_mapping: None,
             row_groups: None,
             chunk_size: None,
+            ignore_corrupt_files: false,
         });
 
         let mut sources: Vec<String> = Vec::new();
@@ -1200,6 +1202,7 @@ mod test {
                     field_id_mapping: None,
                     row_groups: None,
                     chunk_size: None,
+                    ignore_corrupt_files: false,
                 },
             ))),
             schema,
@@ -1251,6 +1254,7 @@ mod test {
                     field_id_mapping: None,
                     row_groups: None,
                     chunk_size: None,
+                    ignore_corrupt_files: false,
                 },
             ))),
             schema,
@@ -1295,6 +1299,7 @@ mod test {
                     field_id_mapping: None,
                     row_groups: None,
                     chunk_size: None,
+                    ignore_corrupt_files: false,
                 },
             ))),
             schema,
@@ -1341,6 +1346,7 @@ mod test {
                     field_id_mapping: None,
                     row_groups: None,
                     chunk_size: None,
+                    ignore_corrupt_files: false,
                 },
             ))),
             schema,
@@ -1384,6 +1390,7 @@ mod test {
                     field_id_mapping: None,
                     row_groups: None,
                     chunk_size: None,
+                    ignore_corrupt_files: false,
                 },
             ))),
             schema,
