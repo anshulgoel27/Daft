@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from daft.catalog.__unity._client import UnityCatalogTable
     from daft.checkpoint import IdempotentCommit
     from daft.convert import ArrowStreamExportable
+    from daft.dataframe.to_torch import DaftTorchDataLoader
     from daft.execution.metadata import ExecutionMetadata
     from daft.io import DataSink
     from daft.io.delta_lake._deltalake import DeltaMergeBuilder
@@ -673,7 +674,7 @@ class DataFrame:
     ) -> Iterator[Union[MicroPartition, "ray.ObjectRef"]]:
         """Begin executing this dataframe and return an iterator over the partitions.
 
-        Each partition will be returned as a daft.recordbatch object (if using Python runner backend)
+        Each partition will be returned as a daft.MicroPartition object (if using Python runner backend)
         or a ray ObjectRef (if using Ray runner backend).
 
         Args:
@@ -1296,6 +1297,80 @@ class DataFrame:
             write_mode=WriteMode.from_str(write_mode),
             file_format=FileFormat.Json,
             file_format_option=file_format_option,
+            io_config=io_config,
+        )
+        # Block and write, then retrieve data
+        write_df = DataFrame(builder)
+        write_df.collect()
+        assert write_df._result is not None
+
+        # Populate and return a new disconnected DataFrame
+        # Keep the original logical plan so explain() can still show upstream operators
+        # (e.g. filters/projections before the write), instead of collapsing to an
+        # in-memory source after collect() caches the result.
+        result_df = DataFrame(write_df._get_current_builder())
+        result_df._result_cache = write_df._result_cache
+        result_df._preview = write_df._preview
+        result_df._metadata = write_df._metadata
+        return result_df
+
+    @DataframePublicAPI
+    def write_avro(
+        self,
+        root_dir: str | pathlib.Path,
+        compression: str = "null",
+        write_mode: Literal["append", "overwrite", "overwrite-partitions"] = "append",
+        write_success_file: bool = False,
+        partition_cols: list[ColumnInputType] | None = None,
+        io_config: IOConfig | None = None,
+    ) -> "DataFrame":
+        """Writes the DataFrame as Avro files, returning a new DataFrame with paths to the files that were written.
+
+        Files will be written to ``<root_dir>/*`` with randomly generated UUIDs as the file names.
+
+        Args:
+            root_dir (str): root file path to write Avro files to.
+            compression (str, optional): compression algorithm. "null" (default) or "deflate". Defaults to "null".
+            write_mode (str, optional): Operation mode of the write. ``append`` will add new data, ``overwrite`` will replace the contents of the root directory with new data. ``overwrite-partitions`` will replace only the contents in the partitions that are being written to. Defaults to "append".
+            write_success_file (bool, optional): Whether to write a ``_SUCCESS`` file upon successful completion. Defaults to False.
+            partition_cols (Optional[List[ColumnInputType]], optional): How to subpartition each partition further. Defaults to None.
+            io_config (Optional[IOConfig], optional): configurations to use when interacting with remote storage.
+
+        Returns:
+            DataFrame: The filenames that were written out as strings.
+
+        Note:
+            This call is **blocking** and will execute the DataFrame when called
+
+        Examples:
+            >>> import daft
+            >>> df = daft.from_pydict({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+            >>> df.write_avro("output_dir", write_mode="overwrite")  # doctest: +SKIP
+
+        Tip:
+            See also [`df.write_parquet()`][daft.DataFrame.write_parquet] and [`df.write_csv()`][daft.DataFrame.write_csv]
+            Other formats for writing DataFrames
+        """
+        if write_mode not in ["append", "overwrite", "overwrite-partitions"]:
+            raise ValueError(
+                f"Only support `append`, `overwrite`, or `overwrite-partitions` mode. {write_mode} is unsupported"
+            )
+        if write_mode == "overwrite-partitions" and partition_cols is None:
+            raise ValueError("Partition columns must be specified to use `overwrite-partitions` mode.")
+
+        io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
+
+        cols: list[Expression] | None = None
+        if partition_cols is not None:
+            cols = column_inputs_to_expressions(tuple(partition_cols))
+
+        builder = self._builder.write_tabular(
+            root_dir=root_dir,
+            partition_cols=cols,
+            write_mode=WriteMode.from_str(write_mode),
+            write_success_file=write_success_file,
+            file_format=FileFormat.Avro,
+            compression=compression,
             io_config=io_config,
         )
         # Block and write, then retrieve data
@@ -2093,10 +2168,7 @@ class DataFrame:
             Basic upsert::
 
                 result = (
-                    self.merge_deltalake(
-                        table="path/to/table",
-                        predicate="target.id = source.id"
-                    )
+                    self.merge_deltalake(table="path/to/table", predicate="target.id = source.id")
                     .when_matched_update_all()
                     .when_not_matched_insert_all()
                     .execute()
@@ -6002,6 +6074,58 @@ class DataFrame:
             df = self
 
         return DaftTorchIterableDataset(df)
+
+    @DataframePublicAPI
+    def to_torch_dataloader(
+        self,
+        batch_size: int = 1,
+        *,
+        pin_memory: bool = False,
+        pin_memory_device: str = "",
+        prefetch_count: int = 0,
+    ) -> "DaftTorchDataLoader":
+        """Return a DataLoader-like iterator that streams batched partitions for PyTorch training.
+
+        Begins execution of the DataFrame when iterated. Each yielded batch is a dict mapping column
+        names to `torch.Tensor` values (or Python lists for non-numeric columns).
+
+        For row-level shuffling, use [``shuffle``][daft.DataFrame.shuffle] or
+        [``sample``][daft.DataFrame.sample] on the DataFrame before calling this method.
+
+        Note:
+            Batch sizing is best-effort. Batches may be smaller than `batch_size`.
+
+        Args:
+            batch_size: Target number of rows per batch.
+            pin_memory: If `True`, pin memory on returned tensors for faster GPU transfer.
+            pin_memory_device: Optional device for pinned memory (PyTorch 2.x).
+            prefetch_count: Number of batches loaded in advance. This will increase memory usage, but can
+            improve throughput.
+
+        Returns:
+            DaftTorchDataLoader: Iterable over batch dicts for use as
+            `for batch in df.to_torch_dataloader(batch_size): ...`
+
+        Examples:
+            >>> import daft
+            >>> import torch  # doctest: +SKIP
+            >>> df = daft.from_pydict({"x": [1, 2, 3, 4], "y": [5, 6, 7, 8]})
+            >>> for batch in df.to_torch_dataloader(batch_size=2):  # doctest: +SKIP
+            ...     assert batch["x"].shape == (2,)
+
+        Tip:
+            For the PyTorch `IterableDataset` + `DataLoader` composition, see
+            [``to_torch_iter_dataset``][daft.DataFrame.to_torch_iter_dataset].
+        """
+        from daft.dataframe.to_torch import DaftTorchDataLoader
+
+        return DaftTorchDataLoader(
+            self,
+            batch_size,
+            pin_memory=pin_memory,
+            pin_memory_device=pin_memory_device,
+            prefetch_count=prefetch_count,
+        )
 
     @DataframePublicAPI
     def to_ray_dataset(self) -> "ray.data.dataset.DataSet":

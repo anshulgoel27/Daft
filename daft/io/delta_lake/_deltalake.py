@@ -1,7 +1,7 @@
 # ruff: noqa: I002
 # isort: dont-add-import: from __future__ import annotations
-import os
 import json
+import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Union
 
@@ -275,11 +275,7 @@ def merge_deltalake(
         Basic upsert (update matching rows, insert new rows)::
 
             result = (
-                merge_deltalake(
-                    table="path/to/table",
-                    source=source_df,
-                    predicate="target.id = source.id"
-                )
+                merge_deltalake(table="path/to/table", source=source_df, predicate="target.id = source.id")
                 .when_matched_update_all()
                 .when_not_matched_insert_all()
                 .execute()
@@ -291,18 +287,13 @@ def merge_deltalake(
         State tracking with multiple conditions::
 
             result = (
-                merge_deltalake(
-                    table="path/to/table",
-                    source=source_df,
-                    predicate="target.id = source.id"
-                )
+                merge_deltalake(table="path/to/table", source=source_df, predicate="target.id = source.id")
                 .when_matched_update(
                     predicate="source.attributes != target.attributes",
-                    updates={"attributes": "source.attributes", "status": "'UPDATED'"}
+                    updates={"attributes": "source.attributes", "status": "'UPDATED'"},
                 )
                 .when_matched_update(
-                    predicate="source.attributes = target.attributes",
-                    updates={"status": "'UNCHANGED'"}
+                    predicate="source.attributes = target.attributes", updates={"status": "'UNCHANGED'"}
                 )
                 .when_not_matched_insert_all()
                 .execute()
@@ -455,8 +446,6 @@ class DeltaMergeBuilder:
         Returns:
             DataFrame: A single-row DataFrame with columns for each merge metric.
         """
-        import pyarrow as pa
-
         raw_metrics = self._merger.execute()
         return _format_merge_metrics_as_dataframe(raw_metrics)
 
@@ -490,10 +479,8 @@ def _format_merge_metrics_as_dataframe(raw_metrics: dict[str, Any]) -> "DataFram
 
     df = DataFrame._from_arrow(pa.table(metrics_data))
     # Store the raw metrics dict in metadata for programmatic access
-    df._metadata = {"merge_metrics": raw_metrics}
+    df._metadata = {"merge_metrics": raw_metrics}  # type: ignore[assignment]
     return df
-
-
 
 
 def delta_schema_to_pyarrow(schema: "deltalake.Schema") -> "pa.Schema":

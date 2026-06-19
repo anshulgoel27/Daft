@@ -144,5 +144,6 @@
 * Contributing
     * [Overview](contributing/overview.md)
     * [Development Guide](contributing/development.md)
+    * [Local Setup and Troubleshooting](contributing/local-setup-troubleshooting.md)
     * [Contributing AI Functions](contributing/contributing-ai-functions.md)
 * [Daft Skills](skills.md)

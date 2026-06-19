@@ -102,7 +102,7 @@ from .similarity import (
 )
 
 from .image_file_ import image_file_metadata, decode_image_file
-from .file_ import file, file_path, file_size, video_file, audio_file, image_file, guess_mime_type
+from .file_ import file, file_path, file_size, file_exists, video_file, audio_file, image_file, guess_mime_type
 
 from .image import (
     resize,
@@ -426,6 +426,7 @@ __all__ = [
     "extract_month_uuid7",
     "factorial",
     "file",
+    "file_exists",
     "file_path",
     "file_size",
     "fill_nan",
@@ -515,6 +516,7 @@ __all__ = [
     "monotonically_increasing_id",
     "month",
     "months_between",
+    "named_struct",
     "nanosecond",
     "negate",
     "next_day",
@@ -595,7 +597,6 @@ __all__ = [
     "to_kebab_case",
     "to_list",
     "to_snake_case",
-    "named_struct",
     "to_struct",
     "to_title_case",
     "to_unix_epoch",

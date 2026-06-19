@@ -255,6 +255,9 @@ class FileFormat(Enum):
     Parquet = 1
     Csv = 2
     Json = 3
+    Warc = 4
+    Text = 5
+    Avro = 6
 
     def ext(self) -> str: ...
 
@@ -331,6 +334,11 @@ class WarcSourceConfig:
 
     def __init__(self) -> None: ...
 
+class AvroSourceConfig:
+    """Configuration of an Avro data source."""
+
+    def __init__(self) -> None: ...
+
 class DatabaseSourceConfig:
     """Configuration of a database data source."""
 
@@ -360,7 +368,7 @@ class TextSourceConfig:
 class FileFormatConfig:
     """Configuration for parsing a particular file format (Parquet, CSV, JSON)."""
 
-    config: ParquetSourceConfig | CsvSourceConfig | JsonSourceConfig | WarcSourceConfig
+    config: ParquetSourceConfig | CsvSourceConfig | JsonSourceConfig | WarcSourceConfig | AvroSourceConfig
 
     @staticmethod
     def from_parquet_config(config: ParquetSourceConfig) -> FileFormatConfig:
@@ -380,6 +388,11 @@ class FileFormatConfig:
     @staticmethod
     def from_warc_config(config: WarcSourceConfig) -> FileFormatConfig:
         """Create a WARC file format config."""
+        ...
+
+    @staticmethod
+    def from_avro_config(config: AvroSourceConfig) -> FileFormatConfig:
+        """Create an Avro file format config."""
         ...
 
     @staticmethod
@@ -1341,6 +1354,18 @@ def read_json_schema(
     io_config: IOConfig | None = None,
     multithreaded_io: bool | None = None,
 ) -> PySchema: ...
+def read_avro(
+    uri: str,
+    io_config: IOConfig | None = None,
+    multithreaded_io: bool | None = None,
+    column_projection: list[str] | None = None,
+    max_records: int | None = None,
+) -> PyRecordBatch: ...
+def read_avro_schema(
+    uri: str,
+    io_config: IOConfig | None = None,
+    multithreaded_io: bool | None = None,
+) -> PySchema: ...
 
 class PyTimeUnit:
     @staticmethod
@@ -1485,6 +1510,7 @@ class PyDataType:
     def is_logical(self) -> builtins.bool: ...
     def is_temporal(self) -> builtins.bool: ...
     def is_file(self) -> builtins.bool: ...
+    def is_geometry(self) -> builtins.bool: ...
     def fixed_size(self) -> int: ...
     def fixed_shape(self) -> tuple[int, ...]: ...
     def time_unit(self) -> PyTimeUnit: ...
@@ -2349,6 +2375,7 @@ class DistributedPhysicalPlan:
     ) -> DistributedPhysicalPlan: ...
     def idx(self) -> str: ...
     def num_partitions(self) -> int: ...
+    def flight_shuffle_dirs(self) -> list[str]: ...
     def repr_ascii(self, simple: bool) -> str: ...
     def repr_mermaid(self, options: MermaidOptions) -> str: ...
     def repr_json(self, psets: dict[str, list[RayPartitionRef]] | None = None) -> str: ...
@@ -2506,6 +2533,10 @@ class PyDaftExecutionConfig:
         flight_shuffle_dirs: list[str] | None = None,
         flight_shuffle_compression: str | None = None,
         enable_multi_glob_path_tasks: bool | None = None,
+        hash_join_spill_threshold_bytes: int | None = None,
+        sort_spill_threshold_bytes: int | None = None,
+        agg_spill_threshold_bytes: int | None = None,
+        window_spill_threshold_bytes: int | None = None,
     ) -> PyDaftExecutionConfig: ...
     @property
     def enable_scan_task_split_and_merge(self) -> bool: ...
@@ -2814,6 +2845,7 @@ class PyFileReference:
     def name(self) -> str: ...
     def position(self) -> int | None: ...
     def size(self) -> int | None: ...
+    def exists(self) -> bool: ...
 
 class PyDaftFile:
     def __init__(self, path: str | None = None, data: bytes | None = None) -> None: ...

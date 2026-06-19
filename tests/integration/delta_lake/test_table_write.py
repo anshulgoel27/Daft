@@ -29,7 +29,7 @@ def custom_metadata():
 def commit_properties():
     @contextlib.contextmanager
     def _(deltalake):
-        setattr(deltalake, "CommitProperties", _FakeCommitProperties)
+        deltalake.CommitProperties = _FakeCommitProperties
         try:
             yield
         finally:
@@ -440,52 +440,56 @@ def test_update_deltalake_basic(tmp_path):
 
 
 def test_merge_deltalake_scenario_0_initial_load(tmp_path):
-    """Scenario 0: First run with no existing persistent entity -> all entities marked as ADDED"""
+    """Scenario 0: First run with no existing persistent entity -> all entities marked as ADDED."""
     path = tmp_path / "entity_table"
-    
+
     # Initial source data (first load)
-    source = daft.from_pydict({
-        "entity_id": [1, 2, 3],
-        "attributes": ["attr-a", "attr-b", "attr-c"],
-        "status": ["ADDED", "ADDED", "ADDED"],
-    })
-    
+    source = daft.from_pydict(
+        {
+            "entity_id": [1, 2, 3],
+            "attributes": ["attr-a", "attr-b", "attr-c"],
+            "status": ["ADDED", "ADDED", "ADDED"],
+        }
+    )
+
     # For first load, write directly with ADDED status
     source.write_deltalake(str(path))
-    
+
     rows = daft.read_deltalake(str(path)).sort("entity_id").to_pydict()
     assert rows == {
         "entity_id": [1, 2, 3],
         "attributes": ["attr-a", "attr-b", "attr-c"],
-        "status": ["ADDED", "ADDED", "ADDED"]
+        "status": ["ADDED", "ADDED", "ADDED"],
     }
 
 
 def test_merge_deltalake_scenario_1_new_entity(tmp_path):
-    """Scenario 1: New entity in source -> marked as ADDED"""
+    """Scenario 1: New entity in source -> marked as ADDED."""
     path = tmp_path / "entity_table"
-    
+
     # Initial state: entities 1, 2
-    daft.from_pydict({
-        "entity_id": [1, 2],
-        "attributes": ["attr-a", "attr-b"],
-        "status": ["ADDED", "ADDED"],
-    }).write_deltalake(str(path))
-    
+    daft.from_pydict(
+        {
+            "entity_id": [1, 2],
+            "attributes": ["attr-a", "attr-b"],
+            "status": ["ADDED", "ADDED"],
+        }
+    ).write_deltalake(str(path))
+
     # Source with entity 1, 2, and NEW entity 3
-    source = daft.from_pydict({
-        "entity_id": [1, 2, 3],
-        "attributes": ["attr-a", "attr-b", "attr-c"],
-    })
-    
+    source = daft.from_pydict(
+        {
+            "entity_id": [1, 2, 3],
+            "attributes": ["attr-a", "attr-b", "attr-c"],
+        }
+    )
+
     result = (
-        daft.merge_deltalake(
-            str(path),
-            source=source,
-            predicate="target.entity_id = source.entity_id"
-        )
+        daft.merge_deltalake(str(path), source=source, predicate="target.entity_id = source.entity_id")
         .when_matched_update_all(except_cols=["status"])
-        .when_not_matched_insert(updates={"entity_id": "source.entity_id", "attributes": "source.attributes", "status": "'ADDED'"})
+        .when_not_matched_insert(
+            updates={"entity_id": "source.entity_id", "attributes": "source.attributes", "status": "'ADDED'"}
+        )
         .execute()
     )
 
@@ -497,81 +501,71 @@ def test_merge_deltalake_scenario_1_new_entity(tmp_path):
     assert rows == {
         "entity_id": [1, 2, 3],
         "attributes": ["attr-a", "attr-b", "attr-c"],
-        "status": ["ADDED", "ADDED", "ADDED"]
+        "status": ["ADDED", "ADDED", "ADDED"],
     }
 
 
 def test_merge_deltalake_scenario_3_unchanged_entity(tmp_path):
-    """Scenario 3: Entity with same attribute values -> marked as UNCHANGED"""
+    """Scenario 3: Entity with same attribute values -> marked as UNCHANGED."""
     path = tmp_path / "entity_table"
-    
+
     # Initial state with entities
-    daft.from_pydict({
-        "entity_id": [1, 2],
-        "attributes": ["attr-a", "attr-b"],
-        "status": ["UPDATED", "UPDATED"],
-    }).write_deltalake(str(path))
-    
+    daft.from_pydict(
+        {
+            "entity_id": [1, 2],
+            "attributes": ["attr-a", "attr-b"],
+            "status": ["UPDATED", "UPDATED"],
+        }
+    ).write_deltalake(str(path))
+
     # Source with SAME attributes for entities 1 and 2
-    source = daft.from_pydict({
-        "entity_id": [1, 2],
-        "attributes": ["attr-a", "attr-b"],
-    })
-    
+    source = daft.from_pydict(
+        {
+            "entity_id": [1, 2],
+            "attributes": ["attr-a", "attr-b"],
+        }
+    )
+
     result = (
-        daft.merge_deltalake(
-            str(path),
-            source=source,
-            predicate="target.entity_id = source.entity_id"
-        )
-        .when_matched_update(
-            updates={"status": "'UNCHANGED'"},
-            predicate="source.attributes = target.attributes"
-        )
+        daft.merge_deltalake(str(path), source=source, predicate="target.entity_id = source.entity_id")
+        .when_matched_update(updates={"status": "'UNCHANGED'"}, predicate="source.attributes = target.attributes")
         .execute()
     )
 
     assert isinstance(result, daft.DataFrame)
     rows = daft.read_deltalake(str(path)).sort("entity_id").to_pydict()
     # Both entities should now be marked as UNCHANGED
-    assert rows == {
-        "entity_id": [1, 2],
-        "attributes": ["attr-a", "attr-b"],
-        "status": ["UNCHANGED", "UNCHANGED"]
-    }
+    assert rows == {"entity_id": [1, 2], "attributes": ["attr-a", "attr-b"], "status": ["UNCHANGED", "UNCHANGED"]}
 
 
 def test_merge_deltalake_scenario_4_updated_entity(tmp_path):
-    """Scenario 4: Entity with different attribute values -> marked as UPDATED"""
+    """Scenario 4: Entity with different attribute values -> marked as UPDATED."""
     path = tmp_path / "entity_table"
-    
+
     # Initial state with entities
-    daft.from_pydict({
-        "entity_id": [1, 2],
-        "attributes": ["attr-a-old", "attr-b-old"],
-        "status": ["ADDED", "ADDED"],
-    }).write_deltalake(str(path))
-    
+    daft.from_pydict(
+        {
+            "entity_id": [1, 2],
+            "attributes": ["attr-a-old", "attr-b-old"],
+            "status": ["ADDED", "ADDED"],
+        }
+    ).write_deltalake(str(path))
+
     # Source with DIFFERENT attributes for entity 1, SAME for entity 2
-    source = daft.from_pydict({
-        "entity_id": [1, 2],
-        "attributes": ["attr-a-new", "attr-b-old"],
-    })
-    
+    source = daft.from_pydict(
+        {
+            "entity_id": [1, 2],
+            "attributes": ["attr-a-new", "attr-b-old"],
+        }
+    )
+
     result = (
-        daft.merge_deltalake(
-            str(path),
-            source=source,
-            predicate="target.entity_id = source.entity_id"
-        )
+        daft.merge_deltalake(str(path), source=source, predicate="target.entity_id = source.entity_id")
         .when_matched_update(
             updates={"attributes": "source.attributes", "status": "'UPDATED'"},
-            predicate="source.attributes != target.attributes"
+            predicate="source.attributes != target.attributes",
         )
-        .when_matched_update(
-            updates={"status": "'UNCHANGED'"},
-            predicate="source.attributes = target.attributes"
-        )
+        .when_matched_update(updates={"status": "'UNCHANGED'"}, predicate="source.attributes = target.attributes")
         .execute()
     )
 
@@ -579,50 +573,44 @@ def test_merge_deltalake_scenario_4_updated_entity(tmp_path):
     rows = daft.read_deltalake(str(path)).sort("entity_id").to_pydict()
     # Entity 1: UPDATED (different attributes)
     # Entity 2: UNCHANGED (same attributes)
-    assert rows == {
-        "entity_id": [1, 2],
-        "attributes": ["attr-a-new", "attr-b-old"],
-        "status": ["UPDATED", "UNCHANGED"]
-    }
+    assert rows == {"entity_id": [1, 2], "attributes": ["attr-a-new", "attr-b-old"], "status": ["UPDATED", "UNCHANGED"]}
 
 
 def test_merge_deltalake_scenario_2_deleted_entity_with_antijoin(tmp_path):
-    """Scenario 2: Entity deleted from source -> marked as DELETED (via anti-join + update)"""
+    """Scenario 2: Entity deleted from source -> marked as DELETED (via anti-join + update)."""
     path = tmp_path / "entity_table"
-    
+
     # Initial state with entities 1, 2, 3
-    daft.from_pydict({
-        "entity_id": [1, 2, 3],
-        "attributes": ["attr-a", "attr-b", "attr-c"],
-        "status": ["ADDED", "ADDED", "ADDED"],
-    }).write_deltalake(str(path))
-    
+    daft.from_pydict(
+        {
+            "entity_id": [1, 2, 3],
+            "attributes": ["attr-a", "attr-b", "attr-c"],
+            "status": ["ADDED", "ADDED", "ADDED"],
+        }
+    ).write_deltalake(str(path))
+
     # Source with only entities 1 and 2 (entity 3 is deleted from source)
-    source = daft.from_pydict({
-        "entity_id": [1, 2],
-        "attributes": ["attr-a", "attr-b"],
-    })
-    
+    source = daft.from_pydict(
+        {
+            "entity_id": [1, 2],
+            "attributes": ["attr-a", "attr-b"],
+        }
+    )
+
     result = (
-        daft.merge_deltalake(
-            str(path),
-            source=source,
-            predicate="target.entity_id = source.entity_id"
-        )
-        .when_not_matched_by_source_update(
-            updates={"status": "'DELETED'"}
-        )
+        daft.merge_deltalake(str(path), source=source, predicate="target.entity_id = source.entity_id")
+        .when_not_matched_by_source_update(updates={"status": "'DELETED'"})
         .execute()
     )
 
     assert isinstance(result, daft.DataFrame)
-    
+
     rows = daft.read_deltalake(str(path)).sort("entity_id").to_pydict()
     # Entity 3 should now be marked as DELETED
     assert rows == {
         "entity_id": [1, 2, 3],
         "attributes": ["attr-a", "attr-b", "attr-c"],
-        "status": ["ADDED", "ADDED", "DELETED"]
+        "status": ["ADDED", "ADDED", "DELETED"],
     }
 
 
@@ -633,11 +621,7 @@ def test_merge_deltalake_delete_apis(tmp_path):
 
     source = daft.from_pydict({"id": [1, 3], "value": ["a", "c"]})
     result = (
-        daft.merge_deltalake(
-            str(path),
-            source=source,
-            predicate="target.id = source.id"
-        )
+        daft.merge_deltalake(str(path), source=source, predicate="target.id = source.id")
         .when_matched_delete(predicate="source.id = 1")
         .when_not_matched_by_source_delete()
         .execute()
@@ -649,25 +633,15 @@ def test_merge_deltalake_delete_apis(tmp_path):
 
 
 def test_merge_deltalake_multiple_when_matched(tmp_path):
-    """Test merge with multiple when_matched_update clauses with different predicates"""
+    """Test merge with multiple when_matched_update clauses with different predicates."""
     path = tmp_path / "some_table"
     daft.from_pydict({"id": [1, 2], "status": ["active", "inactive"], "value": [100, 200]}).write_deltalake(str(path))
 
     source = daft.from_pydict({"id": [1, 2], "status": ["active", "inactive"], "value": [150, 250]})
     result = (
-        daft.merge_deltalake(
-            str(path),
-            source=source,
-            predicate="target.id = source.id"
-        )
-        .when_matched_update(
-            updates={"value": "source.value"},
-            predicate="source.status = 'active'"
-        )
-        .when_matched_update(
-            updates={"value": "'999'"},
-            predicate="source.status = 'inactive'"
-        )
+        daft.merge_deltalake(str(path), source=source, predicate="target.id = source.id")
+        .when_matched_update(updates={"value": "source.value"}, predicate="source.status = 'active'")
+        .when_matched_update(updates={"value": "'999'"}, predicate="source.status = 'inactive'")
         .execute()
     )
 
@@ -677,17 +651,13 @@ def test_merge_deltalake_multiple_when_matched(tmp_path):
 
 
 def test_merge_deltalake_with_predicates(tmp_path):
-    """Test merge with both when_matched_update and when_not_matched_insert"""
+    """Test merge with both when_matched_update and when_not_matched_insert."""
     path = tmp_path / "some_table"
     daft.from_pydict({"id": [1, 2], "value": [100, 200]}).write_deltalake(str(path))
 
     source = daft.from_pydict({"id": [2, 3], "value": [250, 350]})
     result = (
-        daft.merge_deltalake(
-            str(path),
-            source=source,
-            predicate="target.id = source.id"
-        )
+        daft.merge_deltalake(str(path), source=source, predicate="target.id = source.id")
         .when_matched_update({"value": "source.value"})
         .when_not_matched_insert({"id": "source.id", "value": "source.value"})
         .execute()
@@ -699,16 +669,13 @@ def test_merge_deltalake_with_predicates(tmp_path):
 
 
 def test_merge_deltalake_dataframe_api(tmp_path):
-    """Test DataFrame.merge_deltalake method"""
+    """Test DataFrame.merge_deltalake method."""
     path = tmp_path / "some_table"
     daft.from_pydict({"id": [1, 2], "value": ["old-1", "old-2"]}).write_deltalake(str(path))
 
     source = daft.from_pydict({"id": [2, 3], "value": ["new-2", "new-3"]})
     result = (
-        source.merge_deltalake(
-            str(path),
-            predicate="target.id = source.id"
-        )
+        source.merge_deltalake(str(path), predicate="target.id = source.id")
         .when_matched_update({"value": "source.value"})
         .when_not_matched_insert({"id": "source.id", "value": "source.value"})
         .execute()
@@ -731,35 +698,23 @@ def test_history_deltalake_exposes_operation_metrics(tmp_path):
     assert all(isinstance(entry["operationMetrics"], dict) for entry in history)
 
 
-
-
 def test_merge_deltalake_returns_metrics(tmp_path):
-    """Test that merge_deltalake returns formatted metrics"""
+    """Test that merge_deltalake returns formatted metrics."""
     path = tmp_path / "metrics_table"
-    
+
     # Initial table with 2 rows
-    daft.from_pydict({
-        "id": [1, 2],
-        "value": ["a", "b"]
-    }).write_deltalake(str(path))
-    
+    daft.from_pydict({"id": [1, 2], "value": ["a", "b"]}).write_deltalake(str(path))
+
     # Merge source: update row 2, insert row 3
-    source = daft.from_pydict({
-        "id": [2, 3],
-        "value": ["b-updated", "c"]
-    })
-    
+    source = daft.from_pydict({"id": [2, 3], "value": ["b-updated", "c"]})
+
     metrics = (
-        daft.merge_deltalake(
-            str(path),
-            source=source,
-            predicate="target.id = source.id"
-        )
+        daft.merge_deltalake(str(path), source=source, predicate="target.id = source.id")
         .when_matched_update({"value": "source.value"})
         .when_not_matched_insert({"id": "source.id", "value": "source.value"})
         .execute()
     )
-    
+
     # Verify metrics structure
     assert isinstance(metrics, daft.DataFrame)
     raw_metrics = metrics._metadata["merge_metrics"]
@@ -773,56 +728,42 @@ def test_merge_deltalake_returns_metrics(tmp_path):
     assert "scan_time_ms" in raw_metrics
     assert "rewrite_time_ms" in raw_metrics
     assert raw_metrics["num_target_rows_inserted"] == 1  # One row inserted
-    assert raw_metrics["num_target_rows_updated"] == 1   # One row updated
-    assert raw_metrics["num_target_rows_deleted"] == 0   # No deletions
-    
+    assert raw_metrics["num_target_rows_updated"] == 1  # One row updated
+    assert raw_metrics["num_target_rows_deleted"] == 0  # No deletions
+
     # Verify data
     rows = daft.read_deltalake(str(path)).sort("id").to_pydict()
     assert rows == {"id": [1, 2, 3], "value": ["a", "b-updated", "c"]}
 
 
 def test_merge_deltalake_metrics_with_conditional_predicates(tmp_path):
-    """Test merge_deltalake with multiple conditional predicates returns correct metrics"""
+    """Test merge_deltalake with multiple conditional predicates returns correct metrics."""
     path = tmp_path / "conditional_metrics"
-    
+
     # Initial table
-    daft.from_pydict({
-        "id": [1, 2, 3],
-        "status": ["active", "inactive", "active"],
-        "value": [100, 200, 300]
-    }).write_deltalake(str(path))
-    
+    daft.from_pydict(
+        {"id": [1, 2, 3], "status": ["active", "inactive", "active"], "value": [100, 200, 300]}
+    ).write_deltalake(str(path))
+
     # Merge source with updates and new rows
-    source = daft.from_pydict({
-        "id": [2, 3, 4, 5],
-        "status": ["inactive", "active", "new", "new"],
-        "value": [250, 350, 400, 500]
-    })
-    
+    source = daft.from_pydict(
+        {"id": [2, 3, 4, 5], "status": ["inactive", "active", "new", "new"], "value": [250, 350, 400, 500]}
+    )
+
     result = (
-        daft.merge_deltalake(
-            str(path),
-            source=source,
-            predicate="target.id = source.id"
-        )
-        .when_matched_update(
-            updates={"value": "source.value"},
-            predicate="source.status = 'active'"
-        )
-        .when_matched_update(
-            updates={"value": "'999'"},
-            predicate="source.status = 'inactive'"
-        )
+        daft.merge_deltalake(str(path), source=source, predicate="target.id = source.id")
+        .when_matched_update(updates={"value": "source.value"}, predicate="source.status = 'active'")
+        .when_matched_update(updates={"value": "'999'"}, predicate="source.status = 'inactive'")
         .when_not_matched_insert({"id": "source.id", "status": "source.status", "value": "source.value"})
         .execute()
     )
-    
+
     # Verify metrics structure
     assert isinstance(result, daft.DataFrame)
     metrics = result._metadata["merge_metrics"]
     assert metrics["num_target_rows_inserted"] == 2  # Rows 4 and 5
-    assert metrics["num_target_rows_updated"] == 2   # Rows 2 and 3
-    
+    assert metrics["num_target_rows_updated"] == 2  # Rows 2 and 3
+
     # Verify data
     rows = daft.read_deltalake(str(path)).sort("id").to_pydict()
     assert rows["id"] == [1, 2, 3, 4, 5]
@@ -830,41 +771,30 @@ def test_merge_deltalake_metrics_with_conditional_predicates(tmp_path):
 
 
 def test_merge_deltalake_dataframe_returns_metrics(tmp_path):
-    """Test that DataFrame.merge_deltalake returns metrics"""
+    """Test that DataFrame.merge_deltalake returns metrics."""
     path = tmp_path / "df_metrics"
-    
+
     # Initial table
-    daft.from_pydict({
-        "id": [1, 2],
-        "name": ["alice", "bob"]
-    }).write_deltalake(str(path))
-    
+    daft.from_pydict({"id": [1, 2], "name": ["alice", "bob"]}).write_deltalake(str(path))
+
     # Source DataFrame
-    source = daft.from_pydict({
-        "id": [2, 3],
-        "name": ["bob-updated", "charlie"]
-    })
-    
+    source = daft.from_pydict({"id": [2, 3], "name": ["bob-updated", "charlie"]})
+
     # Use DataFrame API
     metrics = (
-        source.merge_deltalake(
-            str(path),
-            predicate="target.id = source.id"
-        )
+        source.merge_deltalake(str(path), predicate="target.id = source.id")
         .when_matched_update({"name": "source.name"})
         .when_not_matched_insert({"id": "source.id", "name": "source.name"})
         .execute()
     )
-    
+
     # Verify metrics returned
     assert isinstance(metrics, daft.DataFrame)
     raw_metrics = metrics._metadata["merge_metrics"]
     assert raw_metrics["num_target_rows_updated"] == 1
     assert raw_metrics["num_target_rows_inserted"] == 1
     assert "num_target_rows_copied" in raw_metrics
-    
+
     # Verify data
     rows = daft.read_deltalake(str(path)).sort("id").to_pydict()
     assert rows == {"id": [1, 2, 3], "name": ["alice", "bob-updated", "charlie"]}
-
-

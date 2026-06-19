@@ -10,6 +10,7 @@ import signal
 import sys
 import uuid
 from dataclasses import dataclass
+from types import FrameType
 from typing import TYPE_CHECKING, NamedTuple
 
 from daft.context import get_context
@@ -809,7 +810,7 @@ class FlotillaRunner:
         # Clean up shuffle dirs if the driver process is stopped via SIGTERM (e.g. ray job stop).
         _prev_sigterm = signal.getsignal(signal.SIGTERM)
 
-        def _sigterm_handler(signum: int, frame: object) -> None:
+        def _sigterm_handler(signum: int, frame: FrameType | None) -> None:
             if self._active_plan_id is not None:
                 try:
                     ray.get(self.runner.cleanup_plan_shuffle.remote(self._active_plan_id), timeout=30)

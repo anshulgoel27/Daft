@@ -16,6 +16,7 @@ common-tracing = {path = "src/common/tracing", default-features = false}
 common-version = {path = "src/common/version", default-features = false}
 daft-ai = {path = "src/daft-ai", default-features = false}
 daft-algebra = {path = "src/daft-algebra", default-features = false}
+daft-avro = {path = "src/daft-avro", default-features = false}
 daft-catalog = {path = "src/daft-catalog", default-features = false}
 daft-checkpoint = {path = "src/daft-checkpoint", default-features = false}
 daft-cli = {path = "src/daft-cli", default-features = false}
@@ -77,6 +78,7 @@ python = [
   "common-system-info/python",
   "common-metrics/python",
   "daft-ai/python",
+  "daft-avro/python",
   "daft-catalog/python",
   "daft-checkpoint/python",
   "daft-checkpoint/s3",
@@ -161,6 +163,12 @@ strip = "none"  # dont strip
 [profile.release.package.daft-parquet]
 opt-level = 2
 
+# opendal's services-oss feature (Alibaba Cloud OSS) uses heavy XML/serde generics
+# that make release compilation hang for 30+ min at opt-level=3.
+# opt-level=1 cuts compile time dramatically with negligible I/O performance impact.
+[profile.release.package.opendal]
+opt-level = 1
+
 [profile.release-lto]
 codegen-units = 1
 inherits = "release"
@@ -194,6 +202,7 @@ members = [
   "src/common/metrics",
   "src/daft-ai",
   "src/daft-algebra",
+  "src/daft-avro",
   "src/daft-catalog",
   "src/daft-checkpoint",
   "src/daft-context",
@@ -244,7 +253,6 @@ exclude = [
 
 [workspace.dependencies]
 arrow = "57.1.0"
-half = {version = "2.7.1", features = ["num-traits", "bytemuck", "serde"]}
 arrow-array = {version = "57.1.0", features = ["chrono-tz"]}
 arrow-buffer = "57.1.0"
 arrow-csv = "57.1.0"
@@ -318,7 +326,8 @@ geo = "0.29"
 geohash = "0.13"
 geojson = "1.0"
 h3o = "0.6"
-wkt = { version = "0.14", features = ["geo-types"] }
+half = {version = "2.7.1", features = ["num-traits", "bytemuck", "serde"]}
+wkt = {version = "0.14", features = ["geo-types"]}
 hashbrown = "0.16"
 html-escape = "0.2.13"
 image = {version = "0.25.10", default-features = false}

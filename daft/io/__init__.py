@@ -16,6 +16,8 @@ from daft.daft import (
     HuggingFaceConfig,
 )
 from daft.lazy_import import LazyImport
+from daft.io._avro import read_avro
+from daft.io.avro_tar import read_avro_tar
 from daft.io._csv import read_csv
 from daft.io._text import read_text
 from daft.io.delta_lake._deltalake import (
@@ -71,12 +73,15 @@ __all__ = [
     "TosConfig",
     "UnityConfig",
     "_range",
+    "delete_deltalake",
     "from_files",
     "from_glob_path",
-    "delete_deltalake",
+    "history_deltalake",
+    "merge_deltalake",
+    "read_avro",
+    "read_avro_tar",
     "read_csv",
     "read_deltalake",
-    "history_deltalake",
     "read_hudi",
     "read_huggingface",
     "read_iceberg",
@@ -91,5 +96,4 @@ __all__ = [
     "read_video_frames",
     "read_warc",
     "update_deltalake",
-    "merge_deltalake",
 ]

@@ -12,8 +12,8 @@ use common_display::DisplayAs;
 use common_error::DaftError;
 use daft_parquet::DaftParquetMetadata;
 use daft_schema::schema::{Schema, SchemaRef};
-use daft_stats::{TableMetadata, TableStatistics};
 pub use daft_stats::PartitionSpec;
+use daft_stats::{TableMetadata, TableStatistics};
 use either::Either;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ pub use anonymous::AnonymousScanOperator;
 mod expr_rewriter;
 mod file_format_config;
 pub mod source;
+pub use daft_avro::AvroSourceConfig;
 #[cfg(feature = "python")]
 pub use file_format_config::DatabaseSourceConfig;
 pub use file_format_config::{
@@ -634,6 +635,7 @@ impl ScanTask {
                                     1.0
                                 }
                             }
+                            FileFormatConfig::Avro(_) => 1.5,
                         },
                         #[cfg(feature = "python")]
                         SourceConfig::Database(_) | SourceConfig::PythonFunction { .. } => 1.0,
