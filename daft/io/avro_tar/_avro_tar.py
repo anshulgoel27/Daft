@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import tarfile
 import tempfile
@@ -17,6 +18,8 @@ from daft.io.source import DataSource, DataSourceTask
 from daft.logical.schema import Schema
 from daft.recordbatch import RecordBatch
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
@@ -29,9 +32,13 @@ def _list_tar_gz_files(path: str, io_config: IOConfig | None) -> list[str]:
     """List all .tar.gz / .tgz files at the given path or matching the given glob pattern."""
     from daft.dependencies import pafs
 
+    logger.debug("Listing tar.gz files at path: %s", path)
+
     if "*" in path or "?" in path:
         files = io_glob(path, io_config=io_config)
-        return [f["path"] for f in files if f["type"] == "File"]
+        result = [f["path"] for f in files if f["type"] == "File"]
+        logger.debug("Glob '%s' resolved to %d file(s)", path, len(result))
+        return result
 
     [resolved], fs = _resolve_paths_and_filesystem(path, io_config=io_config)
     try:
@@ -40,9 +47,11 @@ def _list_tar_gz_files(path: str, io_config: IOConfig | None) -> list[str]:
         return []
 
     if file_info.type == pafs.FileType.File:
+        logger.debug("Resolved single file: %s", resolved)
         return [resolved]
     if file_info.type != pafs.FileType.Directory:
         # Covers FileType.NotFound and FileType.Unknown — path does not exist
+        logger.debug("Path not found or unknown type: %s", resolved)
         return []
 
     selector = pafs.FileSelector(resolved, recursive=True)
@@ -51,11 +60,13 @@ def _list_tar_gz_files(path: str, io_config: IOConfig | None) -> list[str]:
     except (NotADirectoryError, FileNotFoundError):
         return []
 
-    return [
+    result = [
         fi.path
         for fi in infos
         if fi.type == pafs.FileType.File and (fi.path.endswith(".tar.gz") or fi.path.endswith(".tgz"))
     ]
+    logger.debug("Directory '%s' contains %d .tar.gz/.tgz file(s)", resolved, len(result))
+    return result
 
 
 def _read_first_avro_schema(tar_gz_path: str, io_config: IOConfig | None) -> Schema:
@@ -165,6 +176,12 @@ class AvroTarSource(DataSource):
         if not self._tar_gz_uris:
             raise FileNotFoundError(f"No .tar.gz files found at: {paths}")
 
+        logger.info(
+            "AvroTarSource: found %d archive(s) to read%s",
+            len(self._tar_gz_uris),
+            f" (projection: {column_names})" if column_names else "",
+        )
+
         # Infer schema from the first archive
         import pyarrow as pa
 
@@ -225,17 +242,26 @@ class AvroTarSourceTask(DataSourceTask):
         return self._schema
 
     async def read(self) -> AsyncIterator[RecordBatch]:
+        logger.info("AvroTarSourceTask: reading archive %s", self._uri)
         with daft.open_file(self._uri, "rb", io_config=self._io_config) as f:
             gz_bytes = f.read()
+        logger.debug("Downloaded %d bytes from %s", len(gz_bytes), self._uri)
+
+        avro_members_found = 0
+        total_rows_yielded = 0
 
         with tarfile.open(fileobj=io.BytesIO(gz_bytes), mode="r:gz") as tf:
             for member in tf.getmembers():
                 if not member.name.endswith(".avro") or not member.isfile():
+                    logger.debug("Skipping non-avro member: %s", member.name)
                     continue
                 extracted = tf.extractfile(member)
                 if extracted is None:
+                    logger.warning("Could not extract member %s from %s — skipping", member.name, self._uri)
                     continue
 
+                avro_members_found += 1
+                logger.debug("Processing avro member: %s (%d bytes)", member.name, member.size)
                 avro_bytes = extracted.read()
                 tmp_path = None
                 try:
@@ -271,7 +297,17 @@ class AvroTarSourceTask(DataSourceTask):
                         )
                         rb = RecordBatch.from_arrow_table(combined)
 
+                    n_rows = len(rb)
+                    total_rows_yielded += n_rows
+                    logger.debug("Yielding %d rows from member %s in %s", n_rows, member.name, self._uri)
                     yield rb
                 finally:
                     if tmp_path and os.path.exists(tmp_path):
                         os.unlink(tmp_path)
+
+        logger.info(
+            "AvroTarSourceTask: finished %s — %d avro member(s), %d total row(s)",
+            self._uri,
+            avro_members_found,
+            total_rows_yielded,
+        )
