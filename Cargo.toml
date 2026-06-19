@@ -163,6 +163,12 @@ strip = "none"  # dont strip
 [profile.release.package.daft-parquet]
 opt-level = 2
 
+# opendal's services-oss feature (Alibaba Cloud OSS) uses heavy XML/serde generics
+# that make release compilation hang for 30+ min at opt-level=3.
+# opt-level=1 cuts compile time dramatically with negligible I/O performance impact.
+[profile.release.package.opendal]
+opt-level = 1
+
 [profile.release-lto]
 codegen-units = 1
 inherits = "release"

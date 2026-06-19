@@ -4,6 +4,14 @@
 - CONTRIBUTING.md for detailed development process
 - https://github.com/Eventual-Inc/Daft for issues, discussions, and PRs
 
+# Package Management
+
+This fork uses **[uv](https://github.com/astral-sh/uv)** to manage the virtual environment and Python dependencies.
+
+- Install packages into the venv: `uv pip install <package>`
+- Do **not** use `pip install` directly — the venv has no standalone `pip`; use `uv pip install` instead.
+- The venv is created and synced via `make .venv` (calls `uv venv` + `uv sync` under the hood).
+
 # Dev Workflow
 
 1. [Once] Set up Python environment and install dependencies: `make .venv`
