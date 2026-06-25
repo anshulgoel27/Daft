@@ -27,6 +27,7 @@ daft-text = {path = "src/daft-text", default-features = false}
 daft-dashboard = {path = "src/daft-dashboard", default-features = false}
 daft-distributed = {path = "src/daft-distributed", default-features = false}
 daft-dsl = {path = "src/daft-dsl", default-features = false}
+daft-duckdb = {path = "src/daft-duckdb", default-features = false}
 daft-file = {path = "src/daft-file", default-features = false}
 daft-functions = {path = "src/daft-functions"}
 daft-functions-binary = {path = "src/daft-functions-binary", default-features = false}
@@ -88,6 +89,7 @@ python = [
   "daft-dashboard/python",
   "daft-distributed/python",
   "daft-dsl/python",
+  "daft-duckdb/python",
   "daft-file/python",
   "daft-functions-binary/python",
   "daft-functions-json/python",
@@ -202,6 +204,7 @@ members = [
   "src/daft-csv",
   "src/daft-dashboard",
   "src/daft-dsl",
+  "src/daft-duckdb",
   "src/daft-ext",
   "src/daft-ext-internal",
   "src/daft-ext-macros",

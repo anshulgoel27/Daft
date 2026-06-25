@@ -126,6 +126,7 @@ pub mod pylib {
         daft_csv::register_modules(m)?;
         daft_distributed::register_modules(m)?;
         daft_dsl::register_modules(m)?;
+        daft_duckdb::python::register_modules(m)?;
         daft_functions::register_modules(m)?;
         daft_io::register_modules(m)?;
         daft_json::register_modules(m)?;
