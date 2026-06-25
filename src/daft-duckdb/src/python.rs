@@ -56,6 +56,18 @@ impl PyDuckDbExecutor {
         Ok(wrap_results(batches))
     }
 
+    /// Translate `plan` to DuckDB SQL without executing it. Returns `(sql, [source_id, ...])`
+    /// where each `source_id` is a `daft_src_<id>` table the SQL references. Used by the Python
+    /// zero-copy executor (Phase 2b): it registers each source as an Arrow view under that name
+    /// (`con.register("daft_src_<id>", table)`) then runs the SQL — comparing the duckdb Python
+    /// package's in-place Arrow scan against this crate's Appender copy.
+    #[staticmethod]
+    pub fn plan_to_sql(plan: &PyLocalPhysicalPlan) -> PyResult<(String, Vec<SourceId>)> {
+        let sql_plan = crate::plan_sql::plan_to_sql(&plan.plan)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok((sql_plan.sql, sql_plan.bindings))
+    }
+
     /// Register `inputs` once, then time `repeat` executions of the query. Returns
     /// `(registration_seconds, [run_seconds, ...])` — separates the per-task registration/copy
     /// cost ("cold") from steady-state query compute ("warm"). For benchmarking.

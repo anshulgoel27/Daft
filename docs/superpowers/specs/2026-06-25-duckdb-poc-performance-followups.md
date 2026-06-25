@@ -80,6 +80,28 @@ Attempted Phase 2a (bulk-materialize via the `arrow()` table function). **It doe
 
 **Decision:** keep the Appender (optimal available); mark #1 BLOCKED/deferred; the achievable remaining wins are Phase 3 (#2 connection pooling + #3 SQL/prepared-statement cache), which cut per-task *fixed* overhead rather than the copy.
 
+## Phase 2b (#1 zero-copy — UNBLOCKED, measured via the duckdb Python package)
+
+The Rust block (Phase 2) is specific to **duckdb-rs 1.10501** — DuckDB's C++ engine *does* have a true in-place Arrow scan; it's just not surfaced by these Rust bindings. The **duckdb Python package (1.5.3)** exposes it: `con.register(name, arrow_table)` creates an Arrow view that DuckDB scans in place (zero-copy for fixed-width primitives; strings/nested still convert), no row copy. Phase 2b reuses the Rust SQL translation (`plan_to_sql`, now exposed to Python as `DuckDbExecutor.plan_to_sql(plan) -> (sql, [source_id])`) and feeds it zero-copy-registered Arrow, to measure how far the per-task "cold" cost collapses once the ingestion copy is removed.
+
+Delivered: `DuckDbExecutor.plan_to_sql` pyo3 binding; `run_duckdb_zerocopy` + `duckdb_bench_zerocopy` in `tests/duckdb_poc/_harness.py`; a correctness test (`test_duckdb_zerocopy_matches_swordfish`, green — same result as swordfish); the benchmark now reports the Appender path and the zero-copy path side by side.
+
+Benchmark (native runner, ITERS=5, no sort, DuckDB default threads). `app` = Appender (duckdb-rs, copies); `zc` = zero-copy (duckdb Python, in-place scan). `cold` = honest per-task swap cost (get-data-in + one query); zero-copy `cold` includes `arr` = Daft→pyarrow, the analog of the Appender's `reg` copy:
+
+| size | sword ms | app cold | app warm | app reg | zc cold | zc warm | zc reg | zc arr | zc/native | app/native | zc/app cold |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 10K | 16.5 | 5.8 | 2.5 | 3.3 | 1.5 | 1.0 | 0.3 | 0.2 | **0.09** | 0.35 | **0.26** |
+| 1M | 151.9 | 93.6 | 22.4 | 71.2 | 17.2 | 16.7 | 0.3 | 0.2 | **0.11** | 0.62 | **0.18** |
+| 10M | 1125.6 | 774.0 | 127.7 | 646.3 | 236.0 | 235.6 | 0.3 | 0.2 | **0.21** | 0.69 | **0.30** |
+
+**Findings:**
+- **The ingestion copy is gone.** `zc reg` ≈ 0.3 ms at every size (vs Appender `reg` 3.3 / 71.2 / 646.3 ms). `register` only creates the Arrow view; the in-place scan is deferred to query time, so it folds into each run — which is why `zc cold ≈ zc warm` at every size (the ~84% copy phase the Appender pays simply does not exist).
+- **Zero-copy cold is 3–5.5× cheaper than Appender cold** (`zc/app` 0.26 / 0.18 / 0.30) and **beats swordfish at every size**, including 10K: `zc/native` 0.09 / 0.11 / 0.21 → DuckDB-with-zero-copy is **~5–11× faster than swordfish even counting the full per-task swap cost**.
+- **The small-partition crossover is erased.** In Phase 1 the Appender lost at small sizes (10K `cold/native` 0.35). With zero-copy, 10K cold is 1.5 ms vs swordfish 16.5 ms (0.09×) — DuckDB now wins across the whole measured range.
+- One asymmetry: `zc warm` (re-scans Arrow each run) is *higher* than `app warm` at 10M (235 vs 128 ms) because the Appender has data resident in DuckDB's native columnar format. This is irrelevant to a per-task swap (one query per task), where `cold` is the metric and zero-copy wins decisively.
+
+**Caveats / production path:** this measurement runs in the **Python** package, not the Rust worker seam, and zero-copy is **partial** (primitives in place; strings/nested convert — visible in the 10M `zc warm` scan cost). For a production Rust per-task backend the durable route is **ADBC** (supported, not deprecated, `bind_stream` zero-copy Arrow ingestion) or, short-term, **patch duckdb-rs to expose the raw connection handle and call `duckdb_arrow_scan`** fed a streaming `RecordBatchReader` (with a multi-reference fallback for self-joins). Phase 2b proves the ceiling is real and large; ADBC is how to capture it in Rust.
+
 ## Phase 3 results (DONE — #2 connection reuse + #3a translation cache)
 
 Delivered: `DuckDbSession` (`executor.rs`) — one connection (config applied once) reused across runs, with the translated SQL cached per plan identity; each run drops the prior partition's `daft_src_*` tables and registers the new ones. Unit test (`session_reuses_connection_across_runs`) + a Rust benchmark example (`examples/session_bench.rs`). 26 crate tests pass.
@@ -98,4 +120,9 @@ Benchmark (debug build, 500 runs of a small 1000-row partition):
 
 ## Overall conclusion
 
-Phase 1 quantified it and the phases bear it out: **DuckDB's compute is 7–9× faster than swordfish**, but the per-task swap has two costs — the **Arrow→DuckDB ingestion copy** (dominates large partitions; **blocked** by duckdb-rs having no in-place arrow scan) and **connection/translation fixed overhead** (dominates small partitions; **fixed** by `DuckDbSession`, 13.4×). A production per-task swap would use a per-worker `DuckDbSession` with `threads`/`memory_limit` caps; it wins big on small partitions and on compute-heavy queries, and is a wash on large-partition ingestion until a zero-copy arrow scan becomes available.
+Phase 1 quantified it and the phases bear it out: **DuckDB's compute is 7–9× faster than swordfish**, and the per-task swap has two costs — the **Arrow→DuckDB ingestion copy** (dominates large partitions) and **connection/translation fixed overhead** (dominates small partitions; **fixed** by `DuckDbSession`, 13.4×). Both are now answered:
+
+- **Ingestion copy:** blocked in duckdb-rs 1.10501 (Phase 2), but **Phase 2b proved it is removable** — the duckdb Python package's in-place Arrow scan collapses cold to warm and makes DuckDB **faster than swordfish at every size** (`zc/native` 0.09–0.21), erasing the small-partition crossover. The copy was a binding limitation, not a DuckDB one.
+- **Fixed overhead:** fixed by the per-worker `DuckDbSession` (13.4× on small/many partitions).
+
+A production per-task swap would use a per-worker session with `threads`/`memory_limit` caps and a **zero-copy Arrow ingestion path** — captured in Rust via **ADBC** (`bind_stream`) or a duckdb-rs patch calling `duckdb_arrow_scan` over a streaming `RecordBatchReader`. With both, DuckDB wins across the whole measured size range, not just on compute-heavy queries.

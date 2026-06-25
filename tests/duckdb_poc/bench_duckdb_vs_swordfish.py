@@ -3,10 +3,15 @@ from __future__ import annotations
 import statistics
 import time
 
-import daft
 import numpy as np
 
-from tests.duckdb_poc._harness import build_plan_and_inputs, duckdb_bench, run_native_unsorted
+import daft
+from tests.duckdb_poc._harness import (
+    build_plan_and_inputs,
+    duckdb_bench,
+    duckdb_bench_zerocopy,
+    run_native_unsorted,
+)
 
 SIZES = [10_000, 1_000_000, 10_000_000]
 ITERS = 5
@@ -45,24 +50,47 @@ def median_ms_native(plan, inputs) -> float:
 
 def main() -> None:
     daft.set_runner_native()
-    # cold  = registration (Arrow->DuckDB copy) + one query  -> the real per-task swap cost
-    # warm  = query only, inputs already registered          -> pure DuckDB compute
-    # reg   = registration alone                             -> the copy overhead the swap pays
+
+    # Two DuckDB ingestion paths, both vs swordfish:
+    #   APPENDER  (duckdb-rs)        -- CREATE TABLE + Appender: copies every row into DuckDB
+    #                                   native storage up front (reg), then queries cheaply (warm).
+    #   ZERO-COPY (duckdb Python)    -- con.register Arrow view: no up-front copy (reg ~= 0), each
+    #                                   query scans the Arrow buffers in place (so the scan is in
+    #                                   every warm run). `arr` = Daft -> pyarrow conversion.
+    #   cold = the honest per-task swap cost = get-data-in + one query.
+    #     appender cold = reg + warm
+    #     zero-copy cold = arr + reg + warm   (includes Daft->Arrow, the analog of appender's reg)
     hdr = (
-        f"{'size':>12} {'sword ms':>10} {'duck cold ms':>13} {'duck warm ms':>13} "
-        f"{'reg ms':>9} {'warm/native':>12} {'cold/native':>12}"
+        f"{'size':>12} {'sword ms':>9} "
+        f"{'app cold':>9} {'app warm':>9} {'app reg':>8} "
+        f"{'zc cold':>9} {'zc warm':>9} {'zc reg':>7} {'zc arr':>7} "
+        f"{'zc/native':>10} {'app/native':>11} {'zc/app cold':>12}"
     )
     print(hdr)
+    # Warm up the duckdb Python package's Arrow-scan machinery once: the first register in a
+    # process pays a one-time init that would otherwise be misattributed to the first size's reg.
+    _wp, _wi = build_plan_and_inputs(make_query(SIZES[0]))
+    duckdb_bench_zerocopy(_wp, _wi, 1, THREADS, MEMORY_LIMIT)
     for n in SIZES:
         plan, inputs = build_plan_and_inputs(make_query(n))
         sword = median_ms_native(plan, inputs)
-        reg_s, run_s = duckdb_bench(plan, inputs, ITERS, THREADS, MEMORY_LIMIT)
-        warm = statistics.median(run_s) * 1000.0
-        reg = reg_s * 1000.0
-        cold = reg + warm
+
+        app_reg_s, app_run_s = duckdb_bench(plan, inputs, ITERS, THREADS, MEMORY_LIMIT)
+        app_warm = statistics.median(app_run_s) * 1000.0
+        app_reg = app_reg_s * 1000.0
+        app_cold = app_reg + app_warm
+
+        arr_s, zc_reg_s, zc_run_s = duckdb_bench_zerocopy(plan, inputs, ITERS, THREADS, MEMORY_LIMIT)
+        zc_warm = statistics.median(zc_run_s) * 1000.0
+        zc_reg = zc_reg_s * 1000.0
+        zc_arr = arr_s * 1000.0
+        zc_cold = zc_arr + zc_reg + zc_warm
+
         print(
-            f"{n:>12,} {sword:>10.1f} {cold:>13.1f} {warm:>13.1f} "
-            f"{reg:>9.1f} {warm / sword:>12.2f} {cold / sword:>12.2f}"
+            f"{n:>12,} {sword:>9.1f} "
+            f"{app_cold:>9.1f} {app_warm:>9.1f} {app_reg:>8.1f} "
+            f"{zc_cold:>9.1f} {zc_warm:>9.1f} {zc_reg:>7.1f} {zc_arr:>7.1f} "
+            f"{zc_cold / sword:>10.2f} {app_cold / sword:>11.2f} {zc_cold / app_cold:>12.2f}"
         )
 
 
