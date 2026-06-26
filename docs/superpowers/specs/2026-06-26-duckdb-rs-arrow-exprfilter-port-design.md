@@ -1,7 +1,9 @@
 # duckdb-rs Arrow Filter Pushdown — EXPRESSION_FILTER Port (Phase B) Design
 
+> **⛔ SUPERSEDED (2026-06-26)** by [v1.5.4 full-coverage design](2026-06-26-duckdb-rs-arrow-v154-fullfilter-design.md). The DuckDB-`main` bump this depends on is abandoned: verification showed released **v1.5.4 already provides the same filter coverage** (it has both the structured kinds and `EXPRESSION_FILTER`) on a stable build, so we extend the structured walker on v1.5.4 instead of porting onto unreleased `main`. Kept for the record only.
+
 **Date:** 2026-06-26
-**Status:** Design approved; ready for implementation plan
+**Status:** Superseded — do not implement
 **Related:** [upstream design](2026-06-26-duckdb-rs-zerocopy-arrow-upstream-design.md) · branch `arrow-zerocopy-duckdb-main` (foundation commit `911fc15`) · reference: duckdb-python `/Volumes/Work/Code/duckdb-python/src/duckdb_py/arrow/filter_pushdown_visitor.cpp`
 
 ## Goal

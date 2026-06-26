@@ -1,5 +1,7 @@
 # duckdb-rs Arrow EXPRESSION_FILTER Port (Phase B) Implementation Plan
 
+> **⛔ SUPERSEDED (2026-06-26)** — do not execute. The DuckDB-`main` bump this plan targets is abandoned. See [v1.5.4 full-coverage design](../specs/2026-06-26-duckdb-rs-arrow-v154-fullfilter-design.md); a new plan supersedes this one. Kept for the record only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Rewrite `arrow_zerocopy`'s filter pushdown to DuckDB **main**'s `EXPRESSION_FILTER` model (structured `TableFilter` kinds are gone), porting duckdb-python's `TransformExpression` — restoring + extending filter-pushdown coverage on the bumped foundation.
