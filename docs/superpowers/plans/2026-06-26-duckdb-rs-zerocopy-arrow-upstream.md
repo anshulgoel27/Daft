@@ -114,13 +114,14 @@ In `crates/duckdb/src/arrow_zerocopy/mod.rs` `#[cfg(test)] mod test`, reuse/defi
     }
 
     #[test]
-    fn unhandled_pushed_filter_fails_cleanly() {
-        // An IN filter is not handled in Task 1 → clean query error, NOT a wrong result or crash.
-        let conn = Connection::open_in_memory().unwrap();
-        let reg = conn.register_arrow("v", vec![sample()]).unwrap();
-        let err = conn.query_row("SELECT count(*) FROM v WHERE k IN (1, 3)", [], |r| r.get::<_, i64>(0));
-        assert!(err.is_err(), "expected a clean error for an unhandled pushed filter, got {err:?}");
-        drop(reg);
+    fn unhandled_filter_kind_errors_not_silently_wrong() {
+        // Fail-loud guard: an unhandled filter kind must make the evaluator return Err (which
+        // rust_produce routes into error_stream → a clean DuckDB scan failure), NEVER a wrong
+        // (over/under-inclusive) result. A unit test of the policy so it stays stable across tasks
+        // — a SQL-level test would be fragile (a kind unhandled in Task 1 becomes handled in Task 2).
+        use super::filter::{FilterNode, evaluate};
+        let err = evaluate(&FilterNode::Unhandled(9), &sample());
+        assert!(err.is_err(), "unhandled filter kind must error, got {err:?}");
     }
 ```
 
@@ -242,7 +243,7 @@ On any `FilterError`/compute error, fall through to `error_stream(f.schema.clone
 - [ ] **Step 8: Run the tests to confirm they pass**
 
 Run: `cargo test -p duckdb --features "bundled appender-arrow" arrow_zerocopy 2>&1 | tail -20`
-Expected: `constant_comparison_filter_applied_no_global_setting` PASS (7 and 1) and `unhandled_pushed_filter_fails_cleanly` PASS (IN → clean error). Also re-run the carried-over spike tests (round-trip, projection, self-join) — all pass. (First build recompiles the amalgamation + shim, several minutes.)
+Expected: `constant_comparison_filter_applied_no_global_setting` PASS (7 and 1) and `unhandled_filter_kind_errors_not_silently_wrong` PASS. Also re-run the carried-over spike tests (round-trip, projection, self-join) — all pass. (First build recompiles the amalgamation + shim, several minutes.)
 
 - [ ] **Step 9: Commit**
 
@@ -443,5 +444,5 @@ Record the upstream-version outcome (final API, filter coverage, benchmark with 
 
 - **Arrow v58 API drift:** `Scalar::new`, `Datum`, `cmp::{eq,neq,lt,lt_eq,gt,gt_eq}`, `boolean::{and,or}`, `is_null`/`is_not_null`, `filter_record_batch`, `cast` — adapt exact signatures against `crates/duckdb/src/vtab/arrow.rs` and arrow-58 docs; do not invent.
 - **Column index mapping** (`filter_to_col` → projected position) is the subtlest C++ point: verify against duckdb-python's `arrow_array_stream.cpp` factory and add a focused test if a projected+filtered query disagrees with the Appender.
-- **Correctness invariant:** the factory must NEVER return a row set wider or narrower than the pushed filter requires for a *handled* kind, and must `error_stream` (not guess) for unhandled kinds/types. The `unhandled_pushed_filter_fails_cleanly` test guards this; keep an equivalent guard as coverage widens.
+- **Correctness invariant:** the factory must NEVER return a row set wider or narrower than the pushed filter requires for a *handled* kind, and must `error_stream` (not guess) for unhandled kinds/types. The `unhandled_filter_kind_errors_not_silently_wrong` unit test guards the evaluator's fail-loud policy; keep it as coverage widens (it tests `FilterNode::Unhandled`, which always errors regardless of which SQL kinds become handled).
 - **First build is slow** (amalgamation + shim); subsequent Rust/shim edits are fast.
