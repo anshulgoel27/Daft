@@ -136,6 +136,26 @@ Benchmark (release, no-filter `groupby` agg, cold per-task, K=5):
 
 **Verdict:** the mechanism is reachable from Rust on our existing dependency, but in its only Rust-reachable form it's a **deprecated** API with a **filter-pushdown correctness landmine** and a **workload-dependent (often modest) win**. Not a clean production swap as-is. Capturing the Phase 2b ceiling safely needs the non-deprecated replayable-Arrow registration DuckDB uses internally (what Python `register` calls) exposed to Rust — i.e., upstream duckdb-rs support or a DuckDB fix, not a deprecated-C-API workaround.
 
+## Phase 2d (DONE — duckdb-rs C++ shim: correct zero-copy from Rust)
+
+Phase 2c's blockers are inherent to the C API's hardcoded `FactoryGetNext`. Phase 2d builds the fix Phase 2c pointed to: a thin C++ shim in a **duckdb-rs 1.10504 fork** (`/Volumes/Work/Code/duckdb-rs`, branch `zerocopy-arrow-shim-spike`) that registers the native `arrow_scan` table function with a **Rust-driven factory** — replayable (a fresh `FFI_ArrowArrayStream` per scan) and projection-honoring. All Arrow logic stays in Rust; the C++ is a trampoline + the `TableFunction(...)->CreateView(...)` call. New Rust API: `Connection::register_arrow_zerocopy(name, batches) -> ArrowRegistration`. Design + plan: `2026-06-26-duckdb-rs-zerocopy-arrow-shim-design.md` / `plans/2026-06-26-duckdb-rs-zerocopy-arrow-shim.md`. Lean filter handling: the caller runs `SET disabled_optimizers='filter_pushdown'` and filters apply above the scan (no `TableFilterSet` translation — deferred).
+
+**Correctness (all green):** round-trip (`SELECT *` == input), projection subset, **self-join** (`v a JOIN v b` — proves replayability, the exact thing the Phase 2c one-shot path cannot do), filter-with-pushdown-disabled (correct), plus a canary confirming the filter-drop bug still occurs with pushdown ON.
+
+**Performance** (release, cold per-task, K=5; copy-dominated workload: wide 8-column int64 table, `SELECT sum(c0)` — exercises both copy-elimination and projection pushdown), zero-copy `register_arrow_zerocopy` vs the Appender:
+
+| rows | appender ms | zero-copy ms | speedup |
+|---|---|---|---|
+| 100K | 4.5 | 2.9 | 1.56× |
+| 1M | 18.9 | 3.3 | 5.72× |
+| 10M | 160.6 | 7.8 | **20.6×** |
+
+**This brackets the win.** Phase 2c (compute-bound agg, all columns) was 1.1–1.3×; Phase 2d (ingest-bound, selective projection) is up to **20×**. Zero-copy + projection pushdown pays off **proportional to how much of the work is ingestion**: large inputs / light compute / selective projection → big; compute-heavy / all-columns → small. The Appender's cost scales with rows×columns copied; the zero-copy path scans only the projected columns in place.
+
+**Soundness:** the whole-branch review verified the FFI/ABI/ownership against the DuckDB + arrow-rs source (happy path sound, no leaks/double-free, replayability real) and caught one bug — a produce-time panic wrote a null-`get_next` stream (would segfault DuckDB's scan); fixed to export a clean error stream. Branch commits: `6a48b94`, `ff04b53`, `abe1a33`, `8182c1d`.
+
+**Verdict:** **Option 2 is feasible and worth it** — correct zero-copy from Rust, no ADBC, no deprecated API in the hot path, via a small C++ shim. It is a **fork spike** (primitives + Utf8; lean filters). Productionizing/upstreaming needs broader Arrow types, in-scan filter pushdown (translate `TableFilterSet`, à la duckdb-python's `filter_pushdown_visitor`), and a `Send` story — then it is a candidate duckdb-rs upstream contribution.
+
 ## Phase 3 results (DONE — #2 connection reuse + #3a translation cache)
 
 Delivered: `DuckDbSession` (`executor.rs`) — one connection (config applied once) reused across runs, with the translated SQL cached per plan identity; each run drops the prior partition's `daft_src_*` tables and registers the new ones. Unit test (`session_reuses_connection_across_runs`) + a Rust benchmark example (`examples/session_bench.rs`). 26 crate tests pass.
@@ -156,7 +176,7 @@ Benchmark (debug build, 500 runs of a small 1000-row partition):
 
 Phase 1 quantified it and the phases bear it out: **DuckDB's compute is 7–9× faster than swordfish**, and the per-task swap has two costs — the **Arrow→DuckDB ingestion copy** (dominates large partitions) and **connection/translation fixed overhead** (dominates small partitions; **fixed** by `DuckDbSession`, 13.4×). Both are now answered:
 
-- **Ingestion copy:** **Phase 2b proved the ceiling is real** — the duckdb Python package's in-place Arrow scan collapses cold to warm and makes DuckDB faster than swordfish at every size. But **Phase 2c showed it is hard to capture safely from Rust**: ADBC is a bulk-copy (and absent from the bundled lib); the one zero-copy mechanism reachable in-process (`duckdb_arrow_scan`, which we *can* call on the existing dependency) is a deprecated API with a **filter-pushdown correctness bug** over a streamed source, and a workload-dependent (often modest, 1.1–1.3×) win. The win the Python path shows comes from its **materialized, replayable** Arrow registration, which isn't exposed to Rust.
+- **Ingestion copy:** **Phase 2b proved the ceiling is real** (Python in-place scan). Phase 2c showed the only *out-of-the-box* Rust mechanism (deprecated `duckdb_arrow_scan`) is a filter-dropping, one-shot dead end. **Phase 2d removed the blocker**: a small C++ shim in a duckdb-rs fork registers the native `arrow_scan` with a replayable, projection-honoring Rust factory — correct zero-copy from Rust (no ADBC, no deprecated API in the hot path), **1.56–20.6× cheaper cold than the Appender** on copy/projection-dominated workloads (and ~1.1× when compute-bound). Still a fork spike (primitives + Utf8; lean filters).
 - **Fixed overhead:** **fixed** by the per-worker `DuckDbSession` (13.4× on small/many partitions) — safe, no caveats.
 
-**Net recommendation:** the safe, bankable wins are **DuckDB compute (7–9×)** + **connection reuse (`DuckDbSession`, 13.4×)** + per-worker `threads`/`memory_limit` caps, with the **Appender** for ingestion (correct, modest cost). Treat zero-copy ingestion as **deferred, not unlocked**: the Phase 2b ceiling is genuine, but realizing it in the Rust seam requires the non-deprecated replayable-Arrow registration DuckDB uses internally to be exposed to Rust (upstream duckdb-rs support or a DuckDB fix) — the deprecated `duckdb_arrow_scan` stream path is not a clean production swap (filter-pushdown bug + deprecation). A production per-task swap should ship on the safe wins now and revisit zero-copy ingestion when an upstream replayable-Arrow API lands.
+**Net recommendation:** the bankable wins to ship first are **DuckDB compute (7–9×)** + **connection reuse (`DuckDbSession`, 13.4×)** + per-worker `threads`/`memory_limit` caps. For ingestion: the Appender is correct and fine when compute dominates; the **Phase 2d zero-copy shim is the clear win when ingestion/projection dominates** (large inputs, light compute, selective projection — up to 20×). Zero-copy ingestion is now **demonstrated, not deferred** — the remaining work is hardening the fork spike into a production/upstream contribution (broader Arrow types, in-scan filter pushdown via `TableFilterSet` translation, a `Send` story), which is a scoped follow-up rather than an open research question.
