@@ -14,6 +14,36 @@ use daft_recordbatch::RecordBatch;
 use crate::arrow_bridge::{arrow_to_daft_batches, source_to_arrow};
 use crate::plan_sql::plan_to_sql;
 
+/// DuckDB's `arrow_scan` parallelizes at record-batch granularity, so a single large Arrow batch
+/// is scanned single-threaded. Splitting each source into one batch per ~morsel lets the scan use
+/// all cores. 122_880 = DuckDB's row-group/morsel size (60 * 2048), so each batch ≈ one morsel.
+const TARGET_ROWS_PER_BATCH: usize = 122_880;
+
+/// Split any batch larger than `target_rows` into ~equal slices so DuckDB's per-batch-parallel
+/// arrow scan can use all cores. Batches with `<= target_rows` (or `target_rows == 0`) pass
+/// through unchanged. `RecordBatch::slice` is a zero-copy offset view — no row copy — so the
+/// zero-copy registration property is preserved.
+fn rebatch(batches: Vec<ArrowBatch>, target_rows: usize) -> Vec<ArrowBatch> {
+    if target_rows == 0 {
+        return batches;
+    }
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let n = batch.num_rows();
+        if n <= target_rows {
+            out.push(batch);
+            continue;
+        }
+        let mut offset = 0;
+        while offset < n {
+            let len = std::cmp::min(target_rows, n - offset);
+            out.push(batch.slice(offset, len));
+            offset += len;
+        }
+    }
+    out
+}
+
 /// Tuning for a DuckDB execution, applied as connection PRAGMAs. `None` leaves DuckDB's
 /// default (all cores / ~80% RAM). On a worker running many concurrent tasks, capping
 /// `threads`/`memory_limit` per task avoids core/RAM oversubscription.
@@ -156,6 +186,8 @@ fn register_sources<'c>(
                 "duckdb POC: source {source_id} has no record batches"
             )));
         }
+        // Split large batches so DuckDB's per-batch-parallel arrow scan uses all cores.
+        let arrow_batches = rebatch(arrow_batches, TARGET_ROWS_PER_BATCH);
         let view = conn
             .register_arrow(&format!("daft_src_{source_id}"), arrow_batches)
             .map_err(|e| DaftError::External(Box::new(e)))?;
@@ -315,6 +347,82 @@ mod tests {
         let out = DuckDbExecutor::run(&plan, &inputs).unwrap();
         let total: usize = out.iter().map(|b| b.len()).sum();
         assert_eq!(total, 2); // (250, "us") and (350, "us")
+    }
+
+    #[test]
+    fn filter_over_large_source_is_rebatched_and_correct() {
+        // 300_000-row source (> TARGET_ROWS_PER_BATCH 122_880 -> 3 batches) so register_sources
+        // slices it; the filter must still return the exact rows through the zero-copy scan.
+        let schema = Arc::new(Schema::new(vec![Field::new("amount", DataType::Int64)]));
+        let col = Int64Array::from_vec("amount", (0..300_000i64).collect()).into_series();
+        let rb = daft_recordbatch::RecordBatch::from_nonempty_columns(vec![col]).unwrap();
+        let mp = Arc::new(MicroPartition::new_loaded(
+            schema.clone(),
+            Arc::new(vec![rb]),
+            None,
+        ));
+        let scan = LocalPhysicalPlan::in_memory_scan(
+            11,
+            schema.clone(),
+            0,
+            StatsState::NotMaterialized,
+            LocalNodeContext::default(),
+        );
+        // amount > 250_000 over 0..=299_999 -> values 250_001..=299_999 -> 49_999 rows.
+        let pred = daft_dsl::expr::bound_expr::BoundExpr::try_new(
+            resolved_col("amount").gt(lit(250_000i64)),
+            &schema,
+        )
+        .unwrap();
+        let plan = LocalPhysicalPlan::filter(
+            scan,
+            pred,
+            StatsState::NotMaterialized,
+            LocalNodeContext::default(),
+        );
+        let mut inputs = HashMap::new();
+        inputs.insert(11u32, vec![mp]);
+
+        let out = DuckDbExecutor::run(&plan, &inputs).unwrap();
+        let total: usize = out.iter().map(|b| b.len()).sum();
+        assert_eq!(total, 49_999);
+    }
+
+    #[test]
+    fn rebatch_splits_large_batches_zero_copy_and_lossless() {
+        use arrow_array::{Array, Int64Array, RecordBatch as AB};
+        use arrow_schema::{DataType as AdT, Field as AF, Schema as ASch};
+        use std::sync::Arc as A;
+
+        let schema = A::new(ASch::new(vec![AF::new("v", AdT::Int64, false)]));
+        let arr = A::new(Int64Array::from_iter_values(0..1000i64));
+        let batch = AB::try_new(schema, vec![arr]).unwrap();
+
+        // target 300 -> ceil(1000/300) = 4 slices
+        let out = rebatch(vec![batch.clone()], 300);
+        assert_eq!(out.len(), 4, "ceil(1000/300) slices");
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 1000, "rows preserved");
+        // values + order preserved across the offset slices (value(i) is offset-correct)
+        let mut seen = Vec::new();
+        for b in &out {
+            let c = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                seen.push(c.value(i));
+            }
+        }
+        assert_eq!(seen, (0..1000i64).collect::<Vec<_>>(), "values preserved");
+
+        // <= target -> unchanged (one batch, same rows)
+        let small = rebatch(vec![batch.clone()], 5000);
+        assert_eq!(small.len(), 1);
+        assert_eq!(small[0].num_rows(), 1000);
+
+        // target 0 -> no split (guard against divide-by-zero)
+        let zero = rebatch(vec![batch], 0);
+        assert_eq!(zero.len(), 1);
+
+        // empty input -> empty output
+        assert!(rebatch(Vec::<AB>::new(), 300).is_empty());
     }
 
 }
