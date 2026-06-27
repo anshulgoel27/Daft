@@ -13,7 +13,7 @@ daft-micropartition = {path = "../daft-micropartition", default-features = false
 daft-recordbatch = {path = "../daft-recordbatch", default-features = false}
 arrow-array = {workspace = true, features = ["ffi"]}
 arrow-schema = {workspace = true}
-duckdb = {version = "1.1", features = ["bundled", "appender-arrow"]}
+duckdb = {git = "https://github.com/anshulgoel27/duckdb-rs", branch = "arrow-zerocopy", features = ["bundled", "appender-arrow"]}
 pyo3 = {workspace = true, optional = true}
 
 [dev-dependencies]
