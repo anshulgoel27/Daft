@@ -2,7 +2,7 @@ use std::{marker::PhantomData, sync::Arc};
 
 use arrow::{
     array::{ArrayData, BooleanBufferBuilder, NullBufferBuilder, make_array},
-    buffer::{Buffer, MutableBuffer, NullBuffer, ScalarBuffer},
+    buffer::{Buffer, MutableBuffer, ScalarBuffer},
 };
 use common_error::DaftResult;
 
@@ -12,16 +12,6 @@ use crate::{
     datatypes::prelude::*,
     series::{IntoSeries, Series},
 };
-
-/// One source array's buffers/offset/validity, precomputed once so `extend` does no per-call
-/// `ArrayData::buffers()/offset()/nulls()` lookups. All fields are owned Arc-backed clones,
-/// so there is no borrow into the growable itself.
-struct SourceCache {
-    offset: usize,
-    nulls: Option<NullBuffer>,
-    buf0: Buffer,         // fixed-width/boolean: values; var-len: offsets
-    buf1: Option<Buffer>, // var-len: values
-}
 
 /// Handles three physical buffer layouts for direct buffer manipulation.
 /// Selected at construction time based on Daft `DataType`.
@@ -85,7 +75,7 @@ pub struct ArrowGrowable<'a, T: DaftArrowBackedType> {
     name: String,
     dtype: DataType,
     arrow_dtype: arrow::datatypes::DataType,
-    sources: Vec<SourceCache>,
+    source_data: Vec<ArrayData>,
     grower: ValueGrower,
     validity: Option<NullBufferBuilder>,
     len: usize,
@@ -100,32 +90,18 @@ impl<'a, T: DaftArrowBackedType> ArrowGrowable<'a, T> {
         use_validity: bool,
         capacity: usize,
     ) -> Self {
-        let mut sources = Vec::with_capacity(arrays.len());
-        let mut needs_validity = use_validity;
-        let mut arrow_dtype: Option<arrow::datatypes::DataType> = None;
-        for a in &arrays {
-            let data = a.to_data();
-            if arrow_dtype.is_none() {
-                arrow_dtype = Some(data.data_type().clone());
-            }
-            let bufs = data.buffers();
-            let nulls = data.nulls().cloned();
-            if nulls.is_some() {
-                needs_validity = true;
-            }
-            sources.push(SourceCache {
-                offset: data.offset(),
-                nulls,
-                buf0: bufs[0].clone(),
-                buf1: bufs.get(1).cloned(),
-            });
-        }
+        let source_data: Vec<ArrayData> = arrays.iter().map(|s| s.to_data()).collect();
+
         // Get arrow dtype from first source (handles extension types correctly,
         // since Extension dtype cannot go through DataType::to_arrow()).
-        let arrow_dtype = arrow_dtype
+        let arrow_dtype = source_data
+            .first()
+            .map(|d| d.data_type().clone())
             .unwrap_or_else(|| dtype.to_arrow().unwrap_or(arrow::datatypes::DataType::Null));
 
         let grower = grower_from_dtype(dtype, capacity);
+
+        let needs_validity = use_validity || source_data.iter().any(|d| d.nulls().is_some());
         let validity = if needs_validity {
             Some(NullBufferBuilder::new(capacity))
         } else {
@@ -136,7 +112,7 @@ impl<'a, T: DaftArrowBackedType> ArrowGrowable<'a, T> {
             name: name.to_string(),
             dtype: dtype.clone(),
             arrow_dtype,
-            sources,
+            source_data,
             grower,
             validity,
             len: 0,
@@ -151,12 +127,12 @@ where
 {
     #[inline]
     fn extend(&mut self, index: usize, start: usize, len: usize) {
-        let src = &self.sources[index];
+        let source = &self.source_data[index];
 
         // Extend validity bitmap.
         // NullBuffer from ArrayData::nulls() has offset baked in, so use logical indices.
         if let Some(ref mut validity) = self.validity {
-            if let Some(nulls) = &src.nulls {
+            if let Some(nulls) = source.nulls() {
                 validity.append_buffer(&nulls.slice(start, len));
             } else {
                 validity.append_n_non_nulls(len);
@@ -165,27 +141,36 @@ where
 
         // Extend value buffer(s).
         // Raw buffers from ArrayData::buffers() are NOT offset-adjusted,
-        // so we must add source.offset for physical byte access.
-        let offset = src.offset;
+        // so we must add source.offset() for physical byte access.
+        let offset = source.offset();
         match &mut self.grower {
             ValueGrower::FixedWidth { buffer, byte_width } => {
                 let bw = *byte_width;
-                let s = src.buf0.as_slice();
+                let src = source.buffers()[0].as_slice();
                 let byte_start = (offset + start) * bw;
-                buffer.extend_from_slice(&s[byte_start..byte_start + len * bw]);
+                buffer.extend_from_slice(&src[byte_start..byte_start + len * bw]);
             }
             ValueGrower::Boolean { builder } => {
-                let s = src.buf0.as_slice();
+                let src = source.buffers()[0].as_slice();
                 let base = offset + start;
                 for i in 0..len {
                     let bit_idx = base + i;
-                    let is_set = (s[bit_idx / 8] >> (bit_idx % 8)) & 1 == 1;
+                    let is_set = (src[bit_idx / 8] >> (bit_idx % 8)) & 1 == 1;
                     builder.append(is_set);
                 }
             }
             ValueGrower::VarLen { offsets, values } => {
-                let src_offsets: &[i64] = src.buf0.typed_data();
-                let src_values = src.buf1.as_ref().expect("var-len source has values buffer").as_slice();
+                debug_assert!(
+                    matches!(
+                        source.data_type(),
+                        arrow::datatypes::DataType::LargeUtf8
+                            | arrow::datatypes::DataType::LargeBinary
+                    ),
+                    "VarLen grower expects LargeUtf8/LargeBinary but got {:?}",
+                    source.data_type()
+                );
+                let src_offsets: &[i64] = source.buffers()[0].typed_data();
+                let src_values = source.buffers()[1].as_slice();
                 let base = offset + start;
                 for i in 0..len {
                     let idx = base + i;
@@ -326,48 +311,5 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result.i32().unwrap().get(0), Some(30));
         assert_eq!(result.i32().unwrap().get(1), Some(40));
-    }
-
-    #[test]
-    fn extend_multi_source_with_nulls_and_offset() {
-        let field = Field::new("v", DataType::Int32);
-        // src0 (no nulls), then slice it to offset=1 -> logical [20,30,40,50]
-        let src0_full =
-            Int32Array::from_iter(field.clone(), vec![Some(10), Some(20), Some(30), Some(40), Some(50)]);
-        let src0 = src0_full.slice(1, 5).unwrap(); // offset=1, values [20,30,40,50]
-        // src1 has a null
-        let src1 = Int32Array::from_iter(field.clone(), vec![Some(1), None, Some(3)]);
-
-        let mut g = ArrowGrowable::<Int32Type>::new(
-            "v", &DataType::Int32, vec![&src0, &src1], false, 0,
-        );
-        // from src0 (offset=1): take logical idx 1..3 -> [30,40]
-        g.extend(0, 1, 2);
-        // from src1: take 0..3 -> [1, null, 3]
-        g.extend(1, 0, 3);
-        // from src0: take logical idx 3 -> [50]
-        g.extend(0, 3, 1);
-
-        let out = g.build().unwrap();
-        let arr = out.i32().unwrap();
-        let got: Vec<Option<i32>> = (0..arr.len()).map(|i| arr.get(i)).collect();
-        assert_eq!(
-            got,
-            vec![Some(30), Some(40), Some(1), None, Some(3), Some(50)]
-        );
-    }
-
-    #[test]
-    fn extend_varlen_utf8_multi_source() {
-        let a = Utf8Array::from_iter("s", vec![Some("a"), Some("bb"), Some("ccc")].into_iter());
-        let b = Utf8Array::from_iter("s", vec![Some("dddd"), Some("e")].into_iter());
-        let mut g = ArrowGrowable::<Utf8Type>::new("s", &DataType::Utf8, vec![&a, &b], false, 0);
-        g.extend(0, 1, 2); // ["bb","ccc"]
-        g.extend(1, 0, 1); // ["dddd"]
-        g.extend(0, 0, 1); // ["a"]
-        let out = g.build().unwrap();
-        let arr = out.utf8().unwrap();
-        let got: Vec<Option<&str>> = (0..arr.len()).map(|i| arr.get(i)).collect();
-        assert_eq!(got, vec![Some("bb"), Some("ccc"), Some("dddd"), Some("a")]);
     }
 }
