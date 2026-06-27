@@ -265,4 +265,56 @@ mod tests {
         }
     }
 
+    /// `filter(amount > 100 AND region = 'us')` over a 4-row int+utf8 source, registered under
+    /// source id 7. Exercises multi-type (int comparison + utf8 equality) + conjunction pushdown
+    /// through the zero-copy register_arrow scan.
+    fn compound_plan_and_inputs() -> (LocalPhysicalPlanRef, HashMap<u32, Vec<MicroPartitionRef>>) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Int64),
+            Field::new("region", DataType::Utf8),
+        ]));
+        let amount = Int64Array::from_vec("amount", vec![50i64, 150, 250, 350]).into_series();
+        let region =
+            Utf8Array::from_slice("region", ["us", "eu", "us", "us"].as_slice()).into_series();
+        let rb = daft_recordbatch::RecordBatch::from_nonempty_columns(vec![amount, region]).unwrap();
+        let mp = Arc::new(MicroPartition::new_loaded(
+            schema.clone(),
+            Arc::new(vec![rb]),
+            None,
+        ));
+        let scan = LocalPhysicalPlan::in_memory_scan(
+            7,
+            schema.clone(),
+            0,
+            StatsState::NotMaterialized,
+            LocalNodeContext::default(),
+        );
+        // amount=[50,150,250,350], region=[us,eu,us,us]
+        // amount>100 -> 150(eu),250(us),350(us); AND region='us' -> 250,350 => 2 rows.
+        let pred = daft_dsl::expr::bound_expr::BoundExpr::try_new(
+            resolved_col("amount")
+                .gt(lit(100i64))
+                .and(resolved_col("region").eq(lit("us"))),
+            &schema,
+        )
+        .unwrap();
+        let plan = LocalPhysicalPlan::filter(
+            scan,
+            pred,
+            StatsState::NotMaterialized,
+            LocalNodeContext::default(),
+        );
+        let mut inputs = HashMap::new();
+        inputs.insert(7u32, vec![mp]);
+        (plan, inputs)
+    }
+
+    #[test]
+    fn compound_multitype_filter_pushdown() {
+        let (plan, inputs) = compound_plan_and_inputs();
+        let out = DuckDbExecutor::run(&plan, &inputs).unwrap();
+        let total: usize = out.iter().map(|b| b.len()).sum();
+        assert_eq!(total, 2); // (250, "us") and (350, "us")
+    }
+
 }
