@@ -910,7 +910,21 @@ EOF
 
 ---
 
-### Task 5: `EXPRESSION_FILTER` walker — comparison / constant / ref / conjunction
+### Tasks 5 & 6: DROPPED — `EXPRESSION_FILTER` walker is N/A on v1.5.4
+
+> **⛔ DROPPED after execution-time verification (2026-06-26).** Probing 12 predicate shapes
+> against a registered arrow view on DuckDB v1.5.4 showed the optimizer **never emits
+> `EXPRESSION_FILTER` (=9)** for an arrow scan: it constant-folds expressions
+> (`k+1=3` → `CONSTANT_COMPARISON k=2`), wraps OR/IN in `OPTIONAL_FILTER`, uses
+> `CONJUNCTION_AND` / `STRUCT_EXTRACT`, and keeps genuinely-complex or cross-column predicates
+> above the scan. Tasks 1–4 already handle every kind v1.5.4 pushes, so the `EXPRESSION_FILTER`
+> walker would be dead, untestable code with zero coverage gain on v1.5.4. The existing
+> `UNHANDLED → error_stream` already covers the (non-occurring) `EXPRESSION_FILTER` case safely.
+> Decision (user-approved): skip Tasks 5–6 and proceed to Task 7. The walker is the path
+> duckdb-python needs on DuckDB **main** (where structured kinds are LEGACY); revisit if/when the
+> bundle is bumped to such a release. The original Task 5/6 text is retained below for the record.
+
+#### (RETAINED FOR RECORD) Task 5: `EXPRESSION_FILTER` walker — comparison / constant / ref / conjunction
 
 Add `emit_expression` for the `EXPRESSION_FILTER` kind: handle a constant comparison whose column side is a bare `BOUND_REF`, and `AND`/`OR` of such. `BoundOperator` (IS NULL / IN) and struct_extract chains come in Task 6. Any untranslatable sub-expression → the whole filter is UNHANDLED (fail-loud).
 
@@ -1331,11 +1345,14 @@ Update the `register_arrow` doc comment to reflect the new coverage, refresh the
 
 In `mod.rs`, in the `register_arrow` doc comment, replace the filter-pushdown sentence:
 ```
-    /// **filter pushdown**: constant comparisons, IS [NOT] NULL, IN, AND/OR, STRUCT_EXTRACT
-    /// (struct-field) predicates, and arbitrary pushable EXPRESSION_FILTER trees are evaluated
-    /// in Rust over scalars of all pushable types (ints, unsigned, float/double incl. NaN, bool,
-    /// Utf8, Blob, Date, Time, Timestamp, Decimal128). OPTIONAL/DYNAMIC/BLOOM filters are safely
-    /// skipped; any other (untranslatable required) filter produces a clean error stream.
+    /// **filter pushdown**: constant comparisons, IS [NOT] NULL, IN, AND/OR, and STRUCT_EXTRACT
+    /// (struct-field) predicates are evaluated in Rust over scalars of all pushable types (ints,
+    /// unsigned, float/double incl. NaN total-order, bool, Utf8, Blob, Date, Time, Timestamp,
+    /// Decimal128). OPTIONAL/DYNAMIC/BLOOM filters are safely skipped. On DuckDB v1.5.4 the
+    /// optimizer routes every pushable arrow-scan filter to one of these structured kinds (it
+    /// constant-folds expressions and keeps genuinely-complex predicates above the scan), so the
+    /// catch-all EXPRESSION_FILTER kind is not emitted here; should one ever appear it produces a
+    /// clean error stream (fail-loud, never silently wrong).
 ```
 
 - [ ] **Step 2: Complete the scalar wire-format comment in the shim**
@@ -1366,11 +1383,11 @@ ls crates/duckdb/CHANGELOG.md 2>/dev/null || git -C /Volumes/Work/Code/duckdb-rs
 ```
 Add an "Unreleased" entry under the duckdb crate changelog:
 ```markdown
-- `Connection::register_arrow` filter pushdown now reaches duckdb-python coverage parity on
-  DuckDB v1.5.4: STRUCT_EXTRACT (struct-field) predicates via column paths, scalar breadth
-  (Date/Time/Timestamp/Decimal128/Blob + float NaN total-order), and a full EXPRESSION_FILTER
-  expression-tree walker. Untranslatable required filters fail loud; OPTIONAL/DYNAMIC/BLOOM
-  are safely skipped.
+- `Connection::register_arrow` filter pushdown now covers every filter kind DuckDB v1.5.4
+  pushes to an arrow scan: STRUCT_EXTRACT (struct-field) predicates via column paths, plus
+  scalar breadth (Date/Time/Timestamp/Decimal128/Blob + float NaN total-order) on top of the
+  existing constant-comparison / IS [NOT] NULL / AND·OR / IN coverage. OPTIONAL/DYNAMIC/BLOOM
+  are safely skipped; any unhandled required filter fails loud.
 ```
 
 - [ ] **Step 6: Commit**
