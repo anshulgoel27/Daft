@@ -1,28 +1,11 @@
-// Arrow ingestion path confirmed by Task 4 spike (examples/arrow_spike.rs):
-//
-// duckdb-1.10501.0 uses `arrow = "58"` (features: prettyprint, ffi).
-// Our workspace uses `arrow-array = "59"` (split crates). These are distinct Rust types.
-//
-// INGESTION (v59 → DuckDB):
-//   Build a CREATE TABLE DDL from the arrow_array v59 schema, then load via
-//   `Appender::append_record_batch` (appender-arrow feature).
-//   Conversion v59 → v58 uses the Arrow C Stream Interface: both versions expose
-//   `FFI_ArrowArrayStream` as an ABI-stable `#[repr(C)]` C struct (Arrow spec).
-//   Casting the raw pointer between the two versions is sound because `from_raw`
-//   replaces the source with `empty()` (release=None) so double-release cannot occur.
-//
-// RESULT COLLECTION (DuckDB → v59):
-//   `Statement::query_arrow([])` returns `duckdb::arrow` (v58) RecordBatches.
-//   Same FFI stream bridge converts them back to arrow_array v59.
-//   Then `arrow_to_daft_batches` converts to Daft RecordBatches.
-//
-// Confirmed working: all paths compile and `filter_over_scan_runs_in_duckdb` passes.
+// Zero-copy execution: sources are registered as in-place Arrow views via
+// duckdb::Connection::register_arrow (arrow-rs 59 unified across Daft and duckdb), so DuckDB
+// pushes projection + filters into the scan. Results come back from query_arrow already as
+// arrow_array v59 batches. See docs/superpowers/specs/2026-06-27-daft-duckdb-zerocopy-register-arrow-design.md.
 
 use std::collections::HashMap;
 
 use arrow_array::RecordBatch as ArrowBatch;
-use arrow_array::ffi_stream::FFI_ArrowArrayStream as Stream59;
-use arrow_schema::DataType as AD;
 use common_error::{DaftError, DaftResult};
 use daft_local_plan::{LocalPhysicalPlanRef, SourceId};
 use daft_micropartition::MicroPartitionRef;
@@ -59,13 +42,14 @@ impl DuckDbExecutor {
     ) -> DaftResult<Vec<RecordBatch>> {
         let translated = plan_to_sql(plan)?;
         let conn = open_conn(config)?;
-        register_sources(&conn, &translated.bindings, inputs)?;
+        // Held until after execute returns; dropping a view unregisters its DuckDB view.
+        let _views = register_sources(&conn, &translated.bindings, inputs)?;
         execute(&conn, &translated.sql)
     }
 
     /// Benchmark helper: register `inputs` once, then time `repeat` executions of the query.
     /// Returns `(registration_seconds, per_run_execution_seconds)`, letting a caller separate the
-    /// per-task registration/copy cost ("cold") from steady-state query compute ("warm").
+    /// per-task registration cost ("cold") from steady-state query compute ("warm").
     /// Each run's result is collected then discarded (timing only).
     pub fn bench_runs(
         plan: &LocalPhysicalPlanRef,
@@ -77,7 +61,7 @@ impl DuckDbExecutor {
         let conn = open_conn(config)?;
 
         let t_reg = std::time::Instant::now();
-        register_sources(&conn, &translated.bindings, inputs)?;
+        let _views = register_sources(&conn, &translated.bindings, inputs)?;
         let registration_seconds = t_reg.elapsed().as_secs_f64();
 
         let mut run_seconds = Vec::with_capacity(repeat);
@@ -91,11 +75,8 @@ impl DuckDbExecutor {
 }
 
 /// A reusable DuckDB session: one connection (config applied once) reused across many runs, with the
-/// translated SQL cached per plan. Cuts the per-task FIXED overhead — connection open + plan
-/// re-translation — when a worker processes many partitions that share a plan (#2 + #3).
-///
-/// It does NOT reduce the Arrow→DuckDB registration copy (which dominates large partitions and is
-/// inherent — see the follow-ups doc), so the win is concentrated on small/many partitions.
+/// translated SQL cached per plan. Cuts the per-task fixed overhead — connection open + plan
+/// re-translation — when a worker processes many partitions that share a plan.
 pub struct DuckDbSession {
     conn: duckdb::Connection,
     /// (plan identity, translated SQL) — reused while the same plan repeats across partitions.
@@ -124,13 +105,10 @@ impl DuckDbSession {
         }
         let translated = self.cached.as_ref().expect("just set").1.clone();
 
-        // Reuse the connection: drop the prior partition's tables, then register this one's.
-        for source_id in &translated.bindings {
-            self.conn
-                .execute_batch(&format!("DROP TABLE IF EXISTS daft_src_{source_id};"))
-                .map_err(|e| DaftError::External(Box::new(e)))?;
-        }
-        register_sources(&self.conn, &translated.bindings, inputs)?;
+        // Register this partition's sources as zero-copy views, held only for this run. The prior
+        // run's views were already dropped (auto-unregistered) at the end of that run; register_arrow
+        // also replaces any existing view of the same name.
+        let _views = register_sources(&self.conn, &translated.bindings, inputs)?;
         execute(&self.conn, &translated.sql)
     }
 }
@@ -156,12 +134,16 @@ fn open_conn(config: &DuckDbConfig) -> DaftResult<duckdb::Connection> {
     Ok(conn)
 }
 
-/// Register each referenced source as a DuckDB table `daft_src_<id>` from its input partitions.
-fn register_sources(
-    conn: &duckdb::Connection,
+/// Register each referenced source as a zero-copy DuckDB view `daft_src_<id>` over its input
+/// partitions' Arrow buffers. Returns the live `ArrowView` handles — the caller MUST keep them
+/// alive until the query has finished executing (each view references its Arrow batches in place;
+/// dropping a view auto-unregisters the DuckDB view).
+fn register_sources<'c>(
+    conn: &'c duckdb::Connection,
     bindings: &[SourceId],
     inputs: &HashMap<SourceId, Vec<MicroPartitionRef>>,
-) -> DaftResult<()> {
+) -> DaftResult<Vec<duckdb::ArrowView<'c>>> {
+    let mut views = Vec::with_capacity(bindings.len());
     for source_id in bindings {
         let mps = inputs.get(source_id).ok_or_else(|| {
             DaftError::ValueError(format!(
@@ -169,12 +151,22 @@ fn register_sources(
             ))
         })?;
         let arrow_batches = source_to_arrow(mps)?;
-        register_arrow_table(conn, &format!("daft_src_{source_id}"), arrow_batches)?;
+        if arrow_batches.is_empty() {
+            return Err(DaftError::ValueError(format!(
+                "duckdb POC: source {source_id} has no record batches"
+            )));
+        }
+        let view = conn
+            .register_arrow(&format!("daft_src_{source_id}"), arrow_batches)
+            .map_err(|e| DaftError::External(Box::new(e)))?;
+        views.push(view);
     }
-    Ok(())
+    Ok(views)
 }
 
 /// Prepare + run the translated SQL and collect the result as Daft RecordBatches.
+/// `query_arrow` now yields `arrow_array` v59 RecordBatches directly (unified arrow), so no
+/// version bridge is needed.
 fn execute(conn: &duckdb::Connection, sql: &str) -> DaftResult<Vec<RecordBatch>> {
     let mut stmt = conn
         .prepare(sql)
@@ -182,176 +174,8 @@ fn execute(conn: &duckdb::Connection, sql: &str) -> DaftResult<Vec<RecordBatch>>
     let arrow_iter = stmt
         .query_arrow([])
         .map_err(|e| DaftError::External(Box::new(e)))?;
-    // Convert each duckdb::arrow v58 RecordBatch to arrow_array v59 via FFI bridge.
-    let result_batches: Vec<ArrowBatch> = arrow_iter
-        .map(duck_rb_to_arrow_array)
-        .collect::<DaftResult<_>>()?;
+    let result_batches: Vec<ArrowBatch> = arrow_iter.collect();
     arrow_to_daft_batches(result_batches)
-}
-
-/// Register `batches` (arrow_array v59) as a DuckDB table named `name`.
-///
-/// Creates the table via DDL, then appends each batch via `Appender::append_record_batch`
-/// (appender-arrow feature). The v59→v58 RecordBatch conversion goes through
-/// the Arrow C Stream Interface (ABI-stable across versions).
-///
-/// NOTE: the `arrow()` table-function (ArrowVTab) path was tried (Phase 2a) but is unusable here —
-/// duckdb-rs 1.10501's ArrowVTab writes a whole batch into one DataChunk and panics on any batch
-/// larger than STANDARD_VECTOR_SIZE (2048 rows). The Appender handles arbitrary batch sizes.
-fn register_arrow_table(
-    conn: &duckdb::Connection,
-    name: &str,
-    batches: Vec<ArrowBatch>,
-) -> DaftResult<()> {
-    // POC inputs are never empty; a clear error is better than silently skipping
-    // table creation (which would later surface as a confusing "table does not exist").
-    if batches.is_empty() {
-        return Err(DaftError::ValueError(format!(
-            "duckdb POC: source for table {name} has no record batches"
-        )));
-    }
-
-    let schema = batches[0].schema();
-    let ddl = build_create_table_ddl(name, &schema)?;
-    conn.execute_batch(&ddl)
-        .map_err(|e| DaftError::External(Box::new(e)))?;
-
-    let mut app = conn
-        .appender(name)
-        .map_err(|e| DaftError::External(Box::new(e)))?;
-
-    for batch in batches {
-        let duck_batch = arrow_array_to_duck_rb(batch)?;
-        app.append_record_batch(duck_batch)
-            .map_err(|e| DaftError::External(Box::new(e)))?;
-    }
-    // Flush explicitly so any deferred insert error surfaces here. The Appender's
-    // Drop impl ignores the flush result, so relying on drop would silently swallow
-    // a failed row and return WRONG (incomplete) results with no error.
-    app.flush()
-        .map_err(|e| DaftError::External(Box::new(e)))?;
-    Ok(())
-}
-
-/// Build a `CREATE TABLE` DDL string from an arrow_array v59 schema.
-fn build_create_table_ddl(name: &str, schema: &arrow_schema::SchemaRef) -> DaftResult<String> {
-    let cols: Vec<String> = schema
-        .fields()
-        .iter()
-        .map(|f| {
-            let duck_type = arrow_dtype_to_duckdb_type(f.data_type())?;
-            Ok(format!("\"{}\" {}", f.name(), duck_type))
-        })
-        .collect::<DaftResult<_>>()?;
-    Ok(format!("CREATE TABLE {name} ({})", cols.join(", ")))
-}
-
-/// Map an `arrow_array::DataType` to a DuckDB SQL type string.
-fn arrow_dtype_to_duckdb_type(dt: &AD) -> DaftResult<&'static str> {
-    match dt {
-        AD::Boolean => Ok("BOOLEAN"),
-        AD::Int8 => Ok("TINYINT"),
-        AD::Int16 => Ok("SMALLINT"),
-        AD::Int32 => Ok("INTEGER"),
-        AD::Int64 => Ok("BIGINT"),
-        AD::UInt8 => Ok("UTINYINT"),
-        AD::UInt16 => Ok("USMALLINT"),
-        AD::UInt32 => Ok("UINTEGER"),
-        AD::UInt64 => Ok("UBIGINT"),
-        AD::Float32 => Ok("FLOAT"),
-        AD::Float64 => Ok("DOUBLE"),
-        AD::Utf8 | AD::LargeUtf8 => Ok("VARCHAR"),
-        AD::Binary | AD::LargeBinary => Ok("BLOB"),
-        AD::Date32 | AD::Date64 => Ok("DATE"),
-        AD::Timestamp(_, _) => Ok("TIMESTAMP"),
-        AD::Time32(_) | AD::Time64(_) => Ok("TIME"),
-        other => Err(DaftError::NotImplemented(format!(
-            "duckdb POC: unsupported arrow type for DDL: {other:?}"
-        ))),
-    }
-}
-
-/// Convert an arrow_array v59 `RecordBatch` into a `duckdb::arrow` v58 `RecordBatch`
-/// via the Arrow C Stream Interface.
-///
-/// # Safety
-/// Both `arrow_array::ffi_stream::FFI_ArrowArrayStream` (v59) and
-/// `duckdb::arrow::ffi_stream::FFI_ArrowArrayStream` (v58) are `#[repr(C)]` structs
-/// defined by the Arrow C Stream Interface specification, which is ABI-stable.
-/// Their memory layouts are identical; casting between raw pointers is sound.
-/// `FFI_ArrowArrayStream::from_raw` replaces the source with `empty()` (all fields
-/// set to None/null), so the original stream's `Drop` becomes a no-op — no double-release.
-fn arrow_array_to_duck_rb(
-    batch: ArrowBatch,
-) -> DaftResult<duckdb::arrow::record_batch::RecordBatch> {
-    let schema = batch.schema();
-    let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
-        Box::new(arrow_array::RecordBatchIterator::new(std::iter::once(Ok(batch)), schema));
-
-    v59_reader_to_duck_batches(reader)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| DaftError::InternalError("FFI stream bridge produced no batches".into()))
-}
-
-/// Bridge a v59 `RecordBatchReader` into `duckdb::arrow` v58 RecordBatches via the
-/// Arrow C Stream Interface. Errors yielded by the reader propagate as `DaftError`.
-///
-/// # Safety
-/// See `arrow_array_to_duck_rb`: the v58/v59 `FFI_ArrowArrayStream` structs are the
-/// same ABI-stable `#[repr(C)]` C struct, and `from_raw` empties the source so its
-/// `Drop` is a no-op (no double-release). An error surfaced through the C stream's
-/// `get_next`/`get_last_error` callbacks unwinds cleanly back here as a Rust `Err`.
-fn v59_reader_to_duck_batches(
-    reader: Box<dyn arrow_array::RecordBatchReader + Send>,
-) -> DaftResult<Vec<duckdb::arrow::record_batch::RecordBatch>> {
-    use duckdb::arrow::ffi_stream::ArrowArrayStreamReader as Reader58;
-
-    let mut stream_59 = Stream59::new(reader);
-
-    // SAFETY: FFI_ArrowArrayStream is the same C struct layout in arrow v58 and v59.
-    let result = unsafe {
-        let ptr = &mut stream_59 as *mut Stream59
-            as *mut duckdb::arrow::ffi_stream::FFI_ArrowArrayStream;
-        let reader_58 = Reader58::from_raw(ptr)
-            .map_err(|e| DaftError::External(Box::new(e)))?;
-        reader_58.collect::<Result<_, _>>()
-    };
-    // stream_59 is now empty (release = None) due to from_raw's ptr::replace; drop is a no-op.
-
-    result.map_err(|e| DaftError::External(Box::new(e)))
-}
-
-/// Convert a `duckdb::arrow` v58 `RecordBatch` into an `arrow_array` v59 `RecordBatch`
-/// via the Arrow C Stream Interface (same ABI, same safety argument as above).
-fn duck_rb_to_arrow_array(
-    batch: duckdb::arrow::record_batch::RecordBatch,
-) -> DaftResult<ArrowBatch> {
-    use duckdb::arrow::array::RecordBatchReader as RBR58;
-    use duckdb::arrow::ffi_stream::FFI_ArrowArrayStream as Stream58;
-    use duckdb::arrow::record_batch::RecordBatchIterator as Iter58;
-    use arrow_array::ffi_stream::ArrowArrayStreamReader as Reader59;
-
-    // Wrap the v58 batch in a v58 RecordBatchReader (symmetric with arrow_array_to_duck_rb).
-    let schema = batch.schema();
-    let reader: Box<dyn RBR58 + Send> =
-        Box::new(Iter58::new(std::iter::once(Ok(batch)), schema));
-    let mut stream_58 = Stream58::new(reader);
-
-    // SAFETY: same layout guarantee as in arrow_array_to_duck_rb.
-    let v59_batches: Vec<ArrowBatch> = unsafe {
-        let ptr = &mut stream_58 as *mut Stream58 as *mut Stream59;
-        let reader_59 = Reader59::from_raw(ptr)
-            .map_err(|e| DaftError::External(Box::new(e)))?;
-        reader_59.collect::<Result<_, _>>()
-    }
-    .map_err(|e| DaftError::ArrowRsError(e))?;
-    // stream_58 is now empty (release = None); drop is a no-op.
-
-    v59_batches
-        .into_iter()
-        .next()
-        .ok_or_else(|| DaftError::InternalError("FFI stream bridge produced no batches".into()))
 }
 
 #[cfg(test)]
@@ -433,7 +257,7 @@ mod tests {
     fn session_reuses_connection_across_runs() {
         let (plan, inputs) = filter_plan_and_inputs();
         let mut session = DuckDbSession::new(&DuckDbConfig::default()).unwrap();
-        // Two runs on one session: the prior run's tables are dropped + recreated; both correct.
+        // Two runs on one session: each run registers fresh views (auto-unregistered at run end).
         for _ in 0..2 {
             let out = session.run(&plan, &inputs).unwrap();
             let total: usize = out.iter().map(|b| b.len()).sum();
@@ -441,38 +265,4 @@ mod tests {
         }
     }
 
-    /// Drive the FFI stream bridge with a v59 RecordBatchReader whose iteration yields
-    /// `Err(ArrowError)`. The error must surface through the C stream's get_next callback
-    /// and unwind back as a clean `DaftError` — no panic, no leak, no double-free, no UB.
-    /// (Miri can't run bundled DuckDB C++, so this test is the verification for the
-    /// unsafe error branch.)
-    #[test]
-    fn ffi_bridge_propagates_reader_error_cleanly() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "amount",
-            arrow_schema::DataType::Int64,
-            false,
-        )]));
-
-        // A reader that immediately errors instead of yielding a batch.
-        let erroring_iter = std::iter::once(Err(arrow_schema::ArrowError::ComputeError(
-            "injected reader failure".to_string(),
-        )));
-        let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
-            arrow_array::RecordBatchIterator::new(erroring_iter, schema),
-        );
-
-        let result = v59_reader_to_duck_batches(reader);
-        assert!(
-            result.is_err(),
-            "expected the injected reader error to propagate as DaftError, got Ok"
-        );
-        // Confirm it is a real error message, not a swallowed/empty success.
-        let err = result.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("injected reader failure") || matches!(err, DaftError::External(_)),
-            "unexpected error variant/message: {msg}"
-        );
-    }
 }
