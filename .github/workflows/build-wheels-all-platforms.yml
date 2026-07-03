@@ -128,12 +128,31 @@ jobs:
           fi
 
           "$PY_CMD" --version
+          rustup show active-toolchain || true
+          mkdir -p dist
+
+          build_ok=0
+
+          set +e
           uv venv .venv -p "$PY_CMD"
           uv pip install --python .venv/bin/python maturin==1.13.3
-
-          # Same core wheel build command as Makefile's build-whl target.
           unset CONDA_PREFIX
           PYO3_PYTHON=.venv/bin/python .venv/bin/maturin build --release --out dist
+          attempt_one_ec=$?
+          set -e
+
+          if [[ "$attempt_one_ec" -eq 0 ]]; then
+            build_ok=1
+          else
+            echo "Pinned .venv maturin build failed; retrying via uvx maturin"
+            uvx maturin --version || true
+            uvx maturin build --release --out dist -i "$PY_CMD" && build_ok=1
+          fi
+
+          if [[ "$build_ok" -ne 1 ]]; then
+            echo "All wheel build strategies failed" >&2
+            exit 1
+          fi
         env:
           GITHUB_ACTIONS: "true"
           RUSTC_WRAPPER: sccache
