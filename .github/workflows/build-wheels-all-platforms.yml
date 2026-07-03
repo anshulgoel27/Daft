@@ -81,13 +81,35 @@ jobs:
           export PATH="$SCCACHE_DIR:$PATH"
           "$SCCACHE_DIR/sccache" --version
 
+      - name: Ensure Node.js is available
+        run: |
+          if command -v node > /dev/null 2>&1; then
+            node --version
+            npm --version
+          else
+            export NVM_DIR="$HOME/.nvm"
+            curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+            # shellcheck disable=SC1090
+            source "$NVM_DIR/nvm.sh"
+            nvm install 22
+            nvm use 22
+            echo "$NVM_DIR/versions/node/$(nvm version 22)/bin" >> "$GITHUB_PATH"
+            node --version
+            npm --version
+          fi
+
+      - name: Build dashboard assets
+        working-directory: src/daft-dashboard/frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
       - name: Build wheel using direct maturin command
         # Direct maturin build avoids Makefile's full uv sync of all extras, which is much slower.
         run: |
           sccache --start-server || true
-          uvx maturin build --release --out dist -i python${{ env.PYTHON_VERSION }}
+          uvx maturin build --release --out dist -i python
         env:
-          DAFT_DASHBOARD_SKIP_BUILD: "true"
           GITHUB_ACTIONS: "true"
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
