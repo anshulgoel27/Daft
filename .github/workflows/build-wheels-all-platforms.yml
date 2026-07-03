@@ -17,7 +17,7 @@ permissions:
   contents: write
 
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "python3.11"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -115,24 +115,23 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
 
-      - name: Build wheel using direct maturin command
-        # Prefer fast direct build, but fall back to the canonical local command for reliability.
+      - name: Build wheel using local make target
+        # Match local workflow exactly to avoid maturin/version drift in CI.
         run: |
           set -euo pipefail
           sccache --start-server || true
-          PY_BIN="$(command -v python3 || command -v python || true)"
-          if [[ -z "$PY_BIN" ]]; then
-            echo "No Python interpreter found on PATH" >&2
-            exit 1
+
+          PY_CMD="${PYTHON_VERSION}"
+          if ! command -v "$PY_CMD" > /dev/null 2>&1; then
+            # Ensure requested Python exists for Makefile's virtualenv creation.
+            uv python install "${PY_CMD#python}"
           fi
 
-          "$PY_BIN" --version
-          uvx maturin --version
+          "$PY_CMD" --version
+          make build-whl PYTHON_VERSION="$PY_CMD"
 
-          if ! uvx maturin build --release --out dist -i "$PY_BIN"; then
-            echo "Direct maturin build failed, retrying with canonical make target"
-            make build-whl
-          fi
+          mkdir -p dist
+          cp -v target/wheels/*.whl dist/
         env:
           GITHUB_ACTIONS: "true"
           RUSTC_WRAPPER: sccache
