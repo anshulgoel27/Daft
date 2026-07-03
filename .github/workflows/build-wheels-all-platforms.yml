@@ -37,7 +37,7 @@ jobs:
         platform:
           - name: linux
             runner: ubuntu-latest
-            command: make build-whl-cross BUILD_WHL_TARGET=aarch64-unknown-linux-gnu BUILD_WHL_COMPATIBILITY=manylinux_2_28
+            command: make build-whl
           - name: macos
             runner: macos-latest
             command: make build-whl
@@ -64,35 +64,6 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt --component clippy
           rustup show active-toolchain
           rustup show active-toolchain | grep -q 'rust-toolchain.toml'
-
-      - name: Install Zig (Linux cross-wheel build prerequisite)
-        if: matrix.platform.name == 'linux'
-        run: |
-          if command -v zig > /dev/null 2>&1; then
-            zig version
-            exit 0
-          fi
-
-          sudo apt-get update
-          sudo apt-get install -y xz-utils
-          sudo apt-get install -y zig || true
-
-          if ! command -v zig > /dev/null 2>&1; then
-            ZIG_VERSION="0.14.0"
-            ARCH="$(uname -m)"
-            case "$ARCH" in
-              x86_64) ZIG_ARCH="x86_64" ;;
-              aarch64|arm64) ZIG_ARCH="aarch64" ;;
-              *) echo "Unsupported architecture: $ARCH" && exit 1 ;;
-            esac
-
-            curl --retry 5 --retry-delay 2 --retry-connrefused -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
-            tar -xf "zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
-            echo "$PWD/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" >> "$GITHUB_PATH"
-          fi
-
-          command -v zig > /dev/null 2>&1 || { echo "zig not available after installation attempts"; exit 1; }
-          zig version
 
       - name: Ensure Node.js is available
         run: |
