@@ -76,8 +76,10 @@ jobs:
           URL="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${TARGET}.tar.gz"
           curl --retry 5 --retry-delay 2 --retry-connrefused -fsSL "$URL" -o sccache.tar.gz
           tar -xzf sccache.tar.gz
-          echo "$PWD/sccache-v${SCCACHE_VERSION}-${TARGET}" >> "$GITHUB_PATH"
-          sccache --version
+          SCCACHE_DIR="$PWD/sccache-v${SCCACHE_VERSION}-${TARGET}"
+          echo "$SCCACHE_DIR" >> "$GITHUB_PATH"
+          export PATH="$SCCACHE_DIR:$PATH"
+          "$SCCACHE_DIR/sccache" --version
 
       - name: Build wheel using direct maturin command
         # Direct maturin build avoids Makefile's full uv sync of all extras, which is much slower.
