@@ -11,7 +11,7 @@ on:
       - reopened
   push:
     branches:
-      - '**'
+      - main
 
 permissions:
   contents: write
