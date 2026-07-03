@@ -17,7 +17,7 @@ permissions:
   contents: write
 
 env:
-  PYTHON_VERSION: "3.14"
+  PYTHON_VERSION: "3.11"
 
 jobs:
   build:
@@ -54,10 +54,17 @@ jobs:
         with:
           python_version: ${{ env.PYTHON_VERSION }}
 
+      - name: Ensure repository Rust toolchain is active
+        run: |
+          TOOLCHAIN=$(grep -E '^channel\s*=\s*"' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustup override set "$TOOLCHAIN"
+          rustup show active-toolchain
+
       - name: Install Zig (Linux cross-wheel build prerequisite)
         if: matrix.platform.name == 'linux'
         run: |
-          ZIG_VERSION="0.14.1"
+          ZIG_VERSION="0.14.0"
           ARCH="$(uname -m)"
           case "$ARCH" in
             x86_64) ZIG_ARCH="x86_64" ;;
