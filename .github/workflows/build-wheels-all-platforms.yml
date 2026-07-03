@@ -116,7 +116,7 @@ jobs:
           npm run build
 
       - name: Build wheel using local make target
-        # Match local workflow exactly to avoid maturin/version drift in CI.
+        # Use a minimal, reproducible build env in CI (avoid full all-extras sync from Makefile .venv).
         run: |
           set -euo pipefail
           sccache --start-server || true
@@ -128,14 +128,12 @@ jobs:
           fi
 
           "$PY_CMD" --version
-          make .venv PYTHON_VERSION="$PY_CMD"
+          uv venv .venv -p "$PY_CMD"
+          uv pip install --python .venv/bin/python maturin==1.13.3
 
-          # Use the same wheel build command as Makefile's build-whl target without CI-fragile check-toolchain gate.
+          # Same core wheel build command as Makefile's build-whl target.
           unset CONDA_PREFIX
-          PYO3_PYTHON=.venv/bin/python .venv/bin/maturin build --release
-
-          mkdir -p dist
-          cp -v target/wheels/*.whl dist/
+          PYO3_PYTHON=.venv/bin/python .venv/bin/maturin build --release --out dist
         env:
           GITHUB_ACTIONS: "true"
           RUSTC_WRAPPER: sccache
