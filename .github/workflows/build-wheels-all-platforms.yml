@@ -56,13 +56,43 @@ jobs:
         with:
           python_version: ${{ env.PYTHON_VERSION }}
 
+      - name: Install sccache
+        run: |
+          SCCACHE_VERSION="0.10.0"
+          OS="$(uname -s)"
+          ARCH="$(uname -m)"
+
+          if [[ "$OS" == "Linux" && "$ARCH" == "x86_64" ]]; then
+            TARGET="x86_64-unknown-linux-musl"
+          elif [[ "$OS" == "Darwin" && "$ARCH" == "arm64" ]]; then
+            TARGET="aarch64-apple-darwin"
+          elif [[ "$OS" == "Darwin" && "$ARCH" == "x86_64" ]]; then
+            TARGET="x86_64-apple-darwin"
+          else
+            echo "Unsupported OS/ARCH for sccache: $OS/$ARCH" >&2
+            exit 1
+          fi
+
+          URL="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${TARGET}.tar.gz"
+          curl --retry 5 --retry-delay 2 --retry-connrefused -fsSL "$URL" -o sccache.tar.gz
+          tar -xzf sccache.tar.gz
+          echo "$PWD/sccache-v${SCCACHE_VERSION}-${TARGET}" >> "$GITHUB_PATH"
+          sccache --version
+
       - name: Build wheel using direct maturin command
         # Direct maturin build avoids Makefile's full uv sync of all extras, which is much slower.
         run: |
+          sccache --start-server || true
           uvx maturin build --release --out dist -i python${{ env.PYTHON_VERSION }}
         env:
           DAFT_DASHBOARD_SKIP_BUILD: "true"
           GITHUB_ACTIONS: "true"
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_CACHE_SIZE: "5G"
+
+      - name: Show sccache stats
+        run: sccache --show-stats || true
 
       - name: Upload wheels as draft release assets
         env:
