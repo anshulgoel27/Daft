@@ -64,6 +64,9 @@ jobs:
       - name: Install Zig (Linux cross-wheel build prerequisite)
         if: matrix.platform.name == 'linux'
         run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils
+
           ZIG_VERSION="0.14.0"
           ARCH="$(uname -m)"
           case "$ARCH" in
@@ -71,7 +74,8 @@ jobs:
             aarch64|arm64) ZIG_ARCH="aarch64" ;;
             *) echo "Unsupported architecture: $ARCH" && exit 1 ;;
           esac
-          curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+
+          curl --retry 5 --retry-delay 2 --retry-connrefused -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
           tar -xf "zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
           echo "$PWD/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" >> "$GITHUB_PATH"
           zig version
