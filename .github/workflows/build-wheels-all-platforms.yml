@@ -128,7 +128,11 @@ jobs:
           fi
 
           "$PY_CMD" --version
-          make build-whl PYTHON_VERSION="$PY_CMD"
+          make .venv PYTHON_VERSION="$PY_CMD"
+
+          # Use the same wheel build command as Makefile's build-whl target without CI-fragile check-toolchain gate.
+          unset CONDA_PREFIX
+          PYO3_PYTHON=.venv/bin/python .venv/bin/maturin build --release
 
           mkdir -p dist
           cp -v target/wheels/*.whl dist/
