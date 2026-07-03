@@ -121,21 +121,26 @@ jobs:
           set -euo pipefail
           sccache --start-server || true
 
-          PY_SPEC="${PYTHON_VERSION#python}"
-          uv python install "$PY_SPEC" || true
-          uv venv .venv -p "$PY_SPEC"
-          PY_BIN=".venv/bin/python"
+          PY_BIN="$(command -v python3 || command -v python || true)"
+          if [[ -z "$PY_BIN" ]]; then
+            echo "No Python interpreter found on PATH" >&2
+            exit 1
+          fi
 
           "$PY_BIN" --version
+          "$PY_BIN" -m pip --version || "$PY_BIN" -m ensurepip --upgrade
+          "$PY_BIN" -m pip install --user --upgrade pip setuptools wheel
+          "$PY_BIN" -m pip install --user "maturin==1.13.3"
+          export PATH="$HOME/.local/bin:$PATH"
+
           rustup show active-toolchain || true
           mkdir -p dist
 
           build_ok=0
 
           set +e
-          uv pip install --python "$PY_BIN" maturin==1.13.3
           unset CONDA_PREFIX
-          PYO3_PYTHON="$PY_BIN" .venv/bin/maturin build --release --out dist
+          PYO3_PYTHON="$PY_BIN" maturin build --release --out dist
           attempt_one_ec=$?
           set -e
 
