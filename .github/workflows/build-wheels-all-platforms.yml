@@ -37,10 +37,18 @@ jobs:
         platform:
           - name: linux
             runner: ubuntu-latest
-            command: make build-whl
+            command: |
+              python -m venv .venv
+              source .venv/bin/activate
+              uv pip install --python .venv/bin/python maturin
+              maturin build --release --out dist
           - name: macos
             runner: macos-latest
-            command: make build-whl
+            command: |
+              python -m venv .venv
+              source .venv/bin/activate
+              uv pip install --python .venv/bin/python maturin
+              maturin build --release --out dist
 
     steps:
       - name: Checkout repository
@@ -89,6 +97,7 @@ jobs:
           npm run build
 
       - name: Build wheel using local make command
+        # Direct maturin build avoids Makefile's full uv sync of all extras, which is much slower.
         run: ${{ matrix.platform.command }}
         env:
           GITHUB_ACTIONS: "true"
@@ -119,7 +128,7 @@ jobs:
           html_url=$(echo "$release_json" | python -c 'import json,sys; d=json.load(sys.stdin); print(d.get("html_url", ""))')
 
           found=0
-          for wheel in target/wheels/*.whl; do
+          for wheel in dist/*.whl; do
             [[ -f "$wheel" ]] || continue
             found=1
             name=$(basename "$wheel")
@@ -131,7 +140,7 @@ jobs:
           done
 
           if [[ "$found" -eq 0 ]]; then
-            echo "No wheel files found in target/wheels" >&2
+            echo "No wheel files found in dist" >&2
             exit 1
           fi
 
