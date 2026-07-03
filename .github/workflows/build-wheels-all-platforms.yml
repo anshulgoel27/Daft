@@ -51,10 +51,21 @@ jobs:
           git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
           git checkout --detach FETCH_HEAD
 
-      - name: Install uv, rust, and python
-        uses: ./.github/actions/install
-        with:
-          python_version: ${{ env.PYTHON_VERSION }}
+      - name: Bootstrap build toolchain (fast path)
+        run: |
+          if command -v rustup > /dev/null 2>&1; then
+            rustup --version
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+          if command -v uv > /dev/null 2>&1; then
+            uv --version
+          else
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Install sccache
         run: |
