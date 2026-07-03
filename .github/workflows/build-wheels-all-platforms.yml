@@ -121,23 +121,21 @@ jobs:
           set -euo pipefail
           sccache --start-server || true
 
-          PY_CMD="${PYTHON_VERSION}"
-          if ! command -v "$PY_CMD" > /dev/null 2>&1; then
-            # Ensure requested Python exists for Makefile's virtualenv creation.
-            uv python install "${PY_CMD#python}"
-          fi
+          PY_SPEC="${PYTHON_VERSION#python}"
+          uv python install "$PY_SPEC" || true
+          uv venv .venv -p "$PY_SPEC"
+          PY_BIN=".venv/bin/python"
 
-          "$PY_CMD" --version
+          "$PY_BIN" --version
           rustup show active-toolchain || true
           mkdir -p dist
 
           build_ok=0
 
           set +e
-          uv venv .venv -p "$PY_CMD"
-          uv pip install --python .venv/bin/python maturin==1.13.3
+          uv pip install --python "$PY_BIN" maturin==1.13.3
           unset CONDA_PREFIX
-          PYO3_PYTHON=.venv/bin/python .venv/bin/maturin build --release --out dist
+          PYO3_PYTHON="$PY_BIN" .venv/bin/maturin build --release --out dist
           attempt_one_ec=$?
           set -e
 
@@ -146,7 +144,7 @@ jobs:
           else
             echo "Pinned .venv maturin build failed; retrying via uvx maturin"
             uvx maturin --version || true
-            uvx maturin build --release --out dist -i "$PY_CMD" && build_ok=1
+            uvx maturin build --release --out dist -i "$PY_BIN" && build_ok=1
           fi
 
           if [[ "$build_ok" -ne 1 ]]; then
