@@ -33,7 +33,7 @@ jobs:
         platform:
           - name: linux
             runner: ubuntu-latest
-            command: make build-whl-cross BUILD_WHL_TARGET=aarch64-unknown-linux-gnu BUILD_WHL_COMPATIBILITY=manylinux_2_28
+            command: make build-whl-cross BUILD_WHL_USE_ZIG=0 BUILD_WHL_TARGET=aarch64-unknown-linux-gnu BUILD_WHL_COMPATIBILITY=manylinux_2_28
           - name: macos
             runner: macos-latest
             command: make build-whl
@@ -60,21 +60,6 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt --component clippy
           rustup override set "$TOOLCHAIN"
           rustup show active-toolchain
-
-      - name: Install Zig (Linux cross-wheel build prerequisite)
-        if: matrix.platform.name == 'linux'
-        run: |
-          ZIG_VERSION="0.14.0"
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64) ZIG_ARCH="x86_64" ;;
-            aarch64|arm64) ZIG_ARCH="aarch64" ;;
-            *) echo "Unsupported architecture: $ARCH" && exit 1 ;;
-          esac
-          curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
-          tar -xf "zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
-          echo "$PWD/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" >> "$GITHUB_PATH"
-          zig version
 
       - name: Ensure Node.js is available
         run: |
