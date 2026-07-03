@@ -11,29 +11,19 @@ runs:
   - name: Install rust
     shell: bash
     run: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
       CARGO_BIN="$HOME/.cargo/bin"
-      if command -v rustup > /dev/null 2>&1; then
-        echo "rustup already installed: $(rustup --version | head -n1)"
-      else
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-      fi
+      echo 'export PATH="$CARGO_BIN:$PATH"' >> $HOME/.bashrc
       echo "$CARGO_BIN" >> $GITHUB_PATH
   - name: Install uv
     shell: bash
     run: |
+      curl -LsSf https://astral.sh/uv/install.sh | sh
       UV_BIN="$HOME/.local/bin"
-      if command -v uv > /dev/null 2>&1; then
-        echo "uv already installed: $(uv --version)"
-      else
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-      fi
+      echo 'export PATH="$UV_BIN:$PATH"' >> $HOME/.bashrc
       echo "$UV_BIN" >> $GITHUB_PATH
   - name: Install (and pin) python version ${{ inputs.python_version }}
     shell: bash
     run: |
-      PYTHON_BIN="python${{ inputs.python_version }}"
-      if command -v "$PYTHON_BIN" > /dev/null 2>&1; then
-        "$PYTHON_BIN" --version
-      else
-        uv python install ${{ inputs.python_version }}
-      fi
+      uv python install ${{ inputs.python_version }}
+      uv python pin ${{ inputs.python_version }}
