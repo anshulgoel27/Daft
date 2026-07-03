@@ -67,31 +67,6 @@ jobs:
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           fi
 
-      - name: Install sccache
-        run: |
-          SCCACHE_VERSION="0.10.0"
-          OS="$(uname -s)"
-          ARCH="$(uname -m)"
-
-          if [[ "$OS" == "Linux" && "$ARCH" == "x86_64" ]]; then
-            TARGET="x86_64-unknown-linux-musl"
-          elif [[ "$OS" == "Darwin" && "$ARCH" == "arm64" ]]; then
-            TARGET="aarch64-apple-darwin"
-          elif [[ "$OS" == "Darwin" && "$ARCH" == "x86_64" ]]; then
-            TARGET="x86_64-apple-darwin"
-          else
-            echo "Unsupported OS/ARCH for sccache: $OS/$ARCH" >&2
-            exit 1
-          fi
-
-          URL="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${TARGET}.tar.gz"
-          curl --retry 5 --retry-delay 2 --retry-connrefused -fsSL "$URL" -o sccache.tar.gz
-          tar -xzf sccache.tar.gz
-          SCCACHE_DIR="$PWD/sccache-v${SCCACHE_VERSION}-${TARGET}"
-          echo "$SCCACHE_DIR" >> "$GITHUB_PATH"
-          export PATH="$SCCACHE_DIR:$PATH"
-          "$SCCACHE_DIR/sccache" --version
-
       - name: Ensure Node.js is available
         run: |
           if command -v node > /dev/null 2>&1; then
@@ -115,58 +90,15 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
 
-      - name: Build wheel using local make target
-        # Use a minimal, reproducible build env in CI (avoid full all-extras sync from Makefile .venv).
+      - name: Build wheel (single command)
+        # Keep this path simple and deterministic to reduce CI overhead and debugging complexity.
         run: |
           set -euo pipefail
-          sccache --start-server || true
-
-          PY_BIN="$(command -v python3 || command -v python || true)"
-          if [[ -z "$PY_BIN" ]]; then
-            echo "No Python interpreter found on PATH" >&2
-            exit 1
-          fi
-
+          PY_BIN="$(command -v python3 || command -v python)"
           "$PY_BIN" --version
-          "$PY_BIN" -m pip --version || "$PY_BIN" -m ensurepip --upgrade
-          "$PY_BIN" -m pip install --user --upgrade pip setuptools wheel --break-system-packages || \
-            "$PY_BIN" -m pip install --user --upgrade pip setuptools wheel
-          "$PY_BIN" -m pip install --user "maturin==1.13.3" --break-system-packages || \
-            "$PY_BIN" -m pip install --user "maturin==1.13.3"
-          export PATH="$HOME/.local/bin:$PATH"
-
-          rustup show active-toolchain || true
-          mkdir -p dist
-
-          build_ok=0
-
-          set +e
-          unset CONDA_PREFIX
-          PYO3_PYTHON="$PY_BIN" maturin build --release --out dist
-          attempt_one_ec=$?
-          set -e
-
-          if [[ "$attempt_one_ec" -eq 0 ]]; then
-            build_ok=1
-          else
-            echo "Pinned .venv maturin build failed; retrying via uvx maturin"
-            uvx maturin --version || true
-            uvx maturin build --release --out dist -i "$PY_BIN" && build_ok=1
-          fi
-
-          if [[ "$build_ok" -ne 1 ]]; then
-            echo "All wheel build strategies failed" >&2
-            exit 1
-          fi
+          uvx --from maturin==1.13.3 maturin build --release --out dist -i "$PY_BIN"
         env:
           GITHUB_ACTIONS: "true"
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "false"
-          SCCACHE_DIR: ${{ runner.temp }}/sccache
-          SCCACHE_CACHE_SIZE: "5G"
-
-      - name: Show sccache stats
-        run: sccache --show-stats || true
 
       - name: Upload wheels as draft release assets
         env:
