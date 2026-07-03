@@ -119,7 +119,15 @@ jobs:
         # Direct maturin build avoids Makefile's full uv sync of all extras, which is much slower.
         run: |
           sccache --start-server || true
-          uvx maturin build --release --out dist -i python
+          PY_BIN="$(command -v python3 || command -v python || true)"
+          if [[ -z "$PY_BIN" ]]; then
+            echo "No Python interpreter found on PATH" >&2
+            exit 1
+          fi
+
+          "$PY_BIN" --version
+          uvx maturin --version
+          uvx maturin build --release --out dist -i "$PY_BIN"
         env:
           GITHUB_ACTIONS: "true"
           RUSTC_WRAPPER: sccache
