@@ -123,10 +123,15 @@ jobs:
         env:
           GITHUB_ACTIONS: "true"
 
-      - name: Upload wheels as pipeline artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.platform.name }}-${{ github.run_id }}
-          path: dist/*.whl
-          if-no-files-found: error
-          retention-days: 14
+      - name: Verify wheel outputs
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [[ ${#wheels[@]} -eq 0 ]]; then
+            echo "No wheel files found in dist" >&2
+            exit 1
+          fi
+
+          ls -lh dist/*.whl
+          shasum -a 256 dist/*.whl
