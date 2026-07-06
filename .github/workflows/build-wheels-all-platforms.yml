@@ -160,7 +160,9 @@ jobs:
           shasum -a 256 dist/*.whl
 
       - name: Upload wheels as pipeline artifacts
-        run: |
-          set -euo pipefail
-          npm install --no-save @actions/artifact@2
-          node .github/scripts/upload_wheels_artifact.cjs "wheels-${{ matrix.platform.name }}-${{ github.run_id }}" dist 14
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.name }}-${{ github.run_id }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
