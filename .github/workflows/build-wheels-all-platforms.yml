@@ -117,6 +117,13 @@ jobs:
           echo "$ZIG_DIR" >> "$GITHUB_PATH"
           "$ZIG_DIR/zig" version
 
+      - name: Install Rust target for Linux cross-build
+        if: matrix.platform.name == 'linux'
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-unknown-linux-gnu
+          rustup target list --installed | grep -E '^aarch64-unknown-linux-gnu$'
+
       - name: Build wheel (single command)
         # Keep this path simple and deterministic to reduce CI overhead and debugging complexity.
         run: |
