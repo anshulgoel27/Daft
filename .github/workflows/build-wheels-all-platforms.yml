@@ -36,8 +36,8 @@ jobs:
       matrix:
         platform:
           - name: linux
-            runner: ubuntu-24.04-arm
-            maturin_args: --compatibility manylinux_2_28
+            runner: ubuntu-latest
+            maturin_args: --target aarch64-unknown-linux-gnu --compatibility manylinux_2_28 --zig
           - name: macos
             runner: macos-latest
             maturin_args: ""
@@ -92,6 +92,36 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
 
+      - name: Ensure Zig is available for Linux manylinux build
+        if: matrix.platform.name == 'linux'
+        run: |
+          set -euo pipefail
+          if command -v zig > /dev/null 2>&1; then
+            zig version
+            exit 0
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y xz-utils || true
+
+          ARCH="$(uname -m)"
+          if [[ "$ARCH" == "x86_64" ]]; then
+            ZIG_ARCH="x86_64"
+          elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+            ZIG_ARCH="aarch64"
+          else
+            echo "Unsupported architecture for Zig bootstrap: $ARCH" >&2
+            exit 1
+          fi
+
+          ZIG_VERSION="0.13.0"
+          ZIG_TARBALL="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+          curl --retry 5 --retry-delay 2 --retry-connrefused -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}" -o zig.tar.xz
+          tar -xJf zig.tar.xz
+          echo "$PWD/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+          zig version
+
       - name: Build wheel (single command)
         # Keep this path simple and deterministic to reduce CI overhead and debugging complexity.
         run: |
@@ -114,3 +144,9 @@ jobs:
 
           ls -lh dist/*.whl
           shasum -a 256 dist/*.whl
+
+      - name: Upload wheels as pipeline artifacts
+        run: |
+          set -euo pipefail
+          npm install --no-save @actions/artifact@2
+          node .github/scripts/upload_wheels_artifact.cjs "wheels-${{ matrix.platform.name }}-${{ github.run_id }}" dist 14
