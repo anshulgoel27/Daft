@@ -116,9 +116,23 @@ jobs:
 
           ZIG_VERSION="0.13.0"
           ZIG_TARBALL="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
-          curl --retry 5 --retry-delay 2 --retry-connrefused -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}" -o zig.tar.xz
-          tar -xJf zig.tar.xz
-          echo "$PWD/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          curl --retry 5 --retry-delay 2 --retry-connrefused -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}" -o zig.tar.xz || true
+          if [[ -f zig.tar.xz ]]; then
+            tar -xJf zig.tar.xz || true
+            if [[ -d "zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" ]]; then
+              echo "$PWD/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+            fi
+          fi
+
+          if ! command -v zig > /dev/null 2>&1; then
+            npm install --no-save @ziglang/cli
+            echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+          fi
+
+          if ! command -v zig > /dev/null 2>&1; then
+            echo "Unable to install zig by any available method" >&2
+            exit 1
+          fi
 
           zig version
 
