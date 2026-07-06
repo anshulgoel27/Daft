@@ -36,8 +36,8 @@ jobs:
       matrix:
         platform:
           - name: linux
-            runner: ubuntu-latest
-            maturin_args: --target aarch64-unknown-linux-gnu --compatibility manylinux_2_28 --zig
+            runner: ubuntu-24.04-arm
+            maturin_args: --compatibility manylinux_2_28
           - name: macos
             runner: macos-latest
             maturin_args: ""
@@ -91,27 +91,6 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm run build
-
-      - name: Ensure Zig is available for Linux manylinux build
-        if: matrix.platform.name == 'linux'
-        run: |
-          set -euo pipefail
-          if command -v zig > /dev/null 2>&1; then
-            zig version
-            exit 0
-          fi
-
-          sudo apt-get update
-          sudo apt-get install -y zig || true
-
-          if ! command -v zig > /dev/null 2>&1; then
-            ZIG_VERSION="0.13.0"
-            curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
-            tar -xf zig.tar.xz
-            echo "$PWD/zig-linux-x86_64-${ZIG_VERSION}" >> "$GITHUB_PATH"
-          fi
-
-          zig version
 
       - name: Build wheel (single command)
         # Keep this path simple and deterministic to reduce CI overhead and debugging complexity.
