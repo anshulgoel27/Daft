@@ -76,8 +76,37 @@ pub fn st_geohash(geom: ExprRef, precision: u8) -> ExprRef {
 // Geohash bounding-box coverage: returns geohash prefixes that cover a bbox
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Hard cap on the number of geohash cells the flood fill in
+/// `collect_covering_cells` will collect before giving up.
+///
+/// A query geometry with a large bounding box (e.g. a continent-sized
+/// polygon) can overlap millions of geohash cells at typical precisions
+/// (~1M cells for a 60°×30° bbox at precision 5, tens of millions near
+/// global extent). Enumerating them all as `String`s at *plan time* — before
+/// any data is read — can stall query planning on ordinary user input.
+///
+/// The covering set is only ever used by `GeohashPruning` as a purely
+/// optional pruning aid, which already treats an empty covering set as "do
+/// not prune" (see `geom.is_empty()` check in
+/// `daft-logical-plan::optimization::rules::geohash_pruning`). So instead of
+/// truncating (which would be UNSOUND — a partial covering set would prune
+/// away rows whose true cells were dropped), we abort the flood entirely and
+/// return an empty set once the cap is hit, which safely disables pruning
+/// for oversized query geometries while preserving correctness.
+///
+/// 4096 is comfortably above the cell counts produced by realistic
+/// filter geometries (neighborhoods, cities, even large metro areas) at the
+/// precisions typically used for geohash columns, while being small enough
+/// that hitting the cap costs microseconds, not seconds.
+const MAX_COVERING_CELLS: usize = 4096;
+
 /// Compute all geohash cells at `precision` that overlap with the given geometry's bounding box.
 /// Used for automatic geohash-based partition pruning.
+///
+/// Returns an empty `Vec` both when the geometry has no usable bounding box
+/// and when the true covering set would exceed `MAX_COVERING_CELLS` — in
+/// both cases the caller (`GeohashPruning`) treats an empty result as "do
+/// not prune", which is always a safe, if less optimized, outcome.
 pub fn geohash_covers_geometry(g: &Geometry, precision: usize) -> Vec<String> {
     let bbox = match g.bounding_rect() {
         Some(b) => b,
@@ -98,7 +127,15 @@ pub fn geohash_covers_geometry(g: &Geometry, precision: usize) -> Vec<String> {
     };
 
     let mut cells = std::collections::HashSet::new();
-    collect_covering_cells(&mut cells, &start_hash, &bbox, precision);
+    let capped = collect_covering_cells(&mut cells, &start_hash, &bbox, precision);
+    if capped {
+        // The covering set is larger than we're willing to enumerate. Never
+        // return a partial/truncated set (that would be unsound — it would
+        // cause the pruning rule to drop rows whose true cells were never
+        // collected). Returning empty is always safe: it just disables
+        // pruning for this query geometry.
+        return vec![];
+    }
     cells.into_iter().collect()
 }
 
@@ -110,14 +147,20 @@ pub fn geohash_covers_geometry(g: &Geometry, precision: usize) -> Vec<String> {
 /// implementation broke on dequeuing the max-corner cell, losing same-layer
 /// cells still in the queue, and enqueued neighbors unfiltered, flooding an
 /// O(D²) disk around the start.)
+///
+/// Bounded: the flood aborts once `cells` would grow past
+/// `MAX_COVERING_CELLS`, returning `true` ("capped"). Callers must NOT treat
+/// `cells` as a valid (partial) covering set when this returns `true` — the
+/// flood stops mid-BFS, so `cells` at that point is an arbitrary, incomplete
+/// prefix of the true covering set, not a sound approximation of it.
 fn collect_covering_cells(
     cells: &mut std::collections::HashSet<String>,
     start: &str,
     bbox: &geo::Rect<f64>,
     precision: usize,
-) {
+) -> bool {
     if start.is_empty() {
-        return;
+        return false;
     }
     let mut queue = std::collections::VecDeque::new();
     let mut visited = std::collections::HashSet::new();
@@ -125,6 +168,9 @@ fn collect_covering_cells(
     visited.insert(start.to_string());
 
     while let Some(current) = queue.pop_front() {
+        if cells.len() >= MAX_COVERING_CELLS {
+            return true;
+        }
         cells.insert(current.clone());
 
         let Ok(neighbors) = geohash::neighbors(&current) else {
@@ -146,6 +192,7 @@ fn collect_covering_cells(
             }
         }
     }
+    false
 }
 
 /// Check if a geohash string is covered by any of the given covering cells.
@@ -208,5 +255,31 @@ mod covering_tests {
                 "cell {cell} does not intersect the query bbox"
             );
         }
+    }
+
+    #[test]
+    fn covering_set_is_empty_when_query_bbox_is_enormous() {
+        // At precision 5, a near-global bbox overlaps tens of millions of
+        // geohash cells. The flood fill must abort past MAX_COVERING_CELLS
+        // and report an empty covering set (never a truncated/partial one),
+        // so GeohashPruning's `geom.is_empty()` guard declines to prune
+        // instead of enumerating (or worse, unsoundly truncating) millions
+        // of cells at plan time.
+        let huge = Rect::new(coord! { x: -180.0, y: -85.0 }, coord! { x: 180.0, y: 85.0 });
+        let cells = geohash_covers_geometry(&Geometry::Rect(huge), 5);
+        assert!(
+            cells.is_empty(),
+            "expected capped flood to report an empty covering set, got {} cells",
+            cells.len()
+        );
+
+        // Sanity check the cap doesn't fire early: a modest bbox, well under
+        // the cap, must still return its exact (non-empty) covering set.
+        let modest = Rect::new(coord! { x: -2.0, y: -2.0 }, coord! { x: 2.0, y: 2.0 });
+        let modest_cells = geohash_covers_geometry(&Geometry::Rect(modest), 4);
+        assert!(
+            !modest_cells.is_empty(),
+            "modest bbox should still return a non-empty exact covering set"
+        );
     }
 }
