@@ -627,6 +627,13 @@ pub async fn stream_parquet(
                 )
                 .ok()
                 .and_then(|s| Schema::try_from(&s).ok());
+                for (col, crs) in daft_schema::geo_metadata::non_default_crs_columns(&geo_json) {
+                    log::warn!(
+                        "GeoParquet column '{col}' in {path} declares CRS '{crs}' (not the \
+                         default OGC:CRS84 / WGS84 lon-lat); Daft's Geometry type has no \
+                         CRS concept — geodesic functions assume lon/lat WGS84."
+                    );
+                }
                 arrow_schema_for_detect
                     .map(|s| detect_geo_columns(&geo_json, &s))
                     .unwrap_or_default()

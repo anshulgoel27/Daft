@@ -62,6 +62,15 @@ pub fn infer_schema_from_daft_metadata(
             if !geo_cols.is_empty() {
                 schema = retype_geo_schema(&schema, &geo_cols);
             }
+            for (col, crs) in geo_metadata::non_default_crs_columns(&geo_json) {
+                log::warn!(
+                    "GeoParquet column '{col}' declares CRS '{crs}' (not the default \
+                     OGC:CRS84 / WGS84 lon-lat). Daft's Geometry type has no CRS concept: \
+                     geodesic functions (use_spheroid distance/dwithin, \
+                     great_circle_distance, st_geohash, H3 helpers) assume lon/lat WGS84 \
+                     and will silently produce wrong results for projected coordinates."
+                );
+            }
         }
     }
     Ok(schema)

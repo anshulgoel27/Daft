@@ -90,6 +90,35 @@ pub fn detect_geo_columns(geo_json: &str, schema: &Schema) -> Vec<String> {
         .collect()
 }
 
+/// The GeoParquet spec's default CRS when the `crs` key is absent: lon/lat WGS84.
+const DEFAULT_CRS: &str = "OGC:CRS84";
+
+/// Returns `(column_name, crs)` for every geometry column in `geo_json` whose `crs`
+/// is present and is not the GeoParquet default (`OGC:CRS84`). Lenient: returns
+/// empty on any parse failure, matching `detect_geo_columns`.
+///
+/// Daft's `Geometry` type has no CRS field. Planar ST_* defaults are CRS-agnostic
+/// (results are in coordinate units), but the geodesic family (`use_spheroid`
+/// variants, `great_circle_distance`, `st_geohash`, H3 helpers) assumes lon/lat
+/// WGS84 — callers use this to warn instead of silently misinterpreting projected
+/// coordinates.
+pub fn non_default_crs_columns(geo_json: &str) -> Vec<(String, String)> {
+    let Ok(meta) = serde_json::from_str::<GeoMetadata>(geo_json) else {
+        return vec![];
+    };
+    meta.columns
+        .into_iter()
+        .filter_map(|(name, c)| {
+            let crs = c.crs?;
+            let crs_str = match &crs {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (crs_str != DEFAULT_CRS).then_some((name, crs_str))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +191,44 @@ mod tests {
         assert_eq!(v["primary_column"], "b");
         assert!(v["columns"].get("a").is_none());
         assert_eq!(v["columns"]["b"]["encoding"], "WKB");
+    }
+
+    #[test]
+    fn non_default_crs_columns_flags_non_wgs84() {
+        let json = r#"{
+            "version": "1.1.0",
+            "primary_column": "geom",
+            "columns": {
+                "geom": {"encoding": "WKB", "crs": "EPSG:3857"},
+                "geom_wgs84": {"encoding": "WKB", "crs": "OGC:CRS84"},
+                "geom_default": {"encoding": "WKB"}
+            }
+        }"#;
+        let flagged = non_default_crs_columns(json);
+        assert_eq!(flagged, vec![("geom".to_string(), "EPSG:3857".to_string())]);
+    }
+
+    #[test]
+    fn non_default_crs_columns_empty_for_malformed_json() {
+        assert!(non_default_crs_columns("{not json").is_empty());
+    }
+
+    #[test]
+    fn non_default_crs_columns_handles_projjson_object() {
+        // A GeoParquet file may legally carry a full PROJJSON object as `crs`
+        // rather than a short string identifier. This must not panic and must
+        // not be mistaken for the default CRS.
+        let json = r#"{
+            "version": "1.1.0",
+            "primary_column": "geom",
+            "columns": {
+                "geom": {"encoding": "WKB", "crs": {"type": "GeographicCRS", "name": "Custom CRS"}}
+            }
+        }"#;
+        let flagged = non_default_crs_columns(json);
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].0, "geom");
+        // stringified PROJJSON object, not mistaken for the default
+        assert!(flagged[0].1.contains("Custom CRS"));
     }
 }
