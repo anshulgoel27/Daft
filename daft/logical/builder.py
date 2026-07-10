@@ -426,6 +426,7 @@ class LogicalPlanBuilder:
         version: int,
         large_dtypes: bool,
         io_config: IOConfig,
+        compression: str,
         partition_cols: list[str] | None = None,
     ) -> LogicalPlanBuilder:
         columns_name = self.schema().column_names()
@@ -435,6 +436,7 @@ class LogicalPlanBuilder:
             mode,
             version,
             large_dtypes,
+            compression,
             partition_cols,
             io_config,
         )

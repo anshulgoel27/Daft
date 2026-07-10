@@ -107,6 +107,11 @@ pub struct ParquetReadOptions {
     pub field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
     pub delete_rows: Option<Vec<i64>>,
     pub batch_size: Option<usize>,
+    /// Exact on-disk file size when already known (e.g. from a catalog transaction
+    /// log or an object-store LIST). When set, the remote reader skips its
+    /// per-file HEAD request and fetches the footer with an exact byte range.
+    /// A wrong value fails the footer parse; it is trusted like the catalog log.
+    pub size_bytes: Option<usize>,
     // TODO(arrow-rs): wire this through to the arrowrs reader to skip redundant footer reads.
     // The arrowrs reader currently reads its own metadata via ArrowReaderMetadata::load(),
     // but callers (e.g. scan_task.rs) already have pre-fetched DaftParquetMetadata from planning.
@@ -122,6 +127,8 @@ pub struct PerFileOptions {
     pub delete_rows: Option<Vec<i64>>,
     /// See [`ParquetReadOptions::metadata`].
     pub metadata: Option<Arc<DaftParquetMetadata>>,
+    /// See [`ParquetReadOptions::size_bytes`].
+    pub size_bytes: Option<usize>,
 }
 
 /// Options for bulk reads. Fields without `per_file` apply to every uri;
@@ -185,6 +192,7 @@ fn single_opts_for(opts: &ParquetBulkReadOptions, i: usize) -> ParquetReadOption
         delete_rows: per.delete_rows,
         batch_size: opts.batch_size,
         metadata: per.metadata,
+        size_bytes: per.size_bytes,
         ignore_corrupt_files: false,
         skipped_corrupt_files: None,
     }
@@ -636,7 +644,7 @@ mod tests {
 
     use arrow::datatypes::DataType;
     use common_error::DaftResult;
-    use daft_io::{IOClient, IOConfig};
+    use daft_io::{IOClient, IOConfig, IOStatsContext};
     use futures::StreamExt;
     use parquet::schema::types::Type as ParquetSchemaType;
 
@@ -819,5 +827,149 @@ mod tests {
             "stream with limit=5 on 5-row file should return 5 rows"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const PUBLIC_PARQUET: &str = "s3://daft-public-data/test_fixtures/parquet-dev/mvp.parquet";
+    const PUBLIC_PARQUET_SIZE: usize = 9882;
+
+    fn anonymous_io_client() -> DaftResult<Arc<IOClient>> {
+        let mut io_config = IOConfig::default();
+        io_config.s3.anonymous = true;
+        Ok(Arc::new(IOClient::new(io_config.into())?))
+    }
+
+    #[tokio::test]
+    async fn known_size_skips_head_request() -> DaftResult<()> {
+        let io_client = anonymous_io_client()?;
+        let io_stats = IOStatsContext::new("known_size_skips_head_request");
+
+        let opts = ParquetReadOptions {
+            size_bytes: Some(PUBLIC_PARQUET_SIZE),
+            ..Default::default()
+        };
+        let stream = read_parquet(PUBLIC_PARQUET, io_client, Some(io_stats.clone()), opts).await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+        let num_rows: usize = batches.iter().map(|rb| rb.len()).sum();
+
+        assert_eq!(num_rows, 100);
+        assert_eq!(
+            io_stats.load_head_requests(),
+            0,
+            "a read with a known file size must not issue HEAD requests"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_size_still_heads_once() -> DaftResult<()> {
+        let io_client = anonymous_io_client()?;
+        let io_stats = IOStatsContext::new("unknown_size_still_heads_once");
+
+        let stream = read_parquet(
+            PUBLIC_PARQUET,
+            io_client,
+            Some(io_stats.clone()),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+        let num_rows: usize = batches.iter().map(|rb| rb.len()).sum();
+
+        assert_eq!(num_rows, 100);
+        assert_eq!(io_stats.load_head_requests(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wrong_size_fails_loudly() -> DaftResult<()> {
+        let io_client = anonymous_io_client()?;
+        let opts = ParquetReadOptions {
+            // Plausible but wrong size: large enough to pass the min-size check,
+            // small enough that the footer magic lands in the wrong place.
+            size_bytes: Some(1260),
+            ..Default::default()
+        };
+        let result = read_parquet(PUBLIC_PARQUET, io_client, None, opts).await;
+        let err = match result {
+            Ok(_) => panic!("a wrong size must error, not silently read"),
+            Err(e) => e,
+        };
+        // A genuinely stale/wrong size still fails loud *as corruption*, and the
+        // diagnostic must name the caller-supplied size so it points at the real
+        // cause instead of surfacing a bare footer-magic error.
+        assert!(
+            err.to_string().contains("1260"),
+            "wrong-size error must name the caller-supplied size, got: {err}"
+        );
+        assert!(
+            is_parquet_corrupt(&err),
+            "a genuinely wrong/stale size must classify as corrupt, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// Load-bearing regression test for the known-size (HEAD-skipped) fast path.
+    ///
+    /// A transient IO fault on the footer fetch (S3 timeout/throttle/socket)
+    /// propagates as `Error::IO`, wrapped by the known-size branch into
+    /// `KnownFileSizeMetadata`. It must classify to the *same* typed `DaftError`
+    /// it would on the `None`-size path and NOT be treated as file corruption —
+    /// otherwise `ignore_corrupt_files=true` silently drops the file's rows on a
+    /// mere network blip.
+    #[test]
+    fn known_size_transient_io_is_not_corrupt() {
+        use common_error::DaftError;
+
+        let io_err = daft_io::Error::ReadTimeout {
+            path: PUBLIC_PARQUET.to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read timed out",
+            )),
+        };
+        let wrapped = crate::Error::KnownFileSizeMetadata {
+            path: PUBLIC_PARQUET.to_string(),
+            size_bytes: PUBLIC_PARQUET_SIZE,
+            source: Box::new(crate::Error::IO { source: io_err }),
+        };
+
+        let daft_err: DaftError = wrapped.into();
+        assert!(
+            !is_parquet_corrupt(&daft_err),
+            "transient IO on the known-size path must not be classified as corrupt (got {daft_err:?})"
+        );
+        assert!(
+            matches!(daft_err, DaftError::ReadTimeout(_)),
+            "transient IO must surface the same typed variant as the None-size path, got {daft_err:?}"
+        );
+    }
+
+    /// The other direction: a genuinely wrong/stale caller-supplied size surfaces
+    /// as a footer/metadata-shape error, which must still fail loud as corruption
+    /// with a message that names the size. Mirrors `wrong_size_fails_loudly`
+    /// without touching the network.
+    #[test]
+    fn known_size_footer_shape_is_corrupt_and_names_size() {
+        use common_error::DaftError;
+
+        let footer_err = crate::Error::InvalidParquetFile {
+            path: PUBLIC_PARQUET.to_string(),
+            footer: vec![1, 2, 3, 4],
+        };
+        let wrapped = crate::Error::KnownFileSizeMetadata {
+            path: PUBLIC_PARQUET.to_string(),
+            size_bytes: 1260,
+            source: Box::new(footer_err),
+        };
+
+        let daft_err: DaftError = wrapped.into();
+        assert!(
+            is_parquet_corrupt(&daft_err),
+            "a footer-shape failure on the known-size path must classify as corrupt, got {daft_err:?}"
+        );
+        assert!(
+            daft_err.to_string().contains("1260"),
+            "the corrupt-file message must name the caller-supplied size, got: {daft_err}"
+        );
     }
 }

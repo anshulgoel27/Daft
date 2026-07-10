@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
     from daft.catalog.__unity._client import UnityCatalogTable
+    from daft.datatype import DataType
 
 
 @PublicAPI
@@ -246,6 +247,7 @@ def merge_deltalake(
     max_spill_size: int | None = None,
     max_temp_directory_size: int | None = None,
     post_commithook_properties: "deltalake.PostCommitHookProperties | None" = None,
+    compression: str | None = None,
 ) -> "DeltaMergeBuilder":
     """Create a Delta Lake MERGE operation builder for composable merge clauses.
 
@@ -267,6 +269,10 @@ def merge_deltalake(
         max_spill_size: Maximum spill size in bytes for streamed execution.
         max_temp_directory_size: Maximum temporary directory size in bytes for streamed execution.
         post_commithook_properties: Optional post-commit hook properties.
+        compression: Compression codec for the parquet data files this merge writes.
+            Defaults to "snappy" when `writer_properties` is not supplied. Mutually
+            exclusive with `writer_properties` (which already carries its own
+            `compression` field) — passing both raises `ValueError`.
 
     Returns:
         DeltaMergeBuilder: A builder object for chaining merge clauses with ``.execute()`` finalizer that returns a DataFrame.
@@ -319,6 +325,25 @@ def merge_deltalake(
             )
             metrics = result._metadata["merge_metrics"]
     """
+    if compression is not None and writer_properties is not None:
+        raise ValueError(
+            "Pass either `compression` or `writer_properties`, not both. "
+            "`writer_properties` already carries a `compression` field; setting both is "
+            "ambiguous, and deltalake's WriterProperties cannot be safely copied "
+            "(it is decorated @dataclass but declares no fields, so dataclasses.replace "
+            "silently resets every other option)."
+        )
+
+    if writer_properties is None:
+        import deltalake
+
+        from daft.io.delta_lake.delta_lake_write import normalize_delta_compression
+
+        codec = normalize_delta_compression("snappy" if compression is None else compression)
+        # delta-rs spells uncompressed as 'UNCOMPRESSED'; it rejects 'NONE'.
+        wp_codec = "UNCOMPRESSED" if codec == "none" else codec.upper()
+        writer_properties = deltalake.WriterProperties(compression=wp_codec)
+
     from deltalake import CommitProperties
 
     if isinstance(source, DataFrame):
@@ -573,6 +598,7 @@ def distributed_merge_deltalake(
     broadcast_join: bool | None = None,
     materialize_source: bool = True,
     materialize_join: bool = False,
+    compression: str = "snappy",
 ) -> "DistributedDeltaMergeBuilder":
     """Create a distributed Delta Lake MERGE builder that uses Daft's distributed join.
 
@@ -617,6 +643,8 @@ def distributed_merge_deltalake(
             (default), the joined plan is re-executed per pass and never held
             in memory; on partitioned tables the write pass then re-reads only
             the affected partitions of the target.
+        compression: Compression codec for the parquet data files this merge writes.
+            Defaults to "snappy". See :meth:`daft.DataFrame.write_deltalake`.
 
     Returns:
         DistributedDeltaMergeBuilder: A builder for chaining merge clauses.
@@ -686,6 +714,10 @@ def distributed_merge_deltalake(
                 .execute()
             )
     """
+    from daft.io.delta_lake.delta_lake_write import normalize_delta_compression
+
+    compression = normalize_delta_compression(compression)
+
     # Parse predicate to extract join keys and residual conditions
     join_keys, residual_predicates = _parse_merge_predicate(predicate, source_alias, target_alias)
 
@@ -728,6 +760,7 @@ def distributed_merge_deltalake(
         broadcast_join=broadcast_join,
         materialize_source=materialize_source,
         materialize_join=materialize_join,
+        compression=compression,
     )
 
 
@@ -910,6 +943,30 @@ def _parse_merge_predicate(
     return join_keys, residual_predicates
 
 
+# Casts that can never lose a value. Sound for lossless only: anything absent from this
+# set is guarded by an actual null-introduction check, so a missing entry costs one extra
+# pass but never a wrong error.
+_LOSSLESS_NUMERIC_WIDENINGS = {
+    ("Int8", "Int16"), ("Int8", "Int32"), ("Int8", "Int64"),
+    ("Int16", "Int32"), ("Int16", "Int64"),
+    ("Int32", "Int64"),
+    ("UInt8", "UInt16"), ("UInt8", "UInt32"), ("UInt8", "UInt64"),
+    ("UInt16", "UInt32"), ("UInt16", "UInt64"),
+    ("UInt32", "UInt64"),
+    ("UInt8", "Int16"), ("UInt8", "Int32"), ("UInt8", "Int64"),
+    ("UInt16", "Int32"), ("UInt16", "Int64"),
+    ("UInt32", "Int64"),
+    ("Float32", "Float64"),
+}  # fmt: skip
+
+
+def _is_definitely_lossless_cast(src: "DataType", dst: "DataType") -> bool:
+    """True only when every representable source value survives the cast unchanged."""
+    if src == dst:
+        return True
+    return (str(src), str(dst)) in _LOSSLESS_NUMERIC_WIDENINGS
+
+
 class DistributedDeltaMergeBuilder:
     """Builder for distributed Delta Lake merge using Daft's distributed join engine.
 
@@ -936,6 +993,7 @@ class DistributedDeltaMergeBuilder:
         broadcast_join: bool | None = None,
         materialize_source: bool = True,
         materialize_join: bool = False,
+        compression: str = "snappy",
     ) -> None:
         self._resolved_table = resolved_table
         self._storage_options = storage_options
@@ -949,6 +1007,7 @@ class DistributedDeltaMergeBuilder:
         self._broadcast_join = broadcast_join
         self._materialize_source = materialize_source
         self._materialize_join = materialize_join
+        self._compression = compression
 
         # Target column names, used to decide which source columns collide (and
         # therefore receive the ".__src__" join suffix). Read from the Delta log
@@ -1148,6 +1207,77 @@ class DistributedDeltaMergeBuilder:
                 aligned.append(lit(None).cast(f.dtype).alias(name))
         return left.concat(source_only.select(*aligned))
 
+    def _target_dtypes(self) -> "dict[str, DataType]":
+        """Daft dtypes of the target table's columns, from the committed Delta schema.
+
+        Reuses ``delta_schema_to_pyarrow`` — the module's single Delta->Arrow source of
+        truth (version-robust: ``schema.to_pyarrow()`` before deltalake 1.0.0, an arro3
+        ``pa.schema(schema.to_arrow())`` conversion after). This is exactly what
+        ``DeltaLakeScanOperator`` feeds ``Schema.from_pyarrow_schema`` to build the schema
+        that ``execute()`` reads its target from, so the dtypes checked here are the same
+        ones the alignment (``_decomposed_outer_join``) and output casts actually run. No
+        data is read.
+        """
+        import daft
+
+        arrow_schema = delta_schema_to_pyarrow(self._resolved_table.schema())
+        return {f.name: f.dtype for f in daft.Schema.from_pyarrow_schema(arrow_schema)}
+
+    def _check_source_casts(self, source: "DataFrame") -> None:
+        """Raise if aligning the source to the target schema would turn a value into NULL.
+
+        Daft's `cast` returns NULL on overflow where PyArrow raises. The merge aligns the
+        source to the target's dtypes, so an out-of-range value is silently discarded and
+        the merge reports success. Guard only the casts that are not provably lossless;
+        the check is data-dependent, so a merge that narrows within range still succeeds.
+
+        Probes ``source`` (the *materialized* source when ``materialize_source=True``),
+        not ``self._source``, so the guard vets the exact rows that get written and does
+        not trigger a second execution of the source plan. For a non-deterministic source
+        this is load-bearing: vetting one execution while writing another could let an
+        out-of-range value slip through into the second execution and be silently nulled.
+        """
+        import daft
+        from daft import col
+
+        target_dtypes = self._target_dtypes()
+        risky = [
+            f
+            for f in source.schema()
+            if f.name in target_dtypes
+            and not _is_definitely_lossless_cast(f.dtype, target_dtypes[f.name])
+        ]
+        if not risky:
+            return
+
+        # A row whose source value is non-null but whose cast result is null is a value
+        # that did not fit. Count them per column in one pass.
+        lost = (
+            source.select(
+                *[
+                    (
+                        (~col(f.name).is_null())
+                        & col(f.name).cast(target_dtypes[f.name]).is_null()
+                    )
+                    .cast(daft.DataType.int64())
+                    .alias(f.name)
+                    for f in risky
+                ]
+            )
+            .sum(*[f.name for f in risky])
+            .to_pydict()
+        )
+
+        for f in risky:
+            count = lost[f.name][0] or 0
+            if count:
+                raise ValueError(
+                    f"Merging into column {f.name!r} would discard {count} value(s): "
+                    f"casting {f.dtype} to the target's {target_dtypes[f.name]} produces "
+                    f"NULL for values outside its range. Cast the column explicitly "
+                    f"before merging if that is intended."
+                )
+
     def _check_unsupported_table_features(self) -> None:
         """Reject tables relying on write-time enforcement.
 
@@ -1229,6 +1359,7 @@ class DistributedDeltaMergeBuilder:
             pinned_version + 1,
             True,
             io_config=io_config,
+            compression=self._compression,
             partition_cols=list(partition_cols),
         )
         wdf = DataFrame(builder)
@@ -1321,10 +1452,11 @@ class DistributedDeltaMergeBuilder:
 
         on = self._on
 
-        # Materialize the source once when small enough to hold: it is reused by
-        # the guard and by both execution passes. For very large sources
-        # (materialize_source=False), keep it lazy — each pass re-executes the
-        # source plan (column-pruned) instead of pinning it in cluster memory.
+        # Materialize the source once when small enough to hold: the single
+        # collected copy is reused by the guard and by both execution passes. For
+        # very large sources (materialize_source=False), keep it lazy — each pass
+        # (and the guard) re-executes the source plan (column-pruned) instead of
+        # pinning it in cluster memory.
         source_size_bytes: int | None = None
         if self._materialize_source:
             source = self._source.collect()
@@ -1335,6 +1467,13 @@ class DistributedDeltaMergeBuilder:
         else:
             source = self._source
         source_columns = [f.name for f in source.schema()]
+
+        # Guard — before any join, write, or version pin, but *after* the source is
+        # materialized so it probes the exact rows that get written (one execution, not
+        # two): aligning the source to a narrower target dtype would silently null
+        # out-of-range values (Daft's cast returns NULL where PyArrow raises), so refuse
+        # loudly instead of committing them.
+        self._check_source_casts(source)
 
         # Guard (#11): source join keys must be unique — multiple source rows
         # matching one target row is ambiguous and would duplicate target rows
@@ -1715,6 +1854,7 @@ class DistributedDeltaMergeBuilder:
                     partition_cols=partition_cols if partition_cols else None,
                     custom_metadata=merge_metadata,
                     io_config=self._io_config,
+                    compression=self._compression,
                 )
                 # The overwrite replaced every file, so the new snapshot's
                 # files are exactly the ones this merge added.

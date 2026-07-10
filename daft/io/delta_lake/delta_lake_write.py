@@ -35,6 +35,8 @@ except ImportError:
 def sanitize_table_for_deltalake(
     table: MicroPartition, large_dtypes: bool, partition_keys: list[str] | None = None
 ) -> pa.Table:
+    from daft.dependencies import pa
+
     arrow_table = table.to_arrow()
 
     # Remove partition keys from the table since they are already encoded as keys
@@ -42,7 +44,18 @@ def sanitize_table_for_deltalake(
         arrow_table = arrow_table.drop_columns(partition_keys)
 
     arrow_batch = convert_pa_schema_to_delta(arrow_table.schema, large_dtypes)
-    return arrow_table.cast(arrow_batch)
+    try:
+        return arrow_table.cast(arrow_batch)
+    except pa.ArrowInvalid as exc:
+        unsigned = _find_uint64_columns(arrow_table.schema)
+        if unsigned:
+            raise ValueError(
+                f"Failed to write column(s) {unsigned} to Delta Lake. Delta has no "
+                f"unsigned integer types; uint64 values above 2**63-1 cannot be "
+                f"represented. Cast the column explicitly (e.g. to decimal) before "
+                f"writing. Original error: {exc}"
+            ) from exc
+        raise
 
 
 def partitioned_table_to_deltalake_iter(
@@ -63,6 +76,21 @@ def partitioned_table_to_deltalake_iter(
     else:
         converted_arrow_table = sanitize_table_for_deltalake(partitioned.table, large_dtypes)
         yield converted_arrow_table, "/", {}
+
+
+def _json_safe_bound(value: Any) -> tuple[bool, Any]:
+    """Return (is_safe, value) for a parquet min/max bound.
+
+    Binary bounds that are not valid UTF-8 have no faithful JSON representation. The old
+    `unicode_escape` decode produced a string that is not what the data contains, and other
+    engines read these bounds for data skipping. Omitting a bound is always safe.
+    """
+    if isinstance(value, bytes):
+        try:
+            return True, value.decode("utf-8")
+        except UnicodeDecodeError:
+            return False, None
+    return True, value
 
 
 def get_file_stats_from_metadata(
@@ -93,21 +121,21 @@ def get_file_stats_from_metadata(
 
             # Min / max may not exist for some column types, or if all values are null
             if any(group.column(column_idx).statistics.has_min_max for group in iter_groups(metadata)):
-                # Min and Max are recorded in physical type, not logical type
-                # https://stackoverflow.com/questions/66753485/decoding-parquet-min-max-statistics-for-decimal-type
-                # TODO: Add logic to decode physical type for DATE, DECIMAL
-
                 minimums = (group.column(column_idx).statistics.min for group in iter_groups(metadata))
                 # If some row groups have all null values, their min and max will be null too.
                 min_value = min(minimum for minimum in minimums if minimum is not None)
-                # Infinity cannot be serialized to JSON, so we skip it. Saying
-                # min/max is infinity is equivalent to saying it is null, anyways.
-                if min_value != -inf:
-                    stats["minValues"][name] = min_value
                 maximums = (group.column(column_idx).statistics.max for group in iter_groups(metadata))
                 max_value = max(maximum for maximum in maximums if maximum is not None)
-                if max_value != inf:
-                    stats["maxValues"][name] = max_value
+
+                min_ok, min_json = _json_safe_bound(min_value)
+                max_ok, max_json = _json_safe_bound(max_value)
+                if min_ok and max_ok:
+                    # Infinity cannot be serialized to JSON, so we skip it. Saying
+                    # min/max is infinity is equivalent to saying it is null, anyways.
+                    if min_json != -inf:
+                        stats["minValues"][name] = min_json
+                    if max_json != inf:
+                        stats["maxValues"][name] = max_json
     return stats
 
 
@@ -149,6 +177,52 @@ def make_deltalake_add_action(
         True,
         json.dumps(stats, cls=DeltaJSONEncoder),
     )
+
+
+# Codecs PyArrow's parquet writer can encode. `lz4` is included: with a single writer
+# there is no ambiguity about which parquet codec it maps to.
+_DELTA_COMPRESSION_CODECS = frozenset({"none", "snappy", "gzip", "brotli", "lz4", "zstd"})
+
+# `uncompressed` is a spelling of `none`, not a distinct codec. PyArrow's writer rejects
+# the string but accepts `none`; `write_parquet` documents `uncompressed`, so we keep it
+# working here rather than gratuitously diverging.
+_DELTA_COMPRESSION_ALIASES = {"uncompressed": "none"}
+
+# Codecs the parquet format defines but PyArrow cannot encode. `lzo` is the treacherous
+# one: `pq.ParquetWriter(compression="lzo")` constructs successfully and raises on the
+# first `write_table`, so a zero-row capability probe reports it as supported.
+_DELTA_COMPRESSION_REJECTED = {
+    "lz4_raw": "PyArrow's parquet writer cannot encode it. Use 'lz4' instead.",
+    "lzo": (
+        "PyArrow's C++ Parquet implementation does not support LZO encoding "
+        "(it fails on the first write, not at writer construction). "
+        "Use 'snappy' or 'zstd' instead."
+    ),
+}
+
+
+def normalize_delta_compression(compression: str) -> str:
+    """Validate a Delta write compression codec and return its canonical name.
+
+    Case-insensitive; surrounding whitespace is ignored. Maps ``uncompressed`` to
+    ``none``. Raises ``ValueError`` both for codecs PyArrow cannot encode and for
+    unrecognized codec names, so the failure surfaces at call time rather than mid-write.
+    """
+    codec = compression.strip().lower()
+    codec = _DELTA_COMPRESSION_ALIASES.get(codec, codec)
+
+    if codec in _DELTA_COMPRESSION_REJECTED:
+        raise ValueError(
+            f"compression={compression!r} is not supported for Delta writes: "
+            f"{_DELTA_COMPRESSION_REJECTED[codec]}"
+        )
+    if codec not in _DELTA_COMPRESSION_CODECS:
+        accepted = ", ".join(sorted(_DELTA_COMPRESSION_CODECS | {"uncompressed"}))
+        raise ValueError(
+            f"Unsupported compression codec {compression!r} for Delta writes. "
+            f"Accepted codecs: {accepted}."
+        )
+    return codec
 
 
 def make_deltalake_fs(path: str, io_config: IOConfig | None = None) -> pafs.PyFileSystem:
@@ -201,6 +275,126 @@ class DeltaLakeWriteVisitors:
         return MicroPartition.from_pydict({col_name: self.add_actions})
 
 
+def _normalize_delta_timestamp_type(dtype: pa.DataType) -> pa.DataType:
+    """Rewrite tz-aware timestamps to use the ``UTC`` timezone label, recursing into nested types.
+
+    Delta Lake stores every timezone-aware timestamp as a UTC instant, and
+    deltalake>=1.0.0's ``Schema.from_arrow`` only accepts the literal timezone
+    ``"UTC"`` -- it rejects the fixed-offset spelling (``"+00:00"``) that Daft's
+    ``DataType.to_arrow_dtype()`` emits, as well as any named zone. The int64
+    values are unchanged (same absolute instant), so relabeling the timezone to
+    ``UTC`` is a lossless conversion, not a reinterpretation.
+    """
+    from daft.dependencies import pa
+
+    def norm_field(field: pa.Field) -> pa.Field:
+        return field.with_type(_normalize_delta_timestamp_type(field.type))
+
+    if pa.types.is_timestamp(dtype):
+        if dtype.tz is not None and dtype.tz != "UTC":
+            return pa.timestamp(dtype.unit, tz="UTC")
+        return dtype
+    if pa.types.is_struct(dtype):
+        return pa.struct([norm_field(dtype.field(i)) for i in range(dtype.num_fields)])
+    if pa.types.is_large_list(dtype):
+        return pa.large_list(norm_field(dtype.value_field))
+    if pa.types.is_fixed_size_list(dtype):
+        return pa.list_(norm_field(dtype.value_field), dtype.list_size)
+    if pa.types.is_list(dtype):
+        return pa.list_(norm_field(dtype.value_field))
+    if pa.types.is_map(dtype):
+        return pa.map_(norm_field(dtype.key_field), norm_field(dtype.item_field), keys_sorted=dtype.keys_sorted)
+    return dtype
+
+
+def _normalize_delta_schema_timestamps(schema: pa.Schema) -> pa.Schema:
+    """Apply :func:`_normalize_delta_timestamp_type` to every field of a schema."""
+    from daft.dependencies import pa
+
+    normalized = [field.with_type(_normalize_delta_timestamp_type(field.type)) for field in schema]
+    return pa.schema(normalized, metadata=schema.metadata)
+
+
+# Delta Lake has no unsigned types: delta-rs maps uint8->byte(int8), uint16->short(int16),
+# uint32->integer(int32), uint64->long(int64). Any value above the corresponding SIGNED
+# maximum commits and then cannot be read. Widen to the next signed type that holds every
+# value. uint64 has no lossless target; values above i64::MAX raise at cast time.
+def _widen_unsigned_type(dtype: pa.DataType) -> pa.DataType:
+    """Rewrite unsigned integer types to a signed type Delta can represent.
+
+    Recurses into nested types. uint8/uint16/uint32 widen losslessly. uint64 widens to
+    int64, which is lossless up to i64::MAX; beyond that the table cast raises, which is
+    strictly better than committing a table nobody can read.
+    """
+    from daft.dependencies import pa
+
+    def widen_field(field: pa.Field) -> pa.Field:
+        return field.with_type(_widen_unsigned_type(field.type))
+
+    if pa.types.is_uint8(dtype):
+        return pa.int16()
+    if pa.types.is_uint16(dtype):
+        return pa.int32()
+    if pa.types.is_uint32(dtype) or pa.types.is_uint64(dtype):
+        return pa.int64()
+    if pa.types.is_struct(dtype):
+        return pa.struct([widen_field(dtype.field(i)) for i in range(dtype.num_fields)])
+    if pa.types.is_large_list(dtype):
+        return pa.large_list(widen_field(dtype.value_field))
+    if pa.types.is_fixed_size_list(dtype):
+        return pa.list_(widen_field(dtype.value_field), dtype.list_size)
+    if pa.types.is_list(dtype):
+        return pa.list_(widen_field(dtype.value_field))
+    if pa.types.is_map(dtype):
+        return pa.map_(
+            widen_field(dtype.key_field),
+            widen_field(dtype.item_field),
+            keys_sorted=dtype.keys_sorted,
+        )
+    return dtype
+
+
+def _widen_unsigned_schema(schema: pa.Schema) -> pa.Schema:
+    """Apply :func:`_widen_unsigned_type` to every field of a schema."""
+    from daft.dependencies import pa
+
+    widened = [field.with_type(_widen_unsigned_type(field.type)) for field in schema]
+    return pa.schema(widened, metadata=schema.metadata)
+
+
+def _type_contains_uint64(dtype: pa.DataType) -> bool:
+    """Return whether ``dtype`` is uint64, or contains a uint64 anywhere nested within it.
+
+    Mirrors the container coverage of :func:`_widen_unsigned_type` (struct / list /
+    large_list / fixed_size_list / map, including both the map key and item fields) so
+    that every column the widening step could overflow on uint64 is also detected here.
+    """
+    from daft.dependencies import pa
+
+    if pa.types.is_uint64(dtype):
+        return True
+    if pa.types.is_struct(dtype):
+        return any(_type_contains_uint64(dtype.field(i).type) for i in range(dtype.num_fields))
+    if pa.types.is_large_list(dtype):
+        return _type_contains_uint64(dtype.value_field.type)
+    if pa.types.is_fixed_size_list(dtype):
+        return _type_contains_uint64(dtype.value_field.type)
+    if pa.types.is_list(dtype):
+        return _type_contains_uint64(dtype.value_field.type)
+    if pa.types.is_map(dtype):
+        return _type_contains_uint64(dtype.key_field.type) or _type_contains_uint64(dtype.item_field.type)
+    return False
+
+
+def _find_uint64_columns(schema: pa.Schema) -> list[str]:
+    """Return names of top-level fields whose type is or contains uint64.
+
+    Only uint64 can overflow int64 on cast; uint8/uint16/uint32 widen losslessly and are
+    never named.
+    """
+    return [field.name for field in schema if _type_contains_uint64(field.type)]
+
+
 def convert_pa_schema_to_delta(schema: pa.Schema, large_dtypes: bool) -> pa.Schema:
     import deltalake
     from packaging.version import parse
@@ -217,9 +411,14 @@ def convert_pa_schema_to_delta(schema: pa.Schema, large_dtypes: bool) -> pa.Sche
         schema_conversion_mode = ArrowSchemaConversionMode.LARGE if large_dtypes else ArrowSchemaConversionMode.NORMAL
         return _convert_pa_schema_to_delta(schema, schema_conversion_mode=schema_conversion_mode)
     else:
-        # deltalake>=1.0.0 passes through Arrow data types without modification
-        # https://delta-io.github.io/delta-rs/upgrade-guides/guide-1.0.0/#large_dtypes-removed
-        return schema
+        # deltalake>=1.0.0 passes Arrow data types through without modification, EXCEPT
+        # that its Schema.from_arrow rejects tz-aware timestamps whose timezone is not the
+        # literal "UTC" (e.g. the "+00:00" that Daft emits). The pre-1.0.0 converters above
+        # normalized this for us; restore that normalization here so tz-aware timestamps
+        # commit correctly. https://delta-io.github.io/delta-rs/upgrade-guides/guide-1.0.0/#large_dtypes-removed
+        # Delta also has no unsigned integer types, so widen those too (see
+        # _widen_unsigned_type).
+        return _widen_unsigned_schema(_normalize_delta_schema_timestamps(schema))
 
 
 def create_table_with_add_actions(

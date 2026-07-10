@@ -1924,6 +1924,7 @@ class DataFrame:
         allow_unsafe_rename: bool = False,
         io_config: IOConfig | None = None,
         checkpoint: "IdempotentCommit | None" = None,
+        compression: str = "snappy",
     ) -> "DataFrame":
         """Writes the DataFrame to a [Delta Lake](https://docs.delta.io/latest/index.html) table, returning a new DataFrame with the operations that occurred.
 
@@ -1945,12 +1946,21 @@ class DataFrame:
                 or local disk. Defaults to False.
             io_config (IOConfig, optional): configurations to use when interacting with remote storage.
             checkpoint (IdempotentCommit, optional): Bundled checkpoint store + idempotence key for an idempotent commit. When provided, the Delta commit's ``custom_metadata`` is tagged with ``daft.idempotence-key`` and retries with the same key recognize the prior attempt without producing a duplicate commit. Only ``mode='append'`` is supported. Requires the Ray runner.
+            compression (str, optional): compression codec applied to every column of the written Delta data files. Defaults to "snappy". Accepts "snappy", "gzip", "zstd", "lz4", "brotli", "uncompressed", or "none" (case-insensitive). "lz4_raw" and "lzo" are not supported, because PyArrow's parquet writer cannot encode them.
 
         Returns:
             DataFrame: The operations that occurred with this write.
 
         Note:
             This call is **blocking** and will execute the DataFrame when called.
+
+            Delta Lake has no unsigned integer types, so an unsigned column is
+            widened to the next signed type that holds every value: ``uint8`` →
+            ``short``, ``uint16`` → ``integer``, ``uint32`` → ``long``,
+            ``uint64`` → ``long``. A ``uint32`` column therefore reads back as
+            ``int64``. ``uint64`` values above ``2**63 - 1`` have no signed
+            target and raise a ``ValueError`` rather than committing a table
+            that cannot be read.
 
             When ``checkpoint`` is provided and ``write_deltalake`` raises
             *after* the Delta commit landed (e.g. a transient failure during
@@ -1997,6 +2007,10 @@ class DataFrame:
             ...     checkpoint=daft.IdempotentCommit(store, idempotence_key="run-2026-05-21"),
             ... )  # doctest: +SKIP
         """
+        from daft.io.delta_lake.delta_lake_write import normalize_delta_compression
+
+        compression = normalize_delta_compression(compression)
+
         import json
 
         import deltalake
@@ -2168,6 +2182,7 @@ class DataFrame:
                 configuration=configuration,
                 custom_metadata=custom_metadata,
                 checkpoint=checkpoint,
+                compression=compression,
             )
 
         builder = self._builder.write_deltalake(
@@ -2176,6 +2191,7 @@ class DataFrame:
             version,
             large_dtypes,
             io_config=io_config,
+            compression=compression,
             partition_cols=partition_cols,
         )
         write_df = DataFrame(builder)
@@ -2324,6 +2340,7 @@ class DataFrame:
         max_spill_size: int | None = None,
         max_temp_directory_size: int | None = None,
         post_commithook_properties: "deltalake.PostCommitHookProperties | None" = None,
+        compression: str | None = None,
     ) -> "DeltaMergeBuilder":
         """Create a Delta Lake MERGE operation builder using this DataFrame.
 
@@ -2344,6 +2361,10 @@ class DataFrame:
             max_spill_size: Maximum spill size in bytes for streamed execution.
             max_temp_directory_size: Maximum temporary directory size in bytes for streamed execution.
             post_commithook_properties: Optional post-commit hook properties.
+            compression: Compression codec for the parquet data files this merge writes.
+                Defaults to "snappy" when `writer_properties` is not supplied. Mutually
+                exclusive with `writer_properties` (which already carries its own
+                `compression` field) — passing both raises `ValueError`.
 
         Returns:
             DeltaMergeBuilder: A builder object for chaining merge clauses with ``.execute()`` finalizer that returns a DataFrame.
@@ -2385,6 +2406,7 @@ class DataFrame:
             max_spill_size=max_spill_size,
             max_temp_directory_size=max_temp_directory_size,
             post_commithook_properties=post_commithook_properties,
+            compression=compression,
         )
 
     @staticmethod
@@ -2531,6 +2553,7 @@ class DataFrame:
         configuration: "Mapping[str, str | None] | None",
         custom_metadata: dict[str, str] | None,
         checkpoint: "IdempotentCommit",
+        compression: str,
     ) -> "DataFrame":
         """Idempotent Delta Lake commit identified by ``checkpoint.idempotence_key``.
 
@@ -2572,6 +2595,7 @@ class DataFrame:
             version,
             large_dtypes,
             io_config=io_config,
+            compression=compression,
             partition_cols=partition_cols,
         )
         write_df = DataFrame(builder)
