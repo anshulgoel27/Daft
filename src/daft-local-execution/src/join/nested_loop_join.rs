@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::{Arc, LazyLock}};
 use common_display::table_display::StrValue;
 use common_error::DaftResult;
 use common_metrics::ops::NodeType;
-use daft_core::{join::JoinSide, prelude::{SchemaRef, UInt64Array}};
+use daft_core::{join::JoinSide, prelude::{Operator, SchemaRef, UInt64Array}};
 use daft_dsl::{
     Expr, ExprRef,
     expr::{Column, bound_expr::BoundExpr},
@@ -76,7 +76,7 @@ struct PartitionedRTreeState {
 
 const SPATIAL_FNS: &[&str] = &[
     "st_intersects", "st_contains", "st_within", "st_covers",
-    "st_covered_by", "st_disjoint", "st_touches", "st_overlaps",
+    "st_covered_by", "st_touches", "st_overlaps",
     "st_crosses", "st_equals", "st_dwithin",
 ];
 
@@ -133,11 +133,15 @@ fn extract_from_expr(
                 }
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
+        // Only an AND-conjunction preserves superset-soundness: every true pair
+        // must satisfy the spatial conjunct, hence bbox-intersect. Under OR the
+        // other branch can be true for pairs whose bboxes do NOT intersect, and
+        // under NOT the truth of the wrapped predicate is inverted — in both
+        // cases bbox candidate generation would silently drop true rows.
+        Expr::BinaryOp { op: Operator::And, left, right } => {
             extract_from_expr(left, build_side, output_schema_len, build_n)
                 .or_else(|| extract_from_expr(right, build_side, output_schema_len, build_n))
         }
-        Expr::Not(inner) => extract_from_expr(inner, build_side, output_schema_len, build_n),
         _ => None,
     }
 }
@@ -802,5 +806,60 @@ impl JoinOperator for NestedLoopJoinOperator {
             format!("Filter = {}", self.filter.inner()),
             format!("Build Side = {:?}", self.build_side),
         ]
+    }
+}
+
+#[cfg(test)]
+mod acceleration_tests {
+    use daft_core::prelude::{DataType, Field, Schema};
+    use daft_dsl::{expr::bound_expr::BoundExpr, unresolved_col};
+
+    use super::*;
+
+    fn geom_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("a", DataType::Geometry),
+            Field::new("b", DataType::Geometry),
+        ])
+    }
+
+    fn extract(expr: daft_dsl::ExprRef) -> Option<(usize, usize)> {
+        let bound = BoundExpr::try_new(expr, &geom_schema()).unwrap();
+        extract_geom_col_indices(&bound, JoinSide::Left, 2, 1)
+    }
+
+    #[test]
+    fn st_intersects_is_accelerated() {
+        let e = daft_geo::st_intersects::st_intersects(unresolved_col("a"), unresolved_col("b"));
+        assert!(extract(e).is_some());
+    }
+
+    #[test]
+    fn st_disjoint_is_never_accelerated() {
+        let e = daft_geo::st_disjoint::st_disjoint(unresolved_col("a"), unresolved_col("b"));
+        assert!(extract(e).is_none());
+    }
+
+    #[test]
+    fn negated_intersects_is_never_accelerated() {
+        let e = daft_geo::st_intersects::st_intersects(unresolved_col("a"), unresolved_col("b"))
+            .not();
+        assert!(extract(e).is_none());
+    }
+
+    #[test]
+    fn or_composed_intersects_is_never_accelerated() {
+        let spatial =
+            daft_geo::st_intersects::st_intersects(unresolved_col("a"), unresolved_col("b"));
+        let e = spatial.or(unresolved_col("a").is_null());
+        assert!(extract(e).is_none());
+    }
+
+    #[test]
+    fn and_composed_intersects_is_still_accelerated() {
+        let spatial =
+            daft_geo::st_intersects::st_intersects(unresolved_col("a"), unresolved_col("b"));
+        let e = spatial.and(unresolved_col("a").not_null());
+        assert!(extract(e).is_some());
     }
 }

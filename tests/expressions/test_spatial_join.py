@@ -327,3 +327,86 @@ def test_distributed_spatial_hash_join_does_not_hash_collide_different_keys():
     )
     assert sorted(got["pid"]) == list(range(n))
     assert all(pid == qid for pid, qid in zip(got["pid"], got["qid"]))
+
+
+# ── R-tree acceleration must not be applied to unsound predicates ─────────────
+
+
+def test_python_join_st_disjoint():
+    """st_disjoint must not be R-tree-accelerated: its true matches typically have
+    NON-intersecting bboxes, which bbox candidate generation silently drops."""
+    from daft.functions import st_disjoint
+
+    left = daft.from_pydict({"lid": [1, 2], "lx": [0.0, 100.0], "ly": [0.0, 100.0]}).select(
+        daft.col("lid"), st_point(daft.col("lx"), daft.col("ly")).alias("lg")
+    )
+    right = daft.from_pydict({"rid": [10], "rx": [0.0], "ry": [0.0]}).select(
+        daft.col("rid"), st_point(daft.col("rx"), daft.col("ry")).alias("rg")
+    )
+    result = (
+        left.join(right, on=st_disjoint(left["lg"], right["rg"]))
+        .select("lid", "rid")
+        .sort("lid")
+        .to_pydict()
+    )
+    # lid=1 coincides with rid=10 (not disjoint); lid=2 is far away (disjoint).
+    assert result["lid"] == [2]
+    assert result["rid"] == [10]
+
+
+@pytest.mark.timeout(30)
+def test_python_join_not_st_intersects():
+    """A negated spatial predicate must skip bbox-based R-tree acceleration.
+
+    Bounded with a timeout: independently of R-tree acceleration, evaluating
+    `not(st_intersects(...))` over aliased geometry columns currently hangs the
+    nested-loop-join execution pipeline on this branch (reproduced even on a
+    from-scratch checkout of the branch tip, with none of this task's changes
+    applied, via a plain non-join `.select(~st_intersects(...))`, which fails
+    fast with `daft.exceptions.DaftCoreException: ... Mismatch of expected
+    expression name and name from computed series (g vs st_intersects)`,
+    raised from `daft-recordbatch/src/lib.rs`). That bug is pre-existing,
+    unrelated to R-tree candidate generation, and out of scope for this fix
+    (which only touches `extract_from_expr`'s acceleration decision in
+    `daft-local-execution/src/join/nested_loop_join.rs`) — the timeout turns
+    an indefinite CI hang into a bounded, visible failure instead of silently
+    hiding it.
+    """
+    left = daft.from_pydict({"lid": [1, 2], "lx": [1.0, 100.0], "ly": [1.0, 100.0]}).select(
+        daft.col("lid"), st_point(daft.col("lx"), daft.col("ly")).alias("lg")
+    )
+    right = daft.from_pydict(
+        {"rid": [10], "wkt": ["POLYGON((0 0,2 0,2 2,0 2,0 0))"]}
+    ).select(daft.col("rid"), st_geomfromtext(daft.col("wkt")).alias("rg"))
+    result = (
+        left.join(right, on=~st_intersects(left["lg"], right["rg"]))
+        .select("lid", "rid")
+        .sort("lid")
+        .to_pydict()
+    )
+    # lid=1 is inside the polygon -> excluded by NOT; lid=2 is far outside -> included.
+    assert result["lid"] == [2]
+    assert result["rid"] == [10]
+
+
+def test_python_join_or_composed_spatial_predicate():
+    """An OR-composed predicate must skip acceleration: a pair failing the spatial
+    branch (and its bbox test) can still satisfy the other OR branch."""
+    left = daft.from_pydict({"lid": [1, 2], "lx": [1.0, 100.0], "ly": [1.0, 100.0]}).select(
+        daft.col("lid"), st_point(daft.col("lx"), daft.col("ly")).alias("lg")
+    )
+    right = daft.from_pydict(
+        {"rid": [10], "wkt": ["POLYGON((0 0,2 0,2 2,0 2,0 0))"]}
+    ).select(daft.col("rid"), st_geomfromtext(daft.col("wkt")).alias("rg"))
+    result = (
+        left.join(
+            right,
+            on=st_intersects(left["lg"], right["rg"]) | ((left["lid"] + 8) == right["rid"]),
+        )
+        .select("lid", "rid")
+        .sort("lid")
+        .to_pydict()
+    )
+    # lid=1 intersects; lid=2 does not intersect but satisfies lid+8 == rid (2+8=10).
+    assert result["lid"] == [1, 2]
+    assert result["rid"] == [10, 10]
