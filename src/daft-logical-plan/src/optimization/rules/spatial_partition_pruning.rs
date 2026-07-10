@@ -96,9 +96,27 @@ fn load_index_for_dir(dir: &str) -> Option<LoadedIndex> {
         raw.entry(filename).or_default().push(h3_cell);
     }
 
-    let file_cells = raw
+    // `parse_h3_cells` silently drops any string it can't parse. A shortfall
+    // between the recorded cell strings and the successfully parsed cells
+    // means this file's entry is CORRUPT, not merely sparse — and a
+    // corrupt/partial cell list must never be used to prune, since
+    // `h3_cells_intersect` over a shrunken set can wrongly report "no
+    // overlap". Drop the file's entry entirely so it is ABSENT from
+    // `file_cells`; the lookup in `task_passes_h3` already treats an absent
+    // basename as "not in this directory's index" and keeps the task
+    // conservatively. This is safer than dropping just the unparsed cells
+    // and keeping the valid ones, which would silently shrink coverage and
+    // could turn a real intersection into a false "no overlap".
+    let file_cells: HashMap<String, Vec<u64>> = raw
         .into_iter()
-        .map(|(fname, cell_strs)| (fname, parse_h3_cells(&cell_strs)))
+        .filter_map(|(fname, cell_strs)| {
+            let parsed = parse_h3_cells(&cell_strs);
+            if parsed.len() == cell_strs.len() {
+                Some((fname, parsed))
+            } else {
+                None
+            }
+        })
         .collect();
     Some(LoadedIndex { geom_col, h3_resolution, file_cells })
 }
@@ -228,9 +246,11 @@ fn local_fs_path(path: &str) -> &str {
 
 /// Keep the task when any of its source files' H3 cells (from that file's OWN
 /// directory's index) intersect the query cells. Every unresolvable situation
-/// (no parent dir, no index, wrong geom_col, no query cells, file not indexed)
-/// keeps the task conservatively — pruning must never be based on a different
-/// directory's index.
+/// (no parent dir, no index, wrong geom_col, no query cells, file not indexed
+/// — including a file whose recorded cell strings failed to parse, which
+/// `load_index_for_dir` drops from the index entirely) keeps the task
+/// conservatively — pruning must never be based on a different directory's
+/// index.
 fn task_passes_h3(
     task: &ScanTask,
     geom_col: &str,
@@ -400,6 +420,49 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_cell_string_makes_file_entry_unresolvable_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_idx_file(
+            &dir.path().join(INDEX_FILENAME),
+            "geom",
+            5,
+            &[
+                // part-0.parquet's sidecar entry is CORRUPT: one valid H3 hex
+                // cell plus one unparseable string, as would result from a
+                // hand-edited or otherwise corrupted sidecar file.
+                ("851fb467fffffff", "part-0.parquet"),
+                ("not_a_cell", "part-0.parquet"),
+                // part-1.parquet's entry is fully valid and must be unaffected
+                // by the corruption in a different file's entry.
+                ("85be0e37fffffff", "part-1.parquet"),
+            ],
+        );
+        let index =
+            load_index_for_dir(&dir.path().to_string_lossy()).expect("index must still load");
+
+        // Design A: a file whose recorded cell strings partially fail to parse
+        // must be OMITTED from `file_cells` entirely (unresolvable -> keep at
+        // the `task_passes_h3` lookup site), never present with a
+        // shrunken/partial cell list — a partial list would let
+        // `h3_cells_intersect` silently under-report coverage and prune rows
+        // that should have been kept.
+        assert!(
+            !index.file_cells.contains_key("part-0.parquet"),
+            "a file with any unparseable recorded cell string must be absent \
+             from file_cells, not present with a shrunken cell list"
+        );
+        // The directory's other, fully-valid file entry must still load
+        // normally — corruption in one file's entry must not poison the rest
+        // of the directory's index.
+        assert_eq!(
+            index.file_cells.get("part-1.parquet"),
+            Some(&vec![u64::from(
+                "85be0e37fffffff".parse::<h3o::CellIndex>().unwrap()
+            )])
+        );
+    }
+
+    #[test]
     fn index_cache_isolates_directories() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
@@ -562,6 +625,148 @@ mod tests {
             remaining[0].sources[0]
                 .get_path()
                 .starts_with(&*dir_b.path().to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn end_to_end_keeps_task_when_own_directory_index_has_corrupt_cell_string() {
+        use daft_scan::{
+            FileFormatConfig, ParquetSourceConfig, PhysicalScanInfo, Pushdowns, ScanOperatorRef,
+            ScanSource, ScanSourceKind, ScanTask, SourceConfig, storage_config::StorageConfig,
+            test_utils::DummyScanOperator,
+        };
+        use daft_schema::{
+            dtype::DataType as DaftDataType, field::Field, schema::Schema, time_unit::TimeUnit,
+        };
+
+        fn make_task(path: &str, schema: daft_schema::schema::SchemaRef) -> ScanTaskRef {
+            StdArc::new(ScanTask::new(
+                vec![ScanSource {
+                    size_bytes: None,
+                    metadata: None,
+                    statistics: None,
+                    partition_spec: None,
+                    kind: ScanSourceKind::File {
+                        path: path.to_string(),
+                        chunk_spec: None,
+                        iceberg_delete_files: None,
+                        parquet_metadata: None,
+                    },
+                }],
+                StdArc::new(SourceConfig::File(FileFormatConfig::Parquet(
+                    ParquetSourceConfig {
+                        coerce_int96_timestamp_unit: TimeUnit::Seconds,
+                        field_id_mapping: None,
+                        row_groups: None,
+                        chunk_size: None,
+                        ignore_corrupt_files: false,
+                        geometry: true,
+                    },
+                ))),
+                schema,
+                StdArc::new(StorageConfig::new_internal(false, None)),
+                Pushdowns::default(),
+                None,
+            ))
+        }
+
+        // dir_a's part-0.parquet entry is CORRUPT (one valid non-covering cell
+        // + one unparseable string) and must therefore be UNRESOLVABLE, not
+        // "confirmed non-covering" — its task must be KEPT even though the one
+        // cell that *did* parse is the same non-covering (Sydney) cell used in
+        // dir_b, whose task (clean, fully-valid, non-covering) IS pruned. This
+        // proves the difference in outcome is caused by the corruption, not by
+        // some other confound.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+
+        let query_point = geo::Geometry::Point(geo::Point::new(2.35, 48.85)); // Paris
+        let query_wkb = daft_geo::utils::geom_to_wkb(&query_point).unwrap();
+
+        let other_point = geo::Geometry::Point(geo::Point::new(151.2, -33.87)); // Sydney
+        let other_wkb = daft_geo::utils::geom_to_wkb(&other_point).unwrap();
+        let other_cells = wkb_to_h3_cells(&other_wkb, 5).expect("other point must resolve to H3 cells");
+        let non_covering_cell_str = h3o::CellIndex::try_from(*other_cells.iter().next().unwrap())
+            .unwrap()
+            .to_string();
+
+        write_test_idx_file(
+            &dir_a.path().join(INDEX_FILENAME),
+            "geom",
+            5,
+            &[
+                (non_covering_cell_str.as_str(), "part-0.parquet"),
+                ("not_a_cell", "part-0.parquet"),
+            ],
+        );
+        write_test_idx_file(
+            &dir_b.path().join(INDEX_FILENAME),
+            "geom",
+            5,
+            &[(non_covering_cell_str.as_str(), "part-0.parquet")],
+        );
+
+        let schema = StdArc::new(Schema::new(vec![Field::new("geom", DaftDataType::Binary)]));
+        let task_a = make_task(
+            &dir_a.path().join("part-0.parquet").to_string_lossy(),
+            schema.clone(),
+        );
+        let task_b = make_task(
+            &dir_b.path().join("part-0.parquet").to_string_lossy(),
+            schema.clone(),
+        );
+
+        let scan_op = StdArc::new(DummyScanOperator {
+            schema: schema.clone(),
+            ..Default::default()
+        });
+        let mut psi = PhysicalScanInfo::new(
+            ScanOperatorRef(scan_op),
+            schema.clone(),
+            vec![],
+            Pushdowns::default(),
+            None,
+        );
+        psi.scan_state = ScanState::Tasks(StdArc::new(vec![task_a, task_b]));
+        let source = crate::ops::Source::new(schema.clone(), StdArc::new(SourceInfo::Physical(psi)));
+
+        let predicate = daft_geo::st_intersects::st_intersects(
+            daft_dsl::resolved_col("geom"),
+            daft_dsl::lit(query_wkb.as_slice()),
+        );
+        let filter =
+            crate::ops::Filter::try_new(StdArc::new(LogicalPlan::Source(source)), predicate)
+                .unwrap();
+        let plan = StdArc::new(LogicalPlan::Filter(filter));
+
+        let result = SpatialPartitionPruning.try_optimize(plan).unwrap();
+        assert!(
+            result.transformed,
+            "rule must still prune dir_b's clean, confirmed non-covering task"
+        );
+        let LogicalPlan::Filter(f) = result.data.as_ref() else {
+            panic!("expected Filter")
+        };
+        let LogicalPlan::Source(s) = f.input.as_ref() else {
+            panic!("expected Source")
+        };
+        let SourceInfo::Physical(p) = s.source_info.as_ref() else {
+            panic!()
+        };
+        let ScanState::Tasks(remaining) = &p.scan_state else {
+            panic!()
+        };
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only dir_a's task (corrupt index entry -> unresolvable -> keep) must remain"
+        );
+        assert!(
+            remaining[0].sources[0]
+                .get_path()
+                .starts_with(&*dir_a.path().to_string_lossy()),
+            "dir_a's task must be KEPT despite its one parseable cell being \
+             non-covering, because the corrupt entry makes it unresolvable"
         );
     }
 }
