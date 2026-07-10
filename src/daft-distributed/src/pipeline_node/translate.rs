@@ -113,6 +113,21 @@ fn rebind_predicate(
     BoundExpr::try_new(unbound, schema)
 }
 
+/// Convert `ResolvedColumn::JoinSide(field, _)` markers in a join predicate into
+/// plain unresolved column references (by post-deduplication field name), so the
+/// predicate can be re-bound against the join output schema.
+fn strip_join_side_cols(expr: daft_dsl::ExprRef) -> DaftResult<daft_dsl::ExprRef> {
+    use daft_dsl::expr::ResolvedColumn;
+    Ok(expr
+        .transform(|e| match e.as_ref() {
+            Expr::Column(Column::Resolved(ResolvedColumn::JoinSide(field, _))) => {
+                Ok(Transformed::yes(daft_dsl::unresolved_col(field.name.clone())))
+            }
+            _ => Ok(Transformed::no(e)),
+        })?
+        .data)
+}
+
 pub(crate) struct LogicalPlanToPipelineNodeTranslator {
     pub plan_config: PlanConfig,
     pub meter: Meter,
@@ -231,6 +246,25 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
                     // Only rewrite when the join has equi-keys and no remaining
                     // non-equi predicates (those would need separate handling).
                     if remaining.is_empty() && !left_eq_keys.is_empty() {
+                        // The rewrite hash-partitions each side by its own raw key.
+                        // Mismatched key dtypes could hash equal values differently
+                        // and the local filter can't recover cross-partition rows —
+                        // fall through to the normal (normalizing) join translation.
+                        let dtypes_match = left_eq_keys.iter().zip(right_eq_keys.iter()).all(
+                            |(l, r)| {
+                                match (
+                                    l.to_field(&join.left.schema()),
+                                    r.to_field(&join.right.schema()),
+                                ) {
+                                    (Ok(lf), Ok(rf)) => lf.dtype == rf.dtype,
+                                    _ => false,
+                                }
+                            },
+                        );
+                        if !dtypes_match {
+                            return Ok(TreeNodeRecursion::Continue);
+                        }
+
                         // Translate join children into distributed pipeline nodes.
                         let left_node = self.translate_subtree(&join.left)?;
                         let right_node = self.translate_subtree(&join.right)?;
@@ -241,11 +275,20 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
                         let right_on =
                             BoundExpr::bind_all(&right_eq_keys, &right_node.config().schema)?;
 
-                        // Rebind the spatial predicate to the join output schema so
-                        // that column indices are correct for the NLJ executor.
+                        // The local NLJ evaluates ONLY this filter, and it is the only
+                        // place join semantics are enforced: hash-partitioning co-locates
+                        // equal keys but does NOT prevent different keys from sharing a
+                        // partition. Carry the full ON predicate (equality conjuncts)
+                        // alongside the WHERE spatial predicate.
                         let join_schema = join.output_schema.clone();
-                        let spatial_filter =
-                            rebind_predicate(filter.predicate.clone(), &join_schema)?;
+                        let full_on = join
+                            .on
+                            .inner()
+                            .expect("non-empty equi join has an on expr")
+                            .clone();
+                        let combined =
+                            filter.predicate.clone().and(strip_join_side_cols(full_on)?);
+                        let spatial_filter = rebind_predicate(combined, &join_schema)?;
 
                         // Determine the build side: arg0 of the spatial function is
                         // the "container" geometry (polygon / building footprint) and

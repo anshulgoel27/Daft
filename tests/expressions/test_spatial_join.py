@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import daft
@@ -278,3 +280,50 @@ def test_spatial_join_literal_none_string_key_does_not_match_null():
         .to_pydict()
     )
     assert got["lid"] == []
+
+
+@pytest.mark.skipif(
+    os.environ.get("DAFT_RUNNER") != "ray",
+    reason="SpatialHashJoinNode only exists in the distributed (Ray) pipeline",
+)
+def test_distributed_spatial_hash_join_does_not_hash_collide_different_keys():
+    """Many distinct keys, few partitions: hash collisions are guaranteed. The equi-key
+    must still be enforced, not just the spatial predicate.
+
+    Note: written as an equi-join followed by `.where(st_intersects(...))` rather than a
+    combined `on=` predicate. With a combined `on=` predicate the optimizer keeps the
+    equality and spatial conjuncts together on the Join node itself (no separate Filter
+    node above the Join), which does not match the distributed rewrite's
+    `Filter(spatial) -> Join(equi)` pattern (see translate.rs f_down) and instead falls
+    through to the generic hash-join translator, which panics on the non-equality
+    residual. The `.where()` shape produces the `Filter(spatial) -> Join(equi)` pattern
+    and reliably routes through `SpatialHashJoinNode` (verified via `df.explain(True)`
+    showing `SpatialHashJoin`); the semantics under test are identical either way.
+    """
+    n = 200
+    pts = daft.from_pydict(
+        {
+            "key": [str(i) for i in range(n)],
+            "pid": list(range(n)),
+            "x": [1.0] * n,
+            "y": [1.0] * n,
+        }
+    ).select("key", "pid", st_point(daft.col("x"), daft.col("y")).alias("pg"))
+    # Every polygon covers the SAME area as every point, so the spatial predicate
+    # alone matches everything — only the equi-key restricts matches.
+    polys = daft.from_pydict(
+        {
+            "pkey": [str(i) for i in range(n)],
+            "qid": list(range(n)),
+            "wkt": ["POLYGON((0 0,2 0,2 2,0 2,0 0))"] * n,
+        }
+    ).select("pkey", "qid", st_geomfromtext(daft.col("wkt")).alias("qg"))
+
+    got = (
+        pts.join(polys, left_on="key", right_on="pkey")
+        .where(st_intersects(daft.col("qg"), daft.col("pg")))
+        .select("pid", "qid")
+        .to_pydict()
+    )
+    assert sorted(got["pid"]) == list(range(n))
+    assert all(pid == qid for pid, qid in zip(got["pid"], got["qid"]))
