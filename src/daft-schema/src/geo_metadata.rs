@@ -93,9 +93,89 @@ pub fn detect_geo_columns(geo_json: &str, schema: &Schema) -> Vec<String> {
 /// The GeoParquet spec's default CRS when the `crs` key is absent: lon/lat WGS84.
 const DEFAULT_CRS: &str = "OGC:CRS84";
 
-/// Returns `(column_name, crs)` for every geometry column in `geo_json` whose `crs`
-/// is present and is not the GeoParquet default (`OGC:CRS84`). Lenient: returns
-/// empty on any parse failure, matching `detect_geo_columns`.
+/// Cap `s` at `max` chars so a stray huge blob (e.g. an unrecognized PROJJSON
+/// shape) never lands whole in a log line.
+fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}...")
+    }
+}
+
+/// Render a PROJJSON `id.code` member (spec allows either a JSON string or a
+/// number, e.g. `"CRS84"` or `4326`) as a plain string.
+fn crs_id_code_to_string(code: &serde_json::Value) -> Option<String> {
+    match code {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Classify a parsed `crs` JSON value: `None` if it is the GeoParquet default
+/// (lon/lat WGS84), `Some(display)` with a compact identifier otherwise.
+///
+/// GeoParquet's SPEC form for `crs` is a full PROJJSON *object*, and real
+/// writers (GeoPandas via `pyproj.CRS.to_json_dict()`) embed that object even
+/// for the default WGS84 CRS. A PROJJSON CRS object carries an `id` member
+/// like `{"authority": "OGC", "code": "CRS84"}`, so object-shaped values are
+/// inspected for `id` rather than being flagged outright just for being an
+/// object.
+///
+/// Recognized as default (not flagged):
+/// - the string `"OGC:CRS84"`.
+/// - an object whose `id` is `{authority: "OGC", code: "CRS84"}` (2D) or
+///   `{authority: "OGC", code: "CRS84h"}` (3D).
+///
+/// NOTE (deliberate): `EPSG:4326` is WGS84 but is lat/lon axis order, while
+/// `CRS84` (the GeoParquet default) is lon/lat. That's a genuine
+/// silent-corruption risk, not a naming quirk, so EPSG:4326 — in either
+/// string or PROJJSON-object form — is never folded into the default bucket
+/// here. Do not "helpfully" special-case it as equivalent to CRS84.
+///
+/// When a non-default object CRS has an `id`, the display is the compact
+/// `authority:code` (e.g. `"EPSG:3857"`) rather than the full PROJJSON blob.
+/// Otherwise (or for any other JSON shape), the display falls back to a
+/// truncated stringification so a malformed/unrecognized shape never dumps a
+/// huge blob into a log line.
+fn classify_crs(crs: &serde_json::Value) -> Option<String> {
+    const MAX_LOG_LEN: usize = 80;
+    match crs {
+        serde_json::Value::String(s) => (s != DEFAULT_CRS).then(|| s.clone()),
+        serde_json::Value::Object(_) => {
+            let id = crs.get("id");
+            let authority = id.and_then(|id| id.get("authority")).and_then(|a| a.as_str());
+            let code = id
+                .and_then(|id| id.get("code"))
+                .and_then(crs_id_code_to_string);
+            if let (Some(authority), Some(code)) = (authority, &code) {
+                if authority == "OGC" && (code == "CRS84" || code == "CRS84h") {
+                    return None;
+                }
+            }
+            match (authority, code) {
+                (Some(authority), Some(code)) => Some(format!("{authority}:{code}")),
+                _ => Some(truncate_for_log(&crs.to_string(), MAX_LOG_LEN)),
+            }
+        }
+        other => Some(truncate_for_log(&other.to_string(), MAX_LOG_LEN)),
+    }
+}
+
+/// Returns `(column_name, crs)` for every WKB-encoded geometry column in
+/// `geo_json` whose `crs` is present and is not the GeoParquet default
+/// (`OGC:CRS84`, in either string or PROJJSON-object form — see
+/// `classify_crs`). Lenient: returns empty on any parse failure, matching
+/// `detect_geo_columns`.
+///
+/// Only WKB-encoded columns are considered (matching the encoding filter in
+/// `detect_geo_columns`) — Daft never retypes natively-GeoArrow-encoded
+/// columns to `Geometry`, so their CRS is irrelevant to Daft's readers.
+/// Callers should additionally intersect the result with the columns they
+/// actually detected/retyped (e.g. `detect_geo_columns`'s output), since this
+/// function has no schema and can't confirm the column is present/read.
 ///
 /// Daft's `Geometry` type has no CRS field. Planar ST_* defaults are CRS-agnostic
 /// (results are in coordinate units), but the geodesic family (`use_spheroid`
@@ -108,13 +188,10 @@ pub fn non_default_crs_columns(geo_json: &str) -> Vec<(String, String)> {
     };
     meta.columns
         .into_iter()
+        .filter(|(_, c)| c.encoding.eq_ignore_ascii_case("WKB"))
         .filter_map(|(name, c)| {
             let crs = c.crs?;
-            let crs_str = match &crs {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            (crs_str != DEFAULT_CRS).then_some((name, crs_str))
+            classify_crs(&crs).map(|display| (name, display))
         })
         .collect()
 }
@@ -230,5 +307,93 @@ mod tests {
         assert_eq!(flagged[0].0, "geom");
         // stringified PROJJSON object, not mistaken for the default
         assert!(flagged[0].1.contains("Custom CRS"));
+    }
+
+    #[test]
+    fn non_default_crs_columns_treats_projjson_crs84_object_as_default() {
+        // GeoPandas (via pyproj.CRS.to_json_dict()) embeds a full PROJJSON object
+        // even for the default WGS84 CRS. A PROJJSON object whose `id` member is
+        // {authority: "OGC", code: "CRS84"} is the canonical GeoParquet default
+        // and must NOT be flagged.
+        let json = r#"{
+            "version": "1.1.0",
+            "primary_column": "geom",
+            "columns": {
+                "geom": {
+                    "encoding": "WKB",
+                    "crs": {
+                        "type": "GeographicCRS",
+                        "name": "WGS 84 (CRS84)",
+                        "id": {"authority": "OGC", "code": "CRS84"}
+                    }
+                }
+            }
+        }"#;
+        assert!(non_default_crs_columns(json).is_empty());
+    }
+
+    #[test]
+    fn non_default_crs_columns_flags_projjson_epsg3857_object_with_compact_id() {
+        let json = r#"{
+            "version": "1.1.0",
+            "primary_column": "geom",
+            "columns": {
+                "geom": {
+                    "encoding": "WKB",
+                    "crs": {
+                        "type": "ProjectedCRS",
+                        "name": "WGS 84 / Pseudo-Mercator",
+                        "id": {"authority": "EPSG", "code": 3857}
+                    }
+                }
+            }
+        }"#;
+        let flagged = non_default_crs_columns(json);
+        assert_eq!(
+            flagged,
+            vec![("geom".to_string(), "EPSG:3857".to_string())]
+        );
+    }
+
+    #[test]
+    fn non_default_crs_columns_flags_epsg4326_object() {
+        // EPSG:4326 is lat/lon axis order while CRS84 (the GeoParquet default) is
+        // lon/lat. This is a genuine axis-order difference, not a naming quirk —
+        // EPSG:4326 must stay flagged, deliberately, even though it is "WGS84".
+        let json = r#"{
+            "version": "1.1.0",
+            "primary_column": "geom",
+            "columns": {
+                "geom": {
+                    "encoding": "WKB",
+                    "crs": {
+                        "type": "GeographicCRS",
+                        "name": "WGS 84",
+                        "id": {"authority": "EPSG", "code": 4326}
+                    }
+                }
+            }
+        }"#;
+        let flagged = non_default_crs_columns(json);
+        assert_eq!(
+            flagged,
+            vec![("geom".to_string(), "EPSG:4326".to_string())]
+        );
+    }
+
+    #[test]
+    fn non_default_crs_columns_skips_non_wkb_encoding() {
+        // Daft only ever retypes WKB-encoded columns to Geometry (see
+        // `detect_geo_columns`). A native-GeoArrow-encoded column (e.g. "point")
+        // is never read as Geometry, so a non-default CRS on it is irrelevant
+        // noise and must not be returned.
+        let json = r#"{
+            "version": "1.1.0",
+            "primary_column": "geom",
+            "columns": {
+                "geom": {"encoding": "point", "crs": "EPSG:3857"}
+            }
+        }"#;
+        assert!(non_default_crs_columns(json).is_empty());
     }
 }

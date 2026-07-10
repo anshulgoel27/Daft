@@ -627,16 +627,28 @@ pub async fn stream_parquet(
                 )
                 .ok()
                 .and_then(|s| Schema::try_from(&s).ok());
+                let detected = arrow_schema_for_detect
+                    .map(|s| detect_geo_columns(&geo_json, &s))
+                    .unwrap_or_default();
+                // `non_default_crs_columns` only filters on encoding (WKB); intersect
+                // with `detected` (WKB *and* present in the schema) so we only warn
+                // about columns Daft actually reads as Geometry. `meta.columns` keys
+                // are unique, so this warns at most once per offending column here.
+                // TODO(scan-level dedup): this runs per-file, so a many-file scan
+                // still emits one line per offending column per file; true
+                // once-per-scan dedup would need shared state plumbed through the
+                // reader, which is out of scope here.
                 for (col, crs) in daft_schema::geo_metadata::non_default_crs_columns(&geo_json) {
+                    if !detected.contains(&col) {
+                        continue;
+                    }
                     log::warn!(
                         "GeoParquet column '{col}' in {path} declares CRS '{crs}' (not the \
                          default OGC:CRS84 / WGS84 lon-lat); Daft's Geometry type has no \
                          CRS concept — geodesic functions assume lon/lat WGS84."
                     );
                 }
-                arrow_schema_for_detect
-                    .map(|s| detect_geo_columns(&geo_json, &s))
-                    .unwrap_or_default()
+                detected
             })
             .unwrap_or_default()
     } else {
