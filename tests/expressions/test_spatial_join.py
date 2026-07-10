@@ -431,22 +431,33 @@ def test_python_join_st_disjoint():
     assert result["rid"] == [10]
 
 
+def test_not_st_intersects_select():
+    """Direct (non-join) regression test for the Not-over-ScalarFn field-name bug.
+
+    Negating a spatial predicate over materialized, non-aliased geometry columns must
+    compute the correct boolean result instead of raising `DaftCoreException`
+    'Mismatch of expected expression name and name from computed series'. This pins the
+    root fix (Not/IsNull/NotNull::to_field naming) independently of the join machinery
+    exercised by `test_python_join_not_st_intersects` below.
+    """
+    df = daft.from_pydict(
+        {
+            "x": [1.0, 9.0],
+            "y": [1.0, 9.0],
+            "wkt": ["POLYGON((0 0,2 0,2 2,0 2,0 0))", "POLYGON((0 0,2 0,2 2,0 2,0 0))"],
+        }
+    ).select(
+        st_point(daft.col("x"), daft.col("y")).alias("a"),
+        st_geomfromtext(daft.col("wkt")).alias("b"),
+    ).collect()
+
+    result = df.select((~st_intersects(daft.col("a"), daft.col("b"))).alias("r")).to_pydict()
+    # (1,1) is inside the polygon -> st_intersects True -> negated False.
+    # (9,9) is outside the polygon -> st_intersects False -> negated True.
+    assert result["r"] == [False, True]
+
+
 @pytest.mark.timeout(30)
-@pytest.mark.xfail(
-    reason=(
-        "Pre-existing, unrelated bug: negating ANY spatial ScalarFn is broken in Daft. "
-        "`~st_intersects(a, b)` raises DaftCoreException 'Mismatch of expected expression "
-        "name and name from computed series (g vs st_intersects)' from daft-recordbatch, "
-        "even outside a join and even over materialized, non-aliased columns -- while plain "
-        "`st_intersects(a, b)` and `~bool_col` both work. Inside a nested-loop join the same "
-        "defect deadlocks instead of erroring, hence the timeout marker. This is independent "
-        "of R-tree candidate generation: the Rust-level contract that a negated predicate is "
-        "never bbox-accelerated is pinned by `negated_intersects_is_never_accelerated` in "
-        "daft-local-execution's `acceleration_tests`. Remove this xfail once the Not-over-"
-        "ScalarFn name-resolution bug is fixed; the assertions below are already correct."
-    ),
-    strict=False,
-)
 def test_python_join_not_st_intersects():
     """A negated spatial predicate must skip bbox-based R-tree acceleration."""
     left = daft.from_pydict({"lid": [1, 2], "lx": [1.0, 100.0], "ly": [1.0, 100.0]}).select(

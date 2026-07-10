@@ -1,4 +1,70 @@
+use serde::{Deserialize, Serialize};
+
 use super::*;
+use crate::functions::{ScalarUDF, scalar::EvalContext};
+
+/// A minimal builtin `ScalarFn` used to pin down `Not`/`IsNull`/`NotNull` field-name
+/// resolution: its `get_return_field` deliberately returns a name that is unrelated to
+/// (and thus differs from) its first argument's name, mirroring real builtins like
+/// `st_intersects` whose return-field name ("st_intersects") differs from a first
+/// argument aliased to something else (e.g. "g").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct RenamingBoolFn;
+
+#[typetag::serde]
+impl ScalarUDF for RenamingBoolFn {
+    fn name(&self) -> &'static str {
+        "renaming_bool_fn"
+    }
+
+    fn call(&self, args: FunctionArgs<Series>, _ctx: &EvalContext) -> DaftResult<Series> {
+        let input = args.first().expect("expected 1 input");
+        Ok(input.rename(self.name()))
+    }
+
+    fn get_return_field(&self, args: FunctionArgs<ExprRef>, schema: &Schema) -> DaftResult<Field> {
+        let input = args.first().expect("expected 1 input");
+        let input_field = input.to_field(schema)?;
+        Ok(Field::new(self.name(), input_field.dtype))
+    }
+}
+
+/// Root-cause regression test: `Not`/`IsNull`/`NotNull::to_field` must name their output
+/// after the child's *actual evaluated* field name, not the child's first-argument name
+/// (`Expr::name()`). For a builtin `ScalarFn` whose first argument is aliased, those two
+/// names differ -- which is exactly the case that broke `~st_intersects(a, b)`.
+#[test]
+fn not_over_builtin_scalar_fn_uses_childs_evaluated_field_name() -> DaftResult<()> {
+    let schema = Schema::new(vec![Field::new("x", DataType::Boolean)]);
+    let aliased_arg = resolved_col("x").alias("g");
+    let scalar_expr: ExprRef = ScalarFn::builtin(RenamingBoolFn, vec![aliased_arg]).into();
+
+    // Sanity-check the premise: `Expr::name()` (first-arg name) differs from what the
+    // scalar fn actually evaluates/`to_field`s to (its own return-field name).
+    #[allow(deprecated)]
+    let scalar_name = scalar_expr.name().to_string();
+    assert_eq!(scalar_name, "g");
+    let scalar_field = scalar_expr.to_field(&schema)?;
+    assert_eq!(scalar_field.name.as_ref(), "renaming_bool_fn");
+    assert_ne!(scalar_name, scalar_field.name.as_ref());
+
+    // Not::to_field's expected name must match the child's evaluated name, i.e. what
+    // `Not`'s evaluation (`!child_series`) actually produces.
+    let not_field = scalar_expr.clone().not().to_field(&schema)?;
+    assert_eq!(not_field.name, scalar_field.name);
+    assert_eq!(not_field.dtype, DataType::Boolean);
+
+    // Same property for IsNull/NotNull.
+    let is_null_field = scalar_expr.clone().is_null().to_field(&schema)?;
+    assert_eq!(is_null_field.name, scalar_field.name);
+    assert_eq!(is_null_field.dtype, DataType::Boolean);
+
+    let not_null_field = scalar_expr.not_null().to_field(&schema)?;
+    assert_eq!(not_null_field.name, scalar_field.name);
+    assert_eq!(not_null_field.dtype, DataType::Boolean);
+
+    Ok(())
+}
 
 #[test]
 fn check_comparison_type() -> DaftResult<()> {
