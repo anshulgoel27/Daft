@@ -87,7 +87,7 @@ where
                 // null-ifies — silent garbage far from the actual mistake.
                 if !matches!(self.data_type(), DataType::Binary) {
                     return Err(DaftError::TypeError(format!(
-                        "Cannot cast {:?} to Geometry: only Binary (WKB-encoded) data can \
+                        "Cannot cast {} to Geometry: only Binary (WKB-encoded) data can \
                          be cast to Geometry",
                         self.data_type()
                     )));
