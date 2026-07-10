@@ -368,14 +368,15 @@ def test_distributed_spatial_hash_join_does_not_hash_collide_different_keys():
     must still be enforced, not just the spatial predicate.
 
     Note: written as an equi-join followed by `.where(st_intersects(...))` rather than a
-    combined `on=` predicate. With a combined `on=` predicate the optimizer keeps the
-    equality and spatial conjuncts together on the Join node itself (no separate Filter
-    node above the Join), which does not match the distributed rewrite's
-    `Filter(spatial) -> Join(equi)` pattern (see translate.rs f_down) and instead falls
-    through to the generic hash-join translator, which panics on the non-equality
-    residual. The `.where()` shape produces the `Filter(spatial) -> Join(equi)` pattern
-    and reliably routes through `SpatialHashJoinNode` (verified via `df.explain(True)`
-    showing `SpatialHashJoin`); the semantics under test are identical either way.
+    combined `on=` predicate. This exercises the `Filter(spatial) -> [Project?] ->
+    Join(equi)` shape of the distributed rewrite (see translate.rs f_down) — the WHERE
+    clause is a separate Filter node above an equi-only Join. A combined `on=` predicate
+    instead keeps the equality and spatial conjuncts together on the Join node itself (no
+    separate Filter node above the Join); that bare-Join shape is covered by
+    `test_distributed_spatial_join_combined_on_predicate` below, which routes through the
+    same `SpatialHashJoinNode` via a second f_down branch. Both shapes are verified via
+    `df.explain(True)` showing `SpatialHashJoin`; the semantics under test are identical
+    either way.
     """
     n = 200
     pts = daft.from_pydict(
@@ -399,6 +400,55 @@ def test_distributed_spatial_hash_join_does_not_hash_collide_different_keys():
     got = (
         pts.join(polys, left_on="key", right_on="pkey")
         .where(st_intersects(daft.col("qg"), daft.col("pg")))
+        .select("pid", "qid")
+        .to_pydict()
+    )
+    assert sorted(got["pid"]) == list(range(n))
+    assert all(pid == qid for pid, qid in zip(got["pid"], got["qid"]))
+
+
+@pytest.mark.skipif(
+    os.environ.get("DAFT_RUNNER") != "ray",
+    reason="SpatialHashJoinNode only exists in the distributed (Ray) pipeline",
+)
+def test_distributed_spatial_join_combined_on_predicate():
+    """The natural way to write a distributed spatial join: a single combined `on=`
+    predicate mixing an equality key and a spatial predicate, e.g.
+    `df.join(other, on=(a == b) & st_intersects(...))`.
+
+    Unlike `test_distributed_spatial_hash_join_does_not_hash_collide_different_keys`
+    (which uses `.where(...)` to produce a separate Filter node above an equi-only
+    Join), this shape produces a BARE `Join` node whose `on` already contains both the
+    equality conjunct and the spatial residual, with no wrapping Filter. Before the
+    fix, this shape fell through to the generic distributed join translator, which
+    panics with `todo!("FLOTILLA_MS?: Implement non-equality joins")` as soon as
+    `split_eq_preds` leaves a non-empty (spatial) residual — see translate_join.rs.
+
+    Many distinct keys, few partitions: hash collisions are guaranteed, so this also
+    proves the equi-key is genuinely enforced (not just the spatial predicate) even
+    though the equi-key and spatial predicate are combined in one ON clause.
+    """
+    n = 200
+    pts = daft.from_pydict(
+        {
+            "key": [str(i) for i in range(n)],
+            "pid": list(range(n)),
+            "x": [1.0] * n,
+            "y": [1.0] * n,
+        }
+    ).select("key", "pid", st_point(daft.col("x"), daft.col("y")).alias("pg"))
+    # Every polygon covers the SAME area as every point, so the spatial predicate
+    # alone matches everything — only the equi-key restricts matches.
+    polys = daft.from_pydict(
+        {
+            "pkey": [str(i) for i in range(n)],
+            "qid": list(range(n)),
+            "wkt": ["POLYGON((0 0,2 0,2 2,0 2,0 0))"] * n,
+        }
+    ).select("pkey", "qid", st_geomfromtext(daft.col("wkt")).alias("qg"))
+
+    got = (
+        pts.join(polys, on=(pts["key"] == polys["pkey"]) & st_intersects(polys["qg"], pts["pg"]))
         .select("pid", "qid")
         .to_pydict()
     )
