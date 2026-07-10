@@ -4,13 +4,13 @@ use common_error::{DaftError, DaftResult};
 use common_treenode::{Transformed, TreeNode, TreeNodeRecursion};
 use daft_core::{join::{JoinSide, JoinStrategy}, prelude::Schema};
 use daft_dsl::{
-    Expr, ExprRef, ResolvedColumn,
+    Expr, ExprRef,
     expr::{
         Column,
         agg::extract_agg_expr,
         bound_expr::{BoundAggExpr, BoundExpr, BoundVLLMExpr, BoundWindowExpr},
     },
-    join::normalize_join_keys,
+    join::{normalize_join_keys, strip_join_side_cols},
     resolved_col, unresolved_col, window_to_agg_exprs,
 };
 use daft_functions::random::random_int_expr;
@@ -67,20 +67,6 @@ fn rebind_predicate(expr: ExprRef, schema: &Schema) -> DaftResult<BoundExpr> {
         })?
         .data;
     BoundExpr::try_new(unbound, schema)
-}
-
-/// Convert `ResolvedColumn::JoinSide(field, _)` markers in a join residual predicate
-/// into plain unresolved column references (by the post-deduplication field name),
-/// so the predicate can be re-bound against the join output schema.
-fn strip_join_side_cols(expr: ExprRef) -> DaftResult<ExprRef> {
-    Ok(expr
-        .transform(|e| match e.as_ref() {
-            Expr::Column(Column::Resolved(ResolvedColumn::JoinSide(field, _))) => {
-                Ok(Transformed::yes(unresolved_col(field.name.clone())))
-            }
-            _ => Ok(Transformed::no(e)),
-        })?
-        .data)
 }
 
 /// Build the R-tree-backed `NestedLoopJoin` for a spatial-predicate inner join.

@@ -17,6 +17,7 @@ use daft_dsl::{
         agg::extract_agg_expr,
         bound_expr::{BoundAggExpr, BoundExpr, BoundVLLMExpr, BoundWindowExpr},
     },
+    join::strip_join_side_cols,
     resolved_col,
 };
 use daft_logical_plan::{
@@ -111,21 +112,6 @@ fn rebind_predicate(
         })?
         .data;
     BoundExpr::try_new(unbound, schema)
-}
-
-/// Convert `ResolvedColumn::JoinSide(field, _)` markers in a join predicate into
-/// plain unresolved column references (by post-deduplication field name), so the
-/// predicate can be re-bound against the join output schema.
-fn strip_join_side_cols(expr: daft_dsl::ExprRef) -> DaftResult<daft_dsl::ExprRef> {
-    use daft_dsl::expr::ResolvedColumn;
-    Ok(expr
-        .transform(|e| match e.as_ref() {
-            Expr::Column(Column::Resolved(ResolvedColumn::JoinSide(field, _))) => {
-                Ok(Transformed::yes(daft_dsl::unresolved_col(field.name.clone())))
-            }
-            _ => Ok(Transformed::no(e)),
-        })?
-        .data)
 }
 
 pub(crate) struct LogicalPlanToPipelineNodeTranslator {
