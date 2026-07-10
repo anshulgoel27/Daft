@@ -80,6 +80,17 @@ whose column name changes under the fix is one that previously errored/hung. 28,
 `tests/expressions/` tests pass; the `test_python_join_not_st_intersects` xfail was removed
 and it now passes.
 
+**Integration fallout (found + fixed, `09b5317c8`):** making `IsNull`/`NotNull::to_field`
+validate their child — which `Not::to_field` already did on `main` — surfaced ONE internal
+test, `push_down_filter::filter_with_udf_not_pushed_down_into_scan`, that built a
+`url_download` UDF with an invalid signature (Int64 input where a string is required, plus
+bogus literals for optional args). Dormant only because `is_null().to_field()` never
+recursed before. Fixed the test to use a well-formed `url_download(col_b)`; no production
+change. A full-crate Rust sweep (daft-dsl, -logical-plan, -local-plan, -sql, -recordbatch,
+-distributed, -scan, -core, -schema, -geo, -local-execution) found no other fallout. The
+eager validation is correct fail-loud behavior: an expression whose `to_field` fails cannot
+be evaluated, so `is_null` of it is equally ill-formed.
+
 ## D2 — distributed spatial join panic on the natural syntax (FIXED, `8b2302580`)
 
 Was: under Ray, `df.join(other, on=(a==b) & st_intersects(...))` panicked at
