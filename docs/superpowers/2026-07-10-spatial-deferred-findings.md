@@ -1,223 +1,173 @@
-# Spatial Correctness Branch — Deferred Findings
+# Spatial Correctness Branch — Findings Ledger
 
-Issues raised by task-scoped reviews on `fix/spatial-correctness` that were **not** fixed
-in the task that surfaced them, plus pre-existing bugs discovered during execution.
+Complete record of review findings across all of `fix/spatial-correctness`: what was
+**fixed on the branch**, what is **deferred for a decision or a follow-up**, and the
+**pre-existing bugs discovered during execution** that are out of this branch's scope.
 
-**Status:** covers Tasks 1, 2, and 4 (reviewed & approved). Tasks 3 and 5 were still
-implementing when this was written; Tasks 6–8 not yet started. Append their findings as
-their reviews land.
+**Status:** all 8 planned tasks + 5 follow-up fixes implemented, committed, individually
+reviewed (Tasks 3–8 and every follow-up reviewed by Fable 5), and integrated-verified
+(full `make build` clean; native `test_spatial*.py` + `test_geoparquet.py` = 96 passed /
+1 skipped / 1 xfailed; `cargo test` across the six touched crates green). A final
+whole-branch integration review is the last gate.
 
-**Severity** is the reviewer's, per the SDD rubric: *Important* = would block a merge;
-*Minor* = polish. "Plan-mandated" means the plan's own text prescribed the thing the
-reviewer flagged — those need a human decision, because the plan doesn't get to grade
-its own work.
-
-**Two items need a decision from you before merge:** [A1](#a1) and [C1](#c1).
-
----
-
-## A. Design gaps in shipped code
-
-### <a id="a1"></a>A1. No cap on the geohash covering-set size — a large query polygon stalls plan optimization
-**Severity:** Important, plan-mandated · **From:** Task 4 review · **Decision needed**
-
-**Where:** `src/daft-geo/src/st_geohash.rs` (the new `collect_covering_cells` flood fill),
-consumed at `src/daft-logical-plan/src/optimization/rules/geohash_pruning.rs:151-153`.
-
-**What:** The flood fill is bounded only by the query bbox's cell block at the rule's fixed
-`DEFAULT_GEOHASH_PRECISION = 5` (`geohash_pruning.rs:90`). A query
-`WHERE st_intersects(col, <continent-sized polygon literal>)` against a table carrying a
-`{col}_geohash` column — which is the **default** optimizer pipeline — enumerates roughly
-1M cells for a 60°×30° bbox, and up to ~33.5M (`32^5`) for a near-global one. Each is a
-`String` in two `HashSet`s built at plan time, then `join("\n")`-ed into the plan text
-(`geohash_pruning.rs:159`), then linearly rescanned per row by `geohash_in_covering_cells`.
-
-**Why it matters:** Reachable from ordinary user input; produces a multi-minute, multi-GB
-stall during *planning*, before any data is read.
-
-**Not a regression.** The pre-fix code flooded an O(D²) Chebyshev disk *around* the start
-cell, which was strictly worse. Task 4 improved the worst case from "unbounded slow" to
-"bounded but huge." The plan simply never specified a cap.
-
-**Fix shape (does not weaken correctness):** bail out of the flood once `cells.len()`
-exceeds a few thousand and return an empty `Vec`. The consumer already handles this:
-`geohash_pruning.rs:155-157` does `if geom.is_empty() { return None; }`, i.e. injects no
-predicate and prunes nothing. Pruning is an optimization, so prune-nothing is a correct
-result, not a silent wrong answer.
-
-**Why it wasn't fixed:** the plan mandated the uncapped design, and changing the contract of
-`geohash_covers_geometry` (it would now return empty for very large geometries) is a design
-call, not a bug fix.
+**Severity** is the reviewer's, per the SDD rubric: *Important* = would block a merge on
+its own; *Minor* = polish. "Plan-mandated" = the plan's own text prescribed the flagged
+behavior, so it needed a human decision rather than an implementer fix.
 
 ---
 
-## B. Test coverage gaps
+## Branch commits (main = 94909e69b)
 
-### B1. Two of Task 1's three new tests cannot fail on pre-fix code
-**Severity:** Important, plan-mandated · **From:** Task 1 review
+| SHA | What |
+|-----|------|
+| `7080a579d` | Task 1 — local NLJ filter carries the full ON predicate |
+| `a1c58f97e` | Task 2 — distributed spatial hash join enforces equi-keys in the filter |
+| `26300e7fd` | Task 4 — geohash covering set complete + tight (flood fill) |
+| `0b4423f86` | Task 3 — refuse R-tree acceleration for st_disjoint / negated / OR predicates |
+| `8d08f7747` | Task 5 — collocated-join symmetric unkeyed handling + systematic-mismatch abort |
+| `733715e07` | Task 3 fixup — xfail the negated-spatial-predicate join test (unrelated pre-existing bug) |
+| `e9b526a2a` | Task 6 — reject casting non-Binary sources to Geometry |
+| `3ba1d814a` | Task 7 — warn on non-default GeoParquet CRS |
+| `e462b5788` | Task 3b (review-driven) — derive st_dwithin R-tree pad from the accelerated node |
+| `5b5696b59` | Task 8 — read the real `_spatial_index.idx` format, per directory |
+| `ae01f2192` | Fix A1 — cap the geohash covering set, decline pruning for oversized geometries |
+| `d805f9117` | Fix B1/B2 — pin null-safe key collision + cross-dtype equi-key fallback |
+| `1e9420349` | Fix Task-8 — keep scan tasks when their H3 index cells fail to parse |
+| `c4093bb27` | Fix C1 — hoist `strip_join_side_cols` into `daft-dsl`, remove the cross-crate duplicate |
 
-**Where:** `tests/expressions/test_spatial_join.py` —
-`test_spatial_join_null_key_never_matches` and
-`test_spatial_join_literal_none_string_key_does_not_match_null`.
-
-**What:** Both pass identically before and after Task 1's fix, so neither pins the change.
-
-**Root cause, and a correction to the original review's claim:** the pre-existing optimizer
-rule `FilterNullJoinKey`
-(`src/daft-logical-plan/src/optimization/rules/filter_null_join_key.rs`, registered in
-`optimizer.rs`) inserts `Filter(key.is_null().not())` on *both* join children for any
-standard, non-null-safe `=` equi-key, before `daft-local-plan`'s `translate.rs` ever runs.
-NULL-keyed rows therefore never reach the buggy candidate-generation path via a plain `==`
-join. **The `str_value` NULL-collision bug is only reachable through null-safe `<=>`
-equality** — materially narrower than the incoming review asserted. The rule explicitly does
-not apply to `EqNullSafe`.
-
-**Fix shape:** add a test using `Expression.eq_null_safe` with the literal *string* `"None"`
-on one side and a real NULL on the other, both spatially matching. Pre-fix, `str_value`
-renders both as `"None"`, they collide into one partition group, and the spatial-only filter
-emits a spurious joined row. Post-fix, the complete filter evaluates `key <=> rkey`, which is
-false, and no row is emitted. Alias one side's column (e.g. `rkey`) to dodge the pre-existing
-"Ambiguous column reference in join predicate" error — `test_spatial_join_partitioned_by_key`
-in the same file shows the precedent.
-
-**Why it wasn't fixed:** a fix pass was dispatched and you cancelled it. Nothing was left
-behind — `src/` was verified byte-identical to the task commit afterward.
-
-### B2. Task 1's dtype guard has no test that can fail without it
-**Severity:** Important · **From:** Task 1 review
-
-**Where:** `src/daft-local-plan/src/translate.rs`, the `partition_key` closure.
-
-**What:** No test constructs a genuine cross-dtype equi-key. The one test that touches dtypes
-(`test_spatial_join_literal_none_string_key_does_not_match_null`) explicitly `.cast()`s both
-sides to the *same* dtype, so it can never exercise the guard.
-
-**Fix shape:** join two spatially-matching rows whose equi-key columns hold equal values at
-different dtypes (Int64 `1` vs Float64 `1.0`, forced with `.cast()`), so their `str_value`
-renderings differ (`"1"` vs `"1.0"`). Pre-guard the rows land in different partition groups
-and the row is lost; post-guard `partition_key = None` and the row joins. **If the planner
-supertype-casts both sides before `translate.rs` runs, the guard may be unreachable** — in
-that case record that finding rather than shipping a vacuous test.
-
-### B3. Task 2's dtype-guard fall-through path has no test
-**Severity:** Minor · **From:** Task 2 review
-
-**Where:** `src/daft-distributed/src/pipeline_node/translate.rs:253-266`.
-
-**What:** Nothing exercises mismatched equi-key dtypes under Ray to prove the
-`TreeNodeRecursion::Continue` early-return yields correct results via the normal
-key-normalizing join path. The reviewer verified by code reading that the early-return fires
-before any state mutation and is byte-identical to `f_down`'s no-match fall-through, so the
-join is translated rather than skipped — but no test locks that in.
-
-### B4. Task 1's Filter-over-Join call site has no repo-tracked test
-**Severity:** Minor · **From:** Task 1 review
-
-**Where:** `src/daft-local-plan/src/translate.rs`, the `LogicalPlan::Filter` spatial-rewrite
-branch (the `.and(strip_join_side_cols(on_expr))` fold). Verified only by an ad hoc script
-during implementation.
-
-### B5. An assumption shared by Tasks 1 and 2, untested on both paths
-**Severity:** ⚠️ unverified · **From:** Task 2 review
-
-Neither task tests that `ResolvedColumn::JoinSide(field, _)` always carries the
-**post-deduplication** field name that `rebind_predicate` needs when both sides have a column
-of the same name. Both fixes assume it. Worth one test through each path.
-
-### B6. Task 4 edge cases untested
-**Severity:** Minor, plan-mandated · **From:** Task 4 review
-
-Single-cell bbox, degenerate (zero-area) point bbox, and the no-bounding-rect centroid
-fallback at `src/daft-geo/src/st_geohash.rs:83-91`. The plan mandated the exact test bodies.
+Plus two docs commits (`ee910f4b0` plan, `15259956e` an earlier snapshot of this ledger).
 
 ---
 
-## C. Maintainability
+## FIXED on this branch (was flagged, now resolved)
 
-### <a id="c1"></a>C1. `strip_join_side_cols` is verbatim-duplicated across crates
-**Severity:** Important, plan-mandated · **From:** Task 2 review · **Decision needed**
+### ✅ Task-3b — `st_dwithin` pad divergence (was a NEW hole this branch introduced)
+Task 3 made geom-extraction `And`-only, but the separate `extract_dwithin_distance` walk
+still recursed through `Not`/any-`BinaryOp`. For `(st_dwithin(a,b,5) | cond) & st_dwithin(c,d,100)`
+the join accelerated on the within-100 node but padded the R-tree query box by 5, silently
+dropping pairs 5–100 apart. **Fixed** in `e462b5788`: one unified walk returns
+`(build_col, probe_col, pad)`, so geom columns and pad come from the same node by
+construction; a non-literal / negative / non-finite distance now refuses acceleration
+(falls back to the complete-filter scan) instead of padding by 0.0. Reviewer ran the tests
+(9 passed), confirmed the old function is deleted with zero remaining references.
 
-**Where:** `src/daft-distributed/src/pipeline_node/translate.rs:110-124` is a byte-for-byte
-logic copy of the private helper at `src/daft-local-plan/src/translate.rs:75-84`.
+### ✅ A1 — geohash covering set had no size cap
+A `st_intersects` query with a continent-sized polygon enumerated ~1M cells (up to ~33.5M
+near-global) at plan time, as Strings spliced into the plan text — stalling *planning*.
+**Fixed** in `ae01f2192`: capped at 4096 cells; on overflow the covering set is returned
+EMPTY (all-or-nothing — never partial, which would be unsound pruning), and the consumer
+already treats empty as "don't prune." Verified the capped path discards the partial set.
 
-**Why it matters:** both call sites enforce the same correctness invariant (stripping
-`JoinSide` markers so a join predicate can be rebound against the join output schema). If
-`ResolvedColumn` semantics ever change and only one copy is updated, the result is a silent
-correctness bug, not a style problem.
+### ✅ C1 — `strip_join_side_cols` duplicated across crates
+Was byte-for-byte duplicated in `daft-local-plan` and `daft-distributed`; drift would have
+been a silent correctness bug since both enforce the same invariant. **Fixed** in
+`c4093bb27`: hoisted to `daft_dsl::join::strip_join_side_cols`, both copies deleted, single
+definition, no unused-import warnings.
 
-**Recommendation (reviewer's, which I endorse):** hoist it into `daft-dsl`, beside
-`unresolved_col`. The function depends only on `daft-dsl` types, so that is its natural home
-— better than exporting it from `daft-local-plan` (which `daft-distributed` already depends
-on, so either would work structurally).
+### ✅ B1/B2 — two Task-1 tests couldn't fail on pre-fix code; dtype guard untested
+**Fixed** in `d805f9117`. Two new tests, both genuine RED pre-fix:
+- `test_spatial_join_null_safe_key_collision` — uses `eq_null_safe` (which the pre-existing
+  `FilterNullJoinKey` rule does NOT strip, unlike plain `=`), literal string `"None"` vs a
+  real NULL. Pre-fix the `str_value` collision emitted a spurious row; post-fix the complete
+  filter's `key <=> rkey` rejects it.
+- `test_spatial_join_cross_dtype_equi_key` — the dtype guard. **Useful negative result:**
+  Int64/Float64 does NOT reach the guard (Rust Display renders `1.0f64` as `"1"`, identical
+  to `1i64`); Date-vs-Timestamp does. So the guard is reachable from Python, just not via
+  the numeric pair the plan first suggested.
 
-**Why it wasn't fixed:** the plan explicitly mandated "write a local copy," because the
-original is private.
+### ✅ Task-8 conservative-keep gap — corrupt H3 cells could prune
+`parse_h3_cells` silently drops unparseable cell strings, so a corrupt sidecar shrank a
+file's coverage and could cause it to be *pruned* — silent row loss on corrupt data.
+**Fixed** in `1e9420349` (design A, skip-file): when a file's parsed cell count ≠ its
+recorded count, that file's entry is omitted, so the lookup misses and the existing
+"basename absent → keep" path fires. Corrupt cells now KEEP the task. Needs a malformed
+sidecar to trigger (the shipped writer only emits valid hex).
 
-### C2. Task 4's `visited` set doubles peak string memory
-**Severity:** Minor, plan-mandated · **From:** Task 4 review
-
-**Where:** `src/daft-geo/src/st_geohash.rs`, `collect_covering_cells`.
-
-`visited` ends up holding exactly the same `String`s as `cells` (every enqueued cell is
-eventually dequeued and inserted). Inserting into `cells` at enqueue time and using *it* as
-the visited check would halve peak storage. Compounds with [A1](#a1).
-
-### C3. Cosmetic inconsistencies
-**Severity:** Minor
-
-- Task 2's copy of `strip_join_side_cols` uses a function-local `use` plus a fully-qualified
-  path, where its sibling copy uses top-level imports. Semantics identical.
-- Two defensive guards in Task 4's flood fill cannot fire with the current `geohash` crate:
-  `neighbor.len() != precision` (the crate's `neighbor` always re-encodes at input length)
-  and the `let Ok(neighbors) = ... else` (inputs here are always valid hashes). Harmless.
-- Task 2's reported Ray run shows an unidentified `1 warning`. Almost certainly pre-existing
-  amid 11 panicking tests, but never named. Test output should be pristine.
-- `geohash_covers_geometry` returns a `Vec<String>` in `HashSet` iteration order, which is
-  `join("\n")`-ed into the plan string at `geohash_pruning.rs:159` — so identical queries can
-  produce different plan text. Pre-existing; unchanged by Task 4.
-- The workspace build carries ~12 pre-existing warnings in `common/error`, `daft-core`, and
-  `daft-dsl`. None attributable to this branch.
+### ✅ Task-8 third bug — `file://` path prefix (found during implementation)
+Scan-task paths are canonicalized to `file:///…` URIs, which `std::fs` can't resolve — so
+even after the format + per-directory fixes the pruning rule would have stayed dead for
+real local-FS usage. Fixed in `5b5696b59` with a `local_fs_path` helper mirroring the
+codebase's existing `daft_io::strip_file_uri_to_path`.
 
 ---
 
-## D. Pre-existing bugs found during execution — NOT part of this branch
+## DEFERRED — needs your decision or a follow-up (NOT fixed on this branch)
 
-### D1. Distributed spatial joins panic in their most natural syntax
-**Severity:** Important (a crash, not silent corruption) · **Predates the branch**
+### ⚠️ Task-7 — CRS warning false-positives on PROJJSON-object CRS (you chose to defer)
+**Severity:** Important, plan-mandated · `src/daft-schema/src/geo_metadata.rs:113-118`
+GeoParquet's spec form for `crs` is a PROJJSON **object**, and GeoPandas embeds the full
+object even for plain WGS84. Our `non_default_crs_columns` stringifies any non-string `crs`
+and compares to `"OGC:CRS84"`, so it flags EVERY GeoPandas-written default-CRS file, and
+`other.to_string()` dumps 1–2 KB of JSON into each log line. Two sub-parts:
+1. Inspect the PROJJSON `id` member (`authority == "OGC" && code == "CRS84"`, arguably also
+   `CRS84h` / `EPSG:4326`) and treat it as default before flagging; log the extracted
+   `authority:code`, not the raw blob.
+2. The function also skips `detect_geo_columns`'s WKB-encoding and schema-presence filters,
+   so it warns for native-GeoArrow-encoded columns Daft never reads as Geometry, and for
+   metadata columns absent from the file schema. Add `.filter(encoding == WKB)` inside, or
+   intersect with the already-computed `geo_cols` at each call site.
+**You elected to leave this for yourself.** The axis-order question (EPSG:4326 lat/lon vs
+CRS84 lon/lat) is a genuine open design question worth a separate look either way.
 
-**Where:** `src/daft-distributed/src/pipeline_node/join/translate_join.rs:396` —
-`todo!("FLOTILLA_MS?: Implement non-equality joins")`.
+### Minor / polish — safe to defer, none block merge
+- **Per-file CRS warning volume** (Task 7): one `log::warn!` per offending column per file;
+  a 10k-file projected dataset emits ~10k lines. Confirmed file-level, not per-batch.
+  Consider hoisting to once-per-scan — compounds with the wall-of-JSON above if unfixed.
+- **`optimizer.rs:248-249` stale comment** (near Task 8's edit): still says "R-tree index"
+  / "per-file MBR" — wrong for the H3 design. Outside the grep mandate, pre-existing.
+- **Geohash `visited` doubles peak String memory** (Task 4): inserting into `cells` at
+  enqueue time and using it as the visited check would halve it.
+- **Example leans on private `idx._load_full()`** (Task 8): `SpatialIndex` wants a public
+  eager-load accessor; user-facing example code shouldn't touch a private method.
+- **dwithin boundary tests** (Task 3b): no test pins the `0.0`-distance-accelerated boundary
+  or NaN/±inf refusal (both are code-covered, not test-covered).
+- **Collocated-join `l_keyed_tasks` order is HashMap-nondeterministic** (Task 5): affects
+  sub-join/Concat order, not the row set; benign today (no ordering guarantee, no snapshot
+  tests). Sort deterministically if plan-snapshot tests are ever added.
+- **Task-5 `l_keyed_tasks` materialization untested** (Task 5): the 7 unit tests pin the
+  pure `plan_sub_joins`, but a regression substituting `l_tasks` for `l_keyed_tasks` in the
+  materialization would pass them. A mixed-hive-layout integration test would close it.
+- **Empty `task.sources` → prune** (Task 8): harmless (zero-source task carries no rows) but
+  an explicit `if task.sources.is_empty() { return true; }` would make the invariant airtight.
+- **Cosmetic** (Task 6): `cast.rs` Geometry error uses `{:?}` while the sibling
+  `GeometryArray::cast` error uses `{}`; minor inconsistency.
 
-**What:** Under `DAFT_RUNNER=ray`, `df.join(other, on=(a == b) & st_intersects(...))` panics.
-The distributed spatial rewrite in `f_down`
-(`src/daft-distributed/src/pipeline_node/translate.rs`) only matches the shape
-`Filter(spatial) → Join(equi)`; it never matches a bare `Join` carrying a residual predicate.
-Such a join falls through to the generic distributed translator, which hits the `todo!()` as
-soon as `split_eq_preds` leaves a non-empty residual.
+---
 
-**Verified present at `main` (94909e69b)**, so it predates this work entirely. It is why 11 of
-12 tests in `tests/expressions/test_spatial_join.py` currently fail under Ray, and why Task 2's
-regression test had to be written with the `.where(spatial)` shape instead.
+## PRE-EXISTING bugs found during execution — NOT this branch's scope, need their own tasks
 
-**Impact:** distributed spatial joins are effectively unusable as normally written. Needs its
-own task — folding it into this branch silently would be wrong.
+### D1. Negating any spatial function is broken in Daft (a crash / hang)
+**Severity:** Important · predates the branch (reproduced on `main`).
+`~st_intersects(a, b)` raises `DaftCoreException: Mismatch of expected expression name and
+name from computed series (g vs st_intersects)` from `daft-recordbatch` — even OUTSIDE a
+join and even over materialized, non-aliased columns — while plain `st_intersects(a,b)` and
+`~bool_col` both work. Inside a nested-loop join the same defect *deadlocks* instead of
+erroring. This is why `test_python_join_not_st_intersects` is `xfail`ed (`733715e07`). It
+also means Task 3's negation-refusal guards a path no user can currently execute — correct
+to have, but not independently reachable until this is fixed. **Fix shape:** the
+`Not`-over-`ScalarFn` name-resolution mismatch in expression evaluation; remove the xfail
+once fixed (the assertions are already correct).
 
-**Fix shape:** teach `f_down` to also match a bare `Join` whose `on` splits into equi-keys plus
-a spatial residual, routing it to `SpatialHashJoinNode` the same way the `Filter`-wrapped shape
-is. Note this interacts with Task 2: the rewrite must keep carrying the **full** ON predicate
-into the local NLJ filter.
+### D2. Distributed spatial joins panic in their most natural syntax
+**Severity:** Important (a crash, not silent corruption) · predates the branch (on `main`).
+Under Ray, `df.join(other, on=(a == b) & st_intersects(...))` hits
+`todo!("FLOTILLA_MS?: Implement non-equality joins")` at
+`src/daft-distributed/src/pipeline_node/join/translate_join.rs:396`, because the distributed
+spatial rewrite only matches `Filter(spatial) → Join(equi)`, never a bare `Join` carrying a
+residual predicate. This is why 11/12 tests in `tests/expressions/test_spatial_join.py` fail
+under Ray today, and why Task 2's regression test uses the `.where(spatial)` shape.
+**Fix shape:** teach the distributed `f_down` to also match a bare `Join` whose `on` splits
+into equi-keys + a spatial residual, routing it to `SpatialHashJoinNode` — while keeping the
+full ON predicate in the local NLJ filter (the Task 1/2 invariant).
 
 ---
 
 ## Corrections to the original incoming review
 
 The document this branch was planned from (`~/Downloads/2026-07-10-spatial-review-fixes.md`)
-overstated two findings. Recorded here so they aren't re-litigated:
-
-1. **NULL-key collision** is reachable only via null-safe `<=>` equality, not plain `=`,
-   because `FilterNullJoinKey` strips NULL-keyed rows first. See [B1](#b1).
+overstated two findings; recorded so they aren't re-litigated:
+1. **NULL-key collision** is reachable only via null-safe `<=>`, not plain `=` — the
+   pre-existing `FilterNullJoinKey` rule strips NULL keys first for `=`. (See B1 above.)
 2. **Collocated-join `continue` on a partition-value miss** is *correct* for the Inner-only
-   rewrite — an absent partition value genuinely contributes zero rows. Only the *systematic*
-   all-miss case (e.g. dtype-divergent `PartitionSpec`s that can never compare equal) is a bug,
-   and only when a left unkeyed group lets it bypass the `len == 1` guard. Task 5 fixes exactly
-   that, and no more.
+   rewrite; only the systematic all-miss case (dtype-divergent PartitionSpecs) combined with
+   a left unkeyed group is a bug. Task 5 fixes exactly that and no more.
