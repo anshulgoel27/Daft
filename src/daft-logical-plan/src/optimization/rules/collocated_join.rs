@@ -145,10 +145,15 @@ fn group_tasks_by_partition_col(
 /// Primary: a canonical string rendering of the partition value itself, so
 /// groups sort in a human-meaningful order (the review's ask to "sort by
 /// partition key").
-/// Secondary (tie-break): the group's sorted source file paths. A
-/// hive-partitioned file belongs to exactly one partition-value group, so
-/// this is unique across groups and guarantees a *total*, stable order even
-/// if two distinct partition values were ever to render identically.
+/// Secondary (tie-break): the group's sorted source file paths. For a
+/// hive-partitioned layout a file's path encodes its partition value, so
+/// distinct groups own disjoint path lists and the order is total. This is a
+/// strong practical guarantee rather than a type-level one: two distinct
+/// partition values rendering identically AND owning identical path multisets
+/// (e.g. one physical file scanned under two differing specs) would tie, and a
+/// tie falls back to `sort_by_cached_key`'s stable order — i.e. the incoming
+/// HashMap order, which is not deterministic. Not reachable for real hive
+/// scans; noted so a future reader doesn't over-trust the "unique" claim.
 fn group_sort_key(key: &Option<PartitionSpec>, tasks: &[ScanTaskRef]) -> (String, Vec<String>) {
     let rendered = key.as_ref().map(|ps| ps.keys.to_string()).unwrap_or_default();
     let mut paths: Vec<String> = tasks.iter().flat_map(|t| t.get_file_paths()).collect();
