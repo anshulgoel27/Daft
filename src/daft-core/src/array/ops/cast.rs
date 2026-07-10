@@ -80,7 +80,18 @@ where
                 Series::from_arrow(self.field().clone(), self.data.clone())?.cast_to_python()
             }
             DataType::Geometry => {
-                // Binary → Geometry: wrap the physical binary array as a GeometryArray.
+                // Only Binary carries a WKB representation. Numeric/Utf8/Boolean
+                // sources cast to Binary via their STRING representation (see the
+                // arrow2-compat routing below), so allowing them here would mint a
+                // Geometry column of non-WKB bytes that every ST_* function
+                // null-ifies — silent garbage far from the actual mistake.
+                if !matches!(self.data_type(), DataType::Binary) {
+                    return Err(DaftError::TypeError(format!(
+                        "Cannot cast {:?} to Geometry: only Binary (WKB-encoded) data can \
+                         be cast to Geometry",
+                        self.data_type()
+                    )));
+                }
                 let binary_series = self.cast(&DataType::Binary)?;
                 let physical = binary_series.binary().unwrap().clone();
                 let field = Field::new(self.name(), DataType::Geometry);

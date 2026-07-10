@@ -900,3 +900,26 @@ def test_geom_constructors_return_geometry():
     out = df.select(st_astext(daft.col("g1")).alias("w1"), st_astext(daft.col("g2")).alias("w2")).to_pydict()
     assert out["w1"][0].upper().startswith("POINT") and out["w1"][1] is None
     assert out["w2"][0].upper().startswith("POINT") and out["w2"][1] is None
+
+
+def test_cast_to_geometry_rejects_int_source():
+    df = daft.from_pydict({"x": [1, 2, 3]})
+    with pytest.raises(Exception, match="Geometry"):
+        df.select(daft.col("x").cast(daft.DataType.geometry())).collect()
+
+
+def test_cast_to_geometry_rejects_utf8_source():
+    df = daft.from_pydict({"x": ["POINT(1 2)", "not wkb"]})
+    with pytest.raises(Exception, match="Geometry"):
+        df.select(daft.col("x").cast(daft.DataType.geometry())).collect()
+
+
+def test_cast_to_geometry_from_binary_still_works():
+    from daft.functions import st_point
+
+    df = daft.from_pydict({"x": [1.0], "y": [2.0]}).select(
+        st_point(daft.col("x"), daft.col("y")).alias("g")
+    )
+    wkb = df.select(daft.col("g").cast(daft.DataType.binary()).alias("wkb"))
+    back = wkb.select(daft.col("wkb").cast(daft.DataType.geometry()).alias("g2"))
+    assert back.to_pydict()["g2"] == df.to_pydict()["g"]
