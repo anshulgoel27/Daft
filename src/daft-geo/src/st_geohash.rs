@@ -148,11 +148,22 @@ pub fn geohash_covers_geometry(g: &Geometry, precision: usize) -> Vec<String> {
 /// cells still in the queue, and enqueued neighbors unfiltered, flooding an
 /// O(D²) disk around the start.)
 ///
-/// Bounded: the flood aborts once `cells` would grow past
-/// `MAX_COVERING_CELLS`, returning `true` ("capped"). Callers must NOT treat
-/// `cells` as a valid (partial) covering set when this returns `true` — the
-/// flood stops mid-BFS, so `cells` at that point is an arbitrary, incomplete
-/// prefix of the true covering set, not a sound approximation of it.
+/// `cells` doubles as both the result set and the seen/visited check: a cell
+/// is inserted into `cells` the moment it is enqueued (not when it is later
+/// dequeued), so a cell already present in `cells` has already been queued
+/// and must not be enqueued again. Every enqueued cell is eventually
+/// dequeued and processed, so on a complete (uncapped) run the final
+/// contents of `cells` are exactly the same as if it had instead been
+/// populated at dequeue time — the intermediate bookkeeping is just cheaper,
+/// since it avoids keeping a second `String` set with the same contents.
+///
+/// Bounded: the flood aborts once enqueuing another cell would grow `cells`
+/// past `MAX_COVERING_CELLS`, returning `true` ("capped"). Callers must NOT
+/// treat `cells` as a valid (partial) covering set when this returns `true`
+/// — the flood stops mid-BFS, so `cells` at that point is an arbitrary,
+/// incomplete prefix of the true covering set, not a sound approximation of
+/// it. (`geohash_covers_geometry` never reads `cells` when `capped` is
+/// `true`, so this partial content is never observed by callers.)
 fn collect_covering_cells(
     cells: &mut std::collections::HashSet<String>,
     start: &str,
@@ -163,16 +174,10 @@ fn collect_covering_cells(
         return false;
     }
     let mut queue = std::collections::VecDeque::new();
-    let mut visited = std::collections::HashSet::new();
     queue.push_back(start.to_string());
-    visited.insert(start.to_string());
+    cells.insert(start.to_string());
 
     while let Some(current) = queue.pop_front() {
-        if cells.len() >= MAX_COVERING_CELLS {
-            return true;
-        }
-        cells.insert(current.clone());
-
         let Ok(neighbors) = geohash::neighbors(&current) else {
             continue;
         };
@@ -180,16 +185,20 @@ fn collect_covering_cells(
             neighbors.n, neighbors.ne, neighbors.e, neighbors.se,
             neighbors.s, neighbors.sw, neighbors.w, neighbors.nw,
         ] {
-            if neighbor.len() != precision || visited.contains(&neighbor) {
+            if neighbor.len() != precision || cells.contains(&neighbor) {
                 continue;
             }
             let Ok(neighbor_bbox) = geohash::decode_bbox(&neighbor) else {
                 continue;
             };
-            if neighbor_bbox.intersects(bbox) {
-                visited.insert(neighbor.clone());
-                queue.push_back(neighbor);
+            if !neighbor_bbox.intersects(bbox) {
+                continue;
             }
+            if cells.len() >= MAX_COVERING_CELLS {
+                return true;
+            }
+            cells.insert(neighbor.clone());
+            queue.push_back(neighbor);
         }
     }
     false
