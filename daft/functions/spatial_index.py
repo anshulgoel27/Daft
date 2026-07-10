@@ -799,8 +799,10 @@ class SpatialIndex:
         Path to the ``.idx`` Parquet file (used for lazy queries).
     file_h3_cells : dict
         ``{basename: [cell_str, ...]}`` — H3 cells covering each file.
-        Populated lazily on first full load; prefer ``filter_paths`` for
-        query-time pruning which reads only the relevant rows.
+        A property: accessing it triggers a full materialization of the
+        index sidecar on first access if it hasn't been loaded yet (see
+        ``load_full``). Prefer ``filter_paths`` for query-time pruning,
+        which reads only the relevant rows instead of the whole sidecar.
     """
 
     def __init__(
@@ -812,7 +814,7 @@ class SpatialIndex:
         index_path: Optional[str] = None,
     ):
         self.geom_col = geom_col
-        self.file_h3_cells: dict[str, list[str]] = file_h3_cells or {}
+        self._file_h3_cells: dict[str, list[str]] = file_h3_cells or {}
         self.h3_resolution = h3_resolution
         self.index_path = index_path
 
@@ -827,16 +829,40 @@ class SpatialIndex:
         # Don't load all rows yet — filter_paths will query lazily
         return cls(geom_col=geom_col, h3_resolution=h3_resolution, index_path=path)
 
-    def _load_full(self) -> None:
-        """Materialise the full forward dict (for repr / introspection)."""
-        if self.file_h3_cells or self.index_path is None:
-            return
+    @property
+    def file_h3_cells(self) -> dict[str, list[str]]:
+        """``{basename: [cell_str, ...]}`` — H3 cells covering each file.
+
+        Triggers ``load_full`` on first access to materialise the full
+        forward dict from the ``.idx`` sidecar. Prefer ``filter_paths`` for
+        query-time pruning, which reads only the relevant rows.
+        """
+        self.load_full()
+        return self._file_h3_cells
+
+    def load_full(self) -> "SpatialIndex":
+        """Eagerly materialise the full forward ``{filename: [cell, ...]}`` map.
+
+        Populates ``file_h3_cells`` (and this call becomes a no-op) once the
+        sidecar has been loaded, or immediately if ``index_path`` is unset.
+        Useful for repr / introspection / debugging, where the whole index is
+        needed rather than the lazy, query-scoped reads that ``filter_paths``
+        performs.
+
+        Returns
+        -------
+        SpatialIndex
+            ``self``, for chaining, e.g. ``SpatialIndex.load(path).load_full()``.
+        """
+        if self._file_h3_cells or self.index_path is None:
+            return self
         import pyarrow.parquet as pq
         tbl = pq.read_table(self.index_path, columns=["h3_cell", "filename"])
         d: dict[str, list[str]] = {}
         for cell, fname in zip(tbl["h3_cell"].to_pylist(), tbl["filename"].to_pylist()):
             d.setdefault(fname, []).append(cell)
-        self.file_h3_cells = d
+        self._file_h3_cells = d
+        return self
 
     def filter_paths(
         self,

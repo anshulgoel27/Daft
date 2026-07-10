@@ -170,7 +170,7 @@ def _run_example(df, outdir: str, lons, lats, gh5):
     sample_dir = part_dirs[0]
     idx = load_spatial_index(sample_dir)
     print(f"  {idx}")
-    idx._load_full()
+    idx.load_full()
     for fname, cells in idx.file_h3_cells.items():
         print(f"  {fname}: {len(cells)} H3 cell(s), e.g. {cells[:3]}")
 

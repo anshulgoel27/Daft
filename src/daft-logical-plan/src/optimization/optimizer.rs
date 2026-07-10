@@ -244,8 +244,9 @@ impl OptimizerBuilder {
                 vec![Box::new(ShardScans::new())],
                 RuleExecutionStrategy::Once,
             ),
-            // --- Spatial partition pruning (R-tree index) ---
-            // Prune scan tasks whose per-file MBR does not overlap the query geometry.
+            // --- Spatial partition pruning (H3 inverted-Parquet index) ---
+            // Prune scan tasks whose per-file H3 cell coverage does not overlap
+            // the query geometry's own H3 cells.
             // Runs after MaterializeScans so that concrete file paths are available.
             // No-op when no _spatial_index.idx sidecar is present.
             RuleBatch::new(

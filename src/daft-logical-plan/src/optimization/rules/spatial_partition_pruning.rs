@@ -258,6 +258,10 @@ fn task_passes_h3(
     cache: &mut IndexCache,
     query_cells_by_res: &mut HashMap<u8, Option<Vec<u64>>>,
 ) -> bool {
+    if task.sources.is_empty() {
+        // No sources to resolve against an index -> keep conservatively.
+        return true;
+    }
     for source in &task.sources {
         let path = local_fs_path(source.get_path());
         let Some(dir) = Path::new(path).parent().map(|p| p.to_string_lossy().into_owned())
@@ -398,6 +402,47 @@ mod tests {
             h3_resolution.to_string(),
         ));
         writer.close().unwrap();
+    }
+
+    #[test]
+    fn task_passes_h3_keeps_task_with_empty_sources() {
+        use daft_scan::{
+            FileFormatConfig, ParquetSourceConfig, Pushdowns, ScanTask, SourceConfig,
+            storage_config::StorageConfig,
+        };
+        use daft_schema::{field::Field, schema::Schema, time_unit::TimeUnit};
+
+        // `ScanTask::new` asserts `!sources.is_empty()`, so an empty-sources
+        // task can never arise from the public constructor. Build one via a
+        // direct struct literal (every field is `pub`) purely to exercise the
+        // defensive early-return in `task_passes_h3` directly.
+        let task = ScanTask {
+            sources: vec![],
+            schema: StdArc::new(Schema::new(Vec::<Field>::new())),
+            source_config: StdArc::new(SourceConfig::File(FileFormatConfig::Parquet(
+                ParquetSourceConfig {
+                    coerce_int96_timestamp_unit: TimeUnit::Seconds,
+                    field_id_mapping: None,
+                    row_groups: None,
+                    chunk_size: None,
+                    ignore_corrupt_files: false,
+                    geometry: true,
+                },
+            ))),
+            storage_config: StdArc::new(StorageConfig::new_internal(false, None)),
+            pushdowns: Pushdowns::default(),
+            size_bytes_on_disk: None,
+            metadata: None,
+            statistics: None,
+            generated_fields: None,
+        };
+
+        let mut cache = IndexCache::new();
+        let mut query_cells_by_res = HashMap::new();
+        assert!(
+            task_passes_h3(&task, "geom", &[], &mut cache, &mut query_cells_by_res),
+            "a task with empty sources must be kept conservatively, not pruned"
+        );
     }
 
     #[test]
