@@ -194,3 +194,87 @@ def test_spatial_join_bbox_index_is_actually_used():
     correct = polys.with_spatial_bbox("qg")
     ok = pts.join(correct, on=st_intersects(correct["qg"], pts["pg"])).select("pid", "qid").to_pydict()
     assert ok["pid"] == [1]
+
+
+# ── Full ON-predicate enforcement in the NLJ filter ────────────────────────────
+
+
+def test_spatial_join_composite_equi_key():
+    """Two equality columns + a spatial predicate must both be enforced, not just the spatial one."""
+    pts = daft.from_pydict(
+        {
+            "region": ["a", "a", "b"],
+            "zone": [1, 2, 1],
+            "pid": [1, 2, 3],
+            "x": [1.0, 1.0, 1.0],
+            "y": [1.0, 1.0, 1.0],
+        }
+    ).select("region", "zone", "pid", st_point(daft.col("x"), daft.col("y")).alias("pg"))
+    polys = daft.from_pydict(
+        {
+            "region": ["a", "b"],
+            "zone": [1, 1],
+            "qid": [10, 20],
+            "wkt": ["POLYGON((0 0,2 0,2 2,0 2,0 0))", "POLYGON((0 0,2 0,2 2,0 2,0 0))"],
+        }
+    ).select(
+        daft.col("region").alias("pregion"),
+        daft.col("zone").alias("pzone"),
+        "qid",
+        st_geomfromtext(daft.col("wkt")).alias("qg"),
+    )
+    got = (
+        pts.join(
+            polys,
+            on=(pts["region"] == polys["pregion"])
+            & (pts["zone"] == polys["pzone"])
+            & st_intersects(polys["qg"], pts["pg"]),
+        )
+        .select("pid", "qid")
+        .sort(["pid", "qid"])
+        .to_pydict()
+    )
+    # pid=2 (region=a, zone=2) has no polygon with zone=2 and must NOT match qid=10,
+    # even though it is spatially inside qid=10's polygon.
+    assert list(zip(got["pid"], got["qid"])) == [(1, 10), (3, 20)]
+
+
+def test_spatial_join_null_key_never_matches():
+    """A NULL equi-join key must never match another NULL key under standard `=` semantics."""
+    left = daft.from_pydict(
+        {"lid": [1, 2], "key": [None, "k"], "x": [1.0, 1.0], "y": [1.0, 1.0]}
+    ).select("lid", "key", st_point(daft.col("x"), daft.col("y")).alias("lg"))
+    # Alias the right-side key to "rkey" to avoid same-name ambiguity in the predicate
+    # resolver (see test_spatial_join_partitioned_by_key above) — this only renames the
+    # schema field and does not change the NULL-collision semantics under test.
+    right = daft.from_pydict(
+        {"rid": [10, 11], "key": [None, "k"], "wkt": ["POLYGON((0 0,2 0,2 2,0 2,0 0))"] * 2}
+    ).select("rid", daft.col("key").alias("rkey"), st_geomfromtext(daft.col("wkt")).alias("rg"))
+    got = (
+        left.join(right, on=(left["key"] == right["rkey"]) & st_intersects(right["rg"], left["lg"]))
+        .select("lid", "rid")
+        .sort(["lid", "rid"])
+        .to_pydict()
+    )
+    assert list(zip(got["lid"], got["rid"])) == [(2, 11)]
+
+
+def test_spatial_join_literal_none_string_key_does_not_match_null():
+    """A key column holding the literal string 'None' must not join against NULL keys
+    (today both str_value-render to "None" and collide into one group)."""
+    left = daft.from_pydict(
+        {"lid": [1], "key": ["None"], "x": [1.0], "y": [1.0]}
+    ).select("lid", "key", st_point(daft.col("x"), daft.col("y")).alias("lg"))
+    # Alias the right-side key to "rkey" to avoid same-name ambiguity in the predicate
+    # resolver (see test_spatial_join_partitioned_by_key above) — this only renames the
+    # schema field and does not change the NULL-vs-"None" semantics under test.
+    right = daft.from_pydict(
+        {"rid": [10], "key": [None], "wkt": ["POLYGON((0 0,2 0,2 2,0 2,0 0))"]}
+    ).select("rid", daft.col("key").alias("rkey"), st_geomfromtext(daft.col("wkt")).alias("rg"))
+    right = right.with_column("rkey", right["rkey"].cast(daft.DataType.string()))
+    got = (
+        left.join(right, on=(left["key"] == right["rkey"]) & st_intersects(right["rg"], left["lg"]))
+        .select("lid", "rid")
+        .to_pydict()
+    )
+    assert got["lid"] == []
