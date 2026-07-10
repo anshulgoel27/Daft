@@ -2,7 +2,7 @@
 //!
 //! Provides cell-set computation for WKB geometries used by the
 //! `SpatialPartitionPruning` optimizer rule when it loads a v1
-//! `_spatial_index.json` sidecar.
+//! `_spatial_index.idx` sidecar.
 //!
 //! # Design
 //!

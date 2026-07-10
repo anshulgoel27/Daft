@@ -2,8 +2,8 @@
 
 Overview
 --------
-A *spatial index* is a small JSON sidecar file (``_spatial_index.json``)
-stored alongside a directory of parquet files.  It records the spatial
+A *spatial index* is a small inverted-Parquet sidecar file
+(``_spatial_index.idx``) stored alongside a directory of parquet files.  It records the spatial
 coverage of each file so the ``SpatialPartitionPruning`` optimizer rule can
 skip files that cannot possibly intersect the query geometry.
 
@@ -557,7 +557,7 @@ def build_spatial_index(
     h3_resolution: int = DEFAULT_H3_RESOLUTION,
     max_cells_per_file: Optional[int] = None,
 ) -> dict:
-    """Scan every parquet file in *directory* and write ``_spatial_index.json``.
+    """Scan every parquet file in *directory* and write ``_spatial_index.idx``.
 
     Parameters
     ----------
@@ -567,7 +567,7 @@ def build_spatial_index(
         Name of the WKB-encoded geometry column.
     output_path:
         Path for the index file.  Defaults to
-        ``{directory}/_spatial_index.json``.
+        ``{directory}/_spatial_index.idx``.
     glob_pattern:
         Glob pattern for parquet files within *directory*.
     h3_resolution:
@@ -686,14 +686,14 @@ def _build_h3_index(
         for fut in as_completed(futs):
             scan_results[futs[fut]] = fut.result()
 
-    file_mbrs = {fp: r[0] for fp, r in scan_results.items()}
+    per_file_mbr = {fp: r[0] for fp, r in scan_results.items()}
 
     # ── Determine a single safe resolution for ALL files ──────────────────
     # Resolution capping only matters for polygon/MBR-indexed files (those that
     # go through polyfill or grid-walk).  Pure-point files map each point to
     # exactly one cell at any resolution, so their MBR size is irrelevant.
     all_points = all(r[1] for r in scan_results.values() if r[0] is not None)
-    valid_mbrs = [m for m in file_mbrs.values() if m is not None]
+    valid_mbrs = [m for m in per_file_mbr.values() if m is not None]
     if valid_mbrs and not all_points:
         ux0 = min(m[0] for m in valid_mbrs)
         uy0 = min(m[1] for m in valid_mbrs)
@@ -960,7 +960,7 @@ def spatial_join(
 
     Before running the join, the function:
 
-    1. Detects which side has a ``_spatial_index.json`` (the *probe* side).
+    1. Detects which side has a ``_spatial_index.idx`` (the *probe* side).
     2. Materialises the *build* side's geometry column (the other side).
     3. Computes a union bounding geometry from the build side.
     4. Uses the spatial index to skip probe-side partitions that cannot
@@ -971,7 +971,7 @@ def spatial_join(
     ----------
     left, right:
         Either a ``daft.DataFrame`` or a directory path (str) containing
-        hive-partitioned parquet files with a ``_spatial_index.json`` sidecar.
+        hive-partitioned parquet files with a ``_spatial_index.idx`` sidecar.
     predicate:
         Spatial SQL function name.  One of ``"st_contains"``,
         ``"st_intersects"``, ``"st_within"``.  Applied as

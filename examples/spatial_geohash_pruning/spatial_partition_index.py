@@ -6,7 +6,7 @@ Demonstrates the full workflow:
   2. Write them into **spatially partitioned** parquet files — each file
      holds points that share the same coarse geohash cell (precision 3),
      so all geometries in one file are spatially adjacent.
-  3. Build a ``_spatial_index.json`` sidecar that records the MBR of each
+  3. Build a ``_spatial_index.idx`` sidecar that records the H3 cells of each
      file.
   4. Query with ``read_parquet_spatial()`` — the index prunes files before
      Daft even creates scan tasks (Python-level pruning).
@@ -170,8 +170,9 @@ def _run_example(df, outdir: str, lons, lats, gh5):
     sample_dir = part_dirs[0]
     idx = load_spatial_index(sample_dir)
     print(f"  {idx}")
-    for fname, mbr in idx.file_mbrs.items():
-        print(f"  {fname}: MBR = [{mbr[0]:.3f}, {mbr[1]:.3f}, {mbr[2]:.3f}, {mbr[3]:.3f}]")
+    idx._load_full()
+    for fname, cells in idx.file_h3_cells.items():
+        print(f"  {fname}: {len(cells)} H3 cell(s), e.g. {cells[:3]}")
 
     # ── 5. Query: London bounding box ─────────────────────────────────────
     print("\n=== Step 5: spatial query (London bbox) ===")
@@ -270,7 +271,7 @@ def _run_example(df, outdir: str, lons, lats, gh5):
     print("  " + "-" * 57)
     for pdir in sorted(part_dirs):
     	files = [f for f in os.listdir(pdir) if f.endswith(".parquet")]
-    	has_idx = os.path.exists(os.path.join(pdir, "_spatial_index.json"))
+    	has_idx = os.path.exists(os.path.join(pdir, "_spatial_index.idx"))
     	label = os.path.relpath(pdir, os.path.dirname(pdir))
     	print(f"  {label:<40} {len(files):>5} {'yes' if has_idx else 'no':>9}")
 

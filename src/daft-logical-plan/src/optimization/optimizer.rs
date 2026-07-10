@@ -247,7 +247,7 @@ impl OptimizerBuilder {
             // --- Spatial partition pruning (R-tree index) ---
             // Prune scan tasks whose per-file MBR does not overlap the query geometry.
             // Runs after MaterializeScans so that concrete file paths are available.
-            // No-op when no _spatial_index.json sidecar is present.
+            // No-op when no _spatial_index.idx sidecar is present.
             RuleBatch::new(
                 vec![Box::new(SpatialPartitionPruning)],
                 RuleExecutionStrategy::Once,
