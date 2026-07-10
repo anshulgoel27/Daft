@@ -9,9 +9,8 @@ use daft_dsl::{
 };
 use geo::{Geometry, Point};
 use serde::{Deserialize, Serialize};
-use wkb::geom_to_wkb;
 
-use crate::utils::wkb_opts_to_geometry_series;
+use crate::utils::{geom_to_wkb, wkb_opts_to_geometry_series};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct StPoint;

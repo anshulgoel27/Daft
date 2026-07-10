@@ -8,8 +8,9 @@ use daft_dsl::{
     functions::{FunctionArgs, ScalarUDF, scalar::ScalarFn},
 };
 use serde::{Deserialize, Serialize};
-use wkb::geom_to_wkb;
 use wkt::TryFromWkt;
+
+use crate::utils::geom_to_wkb;
 
 /// Parse a WKT string into WKB bytes.
 fn wkt_to_wkb(s: &str) -> Option<Vec<u8>> {

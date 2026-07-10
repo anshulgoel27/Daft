@@ -9,7 +9,8 @@ use daft_dsl::{
 };
 use geojson::GeoJson;
 use serde::{Deserialize, Serialize};
-use wkb::geom_to_wkb;
+
+use crate::utils::geom_to_wkb;
 
 /// Parse a GeoJSON string into WKB bytes.
 fn geojson_to_wkb(s: &str) -> Option<Vec<u8>> {

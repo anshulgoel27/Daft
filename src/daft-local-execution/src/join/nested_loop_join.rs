@@ -607,7 +607,7 @@ impl JoinOperator for NestedLoopJoinOperator {
                                                 [max_x + pad, max_y + pad],
                                             );
                                             group_tree
-                                                .locate_in_envelope_intersecting(&q)
+                                                .locate_in_envelope_intersecting(q)
                                                 .map(|entry| {
                                                     (key.clone(), i as u64, entry.row_idx as u64)
                                                 })
@@ -678,7 +678,7 @@ impl JoinOperator for NestedLoopJoinOperator {
                                         [max_x + pad, max_y + pad],
                                     );
                                     rtree
-                                        .locate_in_envelope_intersecting(&q)
+                                        .locate_in_envelope_intersecting(q)
                                         .map(|entry| (i as u64, entry.row_idx as u64))
                                         .collect()
                                 })

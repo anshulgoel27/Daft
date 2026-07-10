@@ -1,4 +1,4 @@
-use std::{io::Cursor, sync::Arc};
+use std::sync::Arc;
 
 use arrow_buffer::NullBufferBuilder;
 use common_error::{DaftError, DaftResult};
@@ -11,7 +11,15 @@ use daft_core::{
 };
 use daft_dsl::{ExprRef, functions::FunctionArgs};
 use geo::{Geometry, MultiPolygon};
-use wkb::wkb_to_geom;
+use geo_traits::to_geo::ToGeoGeometry;
+
+/// Encode a `geo::Geometry` into standard (ISO) little-endian WKB bytes.
+pub fn geom_to_wkb(geom: &Geometry) -> DaftResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    wkb::writer::write_geometry(&mut buf, geom, &wkb::writer::WriteOptions::default())
+        .map_err(|e| DaftError::ComputeError(format!("WKB write error: {e:?}")))?;
+    Ok(buf)
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Shared f64 literal helpers
@@ -168,8 +176,10 @@ fn strip_ewkb_srid<'a>(bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
 /// Accepts both standard ISO WKB and PostGIS EWKB (with SRID).
 pub fn parse_wkb(bytes: &[u8]) -> DaftResult<Geometry> {
     let stripped = strip_ewkb_srid(bytes);
-    let mut cur = Cursor::new(stripped.as_ref());
-    wkb_to_geom(&mut cur).map_err(|e| DaftError::ComputeError(format!("WKB parse error: {e:?}")))
+    let wkb = wkb::reader::read_wkb(stripped.as_ref())
+        .map_err(|e| DaftError::ComputeError(format!("WKB parse error: {e:?}")))?;
+    wkb.try_to_geometry()
+        .ok_or_else(|| DaftError::ComputeError("WKB parse error: empty geometry".to_string()))
 }
 
 /// Get the physical BinaryArray backing a Geometry or Binary Series.
@@ -309,8 +319,6 @@ pub fn unary_geom_to_geom(
     out_name: &str,
     f: impl Fn(&Geometry) -> Option<Geometry>,
 ) -> DaftResult<Series> {
-    use wkb::geom_to_wkb;
-
     let binary = get_geometry_binary(series)?;
     let len = binary.len();
     let mut wkb_values: Vec<Option<Vec<u8>>> = Vec::with_capacity(len);
@@ -382,8 +390,6 @@ pub fn binary_geom_to_geom(
     out_name: &str,
     f: impl Fn(&Geometry, &Geometry) -> Option<Geometry>,
 ) -> DaftResult<Series> {
-    use wkb::geom_to_wkb;
-
     let lhs_bin = get_geometry_binary(lhs)?;
     let rhs_bin = get_geometry_binary(rhs)?;
 
