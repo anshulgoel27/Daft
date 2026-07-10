@@ -578,11 +578,11 @@ mod tests {
     /// Tests that we can't pushdown a filter into a ScanOperator if it has an udf-ish expression.
     #[test]
     fn filter_with_udf_not_pushed_down_into_scan() -> DaftResult<()> {
-        let pred: ExprRef = BuiltinScalarFn::new_async(
-            UrlDownload,
-            vec![resolved_col("a"), lit(1), lit(true), lit(true)],
-        )
-        .into();
+        // `b` is the Utf8 column: url_download requires a string input, and now that
+        // `IsNull::to_field` validates its child (like `Not` already did), the UDF
+        // call must be well-formed — the previous `col("a")` (Int64) + bogus
+        // bool/int literals only ever type-checked because is_null didn't recurse.
+        let pred: ExprRef = BuiltinScalarFn::new_async(UrlDownload, vec![resolved_col("b")]).into();
         let plan = dummy_scan_node(dummy_scan_operator(vec![
             Field::new("a", DataType::Int64),
             Field::new("b", DataType::Utf8),
