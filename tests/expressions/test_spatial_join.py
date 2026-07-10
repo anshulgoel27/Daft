@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import os
 
 import pytest
@@ -280,6 +281,82 @@ def test_spatial_join_literal_none_string_key_does_not_match_null():
         .to_pydict()
     )
     assert got["lid"] == []
+
+
+def test_spatial_join_null_safe_key_collision():
+    """A literal string "None" must NOT null-safe-match a real NULL key, even though both
+    render to the same string "None" via `str_value` during partition-key R-tree grouping
+    and would land in the same candidate group.
+
+    `FilterNullJoinKey` only strips NULLs ahead of STANDARD (`=`) equi-keys — it explicitly
+    skips null-safe (`<=>`) keys (see `filter_null_join_key.rs`, `!*null_eq_null` filter) —
+    so the real NULL on the right survives to reach the spatial NLJ's candidate-generation
+    path. Pre-fix, the NLJ filter carried only the spatial residual, so once candidate
+    generation merged the "None"/NULL groups by `str_value`, the pair was emitted with no
+    equality re-check. Post-fix, the complete filter re-evaluates `key <=> rkey`, which is
+    false for a literal string vs a real NULL under null-safe semantics, so no row joins.
+    """
+    left = daft.from_pydict(
+        {"lid": [1], "key": ["None"], "x": [1.0], "y": [1.0]}
+    ).select("lid", "key", st_point(daft.col("x"), daft.col("y")).alias("lg"))
+    # Alias the right-side key to "rkey" to avoid same-name ambiguity in the predicate
+    # resolver (see test_spatial_join_partitioned_by_key above) — this only renames the
+    # schema field and does not change the NULL-vs-"None" semantics under test.
+    right = daft.from_pydict(
+        {"rid": [10], "key": [None], "wkt": ["POLYGON((0 0,2 0,2 2,0 2,0 0))"]}
+    ).select("rid", daft.col("key").alias("rkey"), st_geomfromtext(daft.col("wkt")).alias("rg"))
+    right = right.with_column("rkey", right["rkey"].cast(daft.DataType.string()))
+    got = (
+        left.join(
+            right,
+            on=left["key"].eq_null_safe(right["rkey"]) & st_intersects(right["rg"], left["lg"]),
+        )
+        .select("lid", "rid")
+        .to_pydict()
+    )
+    # Under null-safe (`<=>`) semantics a literal "None" string is NOT equal to NULL, so
+    # no row should join — even though both spatially intersect the same polygon.
+    assert got["lid"] == []
+
+
+def test_spatial_join_cross_dtype_equi_key():
+    """Equi-key columns holding EQUAL values at DIFFERENT dtypes (Date `2024-01-01` vs
+    Timestamp `2024-01-01T00:00:00`) must still join: the translate.rs dtype guard in the
+    `partition_key` closure detects the mismatch and falls back to unpartitioned candidate
+    generation with the complete filter, rather than letting per-key `str_value` grouping
+    place the matching rows in different groups and silently drop the row.
+
+    Date vs Timestamp is used (per the guard's own comment in translate.rs) rather than
+    Int64 vs Float64: Rust's `{}` Display renders `1.0f64` as `"1"`, identical to `1i64`'s
+    `"1"`, so an Int64/Float64 pair does NOT actually collide differently under
+    `str_value` and would not RED pre-fix (verified empirically). Date's `str_value`
+    renders as `"2024-01-01"` and Timestamp's as `"2024-01-01T00:00:00"` (or similar,
+    always including a time component), which DO differ, so this pair genuinely exercises
+    the guard.
+    """
+    left = daft.from_pydict(
+        {"lid": [1], "key": [datetime.date(2024, 1, 1)], "x": [1.0], "y": [1.0]}
+    ).select("lid", "key", st_point(daft.col("x"), daft.col("y")).alias("lg"))
+    # Alias the right-side key to "rkey" to avoid same-name ambiguity in the predicate
+    # resolver (see test_spatial_join_partitioned_by_key above).
+    right = daft.from_pydict(
+        {
+            "rid": [10],
+            "rkey": [datetime.datetime(2024, 1, 1)],
+            "wkt": ["POLYGON((0 0,2 0,2 2,0 2,0 0))"],
+        }
+    ).select("rid", "rkey", st_geomfromtext(daft.col("wkt")).alias("rg"))
+    got = (
+        left.join(
+            right,
+            on=(left["key"] == right["rkey"]) & st_intersects(right["rg"], left["lg"]),
+        )
+        .select("lid", "rid")
+        .to_pydict()
+    )
+    # key=2024-01-01 (Date) == rkey=2024-01-01T00:00:00 (Timestamp), and both spatially
+    # intersect the polygon.
+    assert list(zip(got["lid"], got["rid"])) == [(1, 10)]
 
 
 @pytest.mark.skipif(
