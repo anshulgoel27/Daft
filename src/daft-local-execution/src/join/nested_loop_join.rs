@@ -967,4 +967,39 @@ mod acceleration_tests {
         );
         assert!(extract(e).is_none());
     }
+
+    /// The guard is a strict `< 0.0`, so an exact-zero distance is the
+    /// boundary value that must still be accelerated, with pad reported as
+    /// 0.0. Pins against a future `<= 0.0` typo that would silently start
+    /// refusing valid zero-distance `st_dwithin` queries.
+    #[test]
+    fn dwithin_zero_distance_is_accelerated_with_zero_pad() {
+        let e = daft_geo::st_dwithin::st_dwithin(
+            unresolved_col("a"),
+            unresolved_col("b"),
+            daft_dsl::lit(0.0),
+        );
+        let (_, _, pad) = extract(e).expect("st_dwithin(a, b, 0.0) should be accelerated");
+        assert_eq!(pad, 0.0);
+    }
+
+    #[test]
+    fn dwithin_nan_distance_is_not_accelerated() {
+        let e = daft_geo::st_dwithin::st_dwithin(
+            unresolved_col("a"),
+            unresolved_col("b"),
+            daft_dsl::lit(f64::NAN),
+        );
+        assert!(extract(e).is_none());
+    }
+
+    #[test]
+    fn dwithin_infinite_distance_is_not_accelerated() {
+        let e = daft_geo::st_dwithin::st_dwithin(
+            unresolved_col("a"),
+            unresolved_col("b"),
+            daft_dsl::lit(f64::INFINITY),
+        );
+        assert!(extract(e).is_none());
+    }
 }
