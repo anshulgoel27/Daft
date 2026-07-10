@@ -150,6 +150,58 @@ fn source_with_tasks(source_plan: &LogicalPlan, tasks: Vec<ScanTaskRef>) -> Arc<
     Arc::new(LogicalPlan::Source(new_source))
 }
 
+/// One sub-join to materialize during the collocated rewrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubJoin<K> {
+    /// Left tasks with no resolvable partition value × ALL right tasks.
+    LeftUnkeyedVsAllRight,
+    /// Right tasks with no resolvable partition value × left KEYED tasks only
+    /// (left-unkeyed × right-unkeyed is already covered by the arm above —
+    /// pairing against ALL left tasks would emit those pairs twice).
+    RightUnkeyedVsKeyedLeft,
+    /// One partition value present on both sides.
+    KeyedPair(K),
+}
+
+/// Decide the sub-joins for the rewrite, given each side's group keys
+/// (`None` = tasks with no resolvable partition value for the shared column).
+///
+/// Returns `None` to abort the rewrite: when both sides have keyed groups but
+/// not a single value pairs up, the mismatch is systematic (e.g. the two sides
+/// inferred different partition-value dtypes, so no `PartitionSpec` can ever
+/// compare equal), not a genuine absence — only the original, un-split join is
+/// safe. A *partial* pairing, by contrast, is genuine: this rewrite only fires
+/// for Inner joins, where a left value absent on the right correctly
+/// contributes zero rows, so unpaired keyed groups are simply skipped.
+fn plan_sub_joins<K: Eq + std::hash::Hash + Clone>(
+    l_keys: &[Option<K>],
+    r_keys: &[Option<K>],
+) -> Option<Vec<SubJoin<K>>> {
+    let l_keyed: Vec<&K> = l_keys.iter().flatten().collect();
+    let r_keyed: std::collections::HashSet<&K> = r_keys.iter().flatten().collect();
+    let l_has_unkeyed = l_keys.iter().any(Option::is_none);
+    let r_has_unkeyed = r_keys.iter().any(Option::is_none);
+
+    let pairs: Vec<&K> = l_keyed
+        .iter()
+        .copied()
+        .filter(|k| r_keyed.contains(*k))
+        .collect();
+    if !l_keyed.is_empty() && !r_keyed.is_empty() && pairs.is_empty() {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    if l_has_unkeyed {
+        out.push(SubJoin::LeftUnkeyedVsAllRight);
+    }
+    if r_has_unkeyed && !l_keyed.is_empty() {
+        out.push(SubJoin::RightUnkeyedVsKeyedLeft);
+    }
+    out.extend(pairs.into_iter().cloned().map(SubJoin::KeyedPair));
+    Some(out)
+}
+
 // ── rule body ─────────────────────────────────────────────────────────────────
 
 impl CollocatedJoin {
@@ -188,15 +240,22 @@ impl CollocatedJoin {
         let l_groups = group_tasks_by_partition_col(&l_tasks, pk_col);
         let r_groups = group_tasks_by_partition_col(&r_tasks, pk_col);
 
-        // Build one sub-join per partition value present in both sides.
-        let mut sub_plans: Vec<Arc<LogicalPlan>> = Vec::new();
+        let l_keys: Vec<Option<PartitionSpec>> = l_groups.keys().cloned().collect();
+        let r_keys: Vec<Option<PartitionSpec>> = r_groups.keys().cloned().collect();
+        let Some(planned) = plan_sub_joins(&l_keys, &r_keys) else {
+            // Systematic partition-value mismatch: fall back to the original join.
+            return Ok(Transformed::no(plan));
+        };
+        // A single sub-join can't reduce peak memory; keep the original plan.
+        if planned.len() <= 1 {
+            return Ok(Transformed::no(plan));
+        }
 
-        // Handle any tasks whose partition spec was None or missing the column
-        // conservatively by joining against all R tasks (rare in practice).
-        if let Some(l_unkeyed) = l_groups.get(&None::<PartitionSpec>) {
-            let r_all: Vec<ScanTaskRef> = r_tasks.iter().cloned().collect();
-            let l_src = source_with_tasks(&join.left, l_unkeyed.to_vec());
-            let r_src = source_with_tasks(&join.right, r_all);
+        let make_sub_join = |l_tasks_sub: Vec<ScanTaskRef>,
+                             r_tasks_sub: Vec<ScanTaskRef>|
+         -> DaftResult<Arc<LogicalPlan>> {
+            let l_src = source_with_tasks(&join.left, l_tasks_sub);
+            let r_src = source_with_tasks(&join.right, r_tasks_sub);
             let sub = Join::try_new(
                 l_src,
                 r_src,
@@ -204,36 +263,35 @@ impl CollocatedJoin {
                 join.join_type,
                 join.join_strategy,
             )?;
-            sub_plans.push(Arc::new(LogicalPlan::Join(sub)));
-        }
+            Ok(Arc::new(LogicalPlan::Join(sub)))
+        };
 
-        for (pspec_opt, l_subtasks) in &l_groups {
-            let pspec = match pspec_opt {
-                Some(ps) => ps,
-                None => continue, // already handled above
-            };
-            let r_subtasks = match r_groups.get(&Some(pspec.clone())) {
-                Some(tasks) => tasks,
-                None => continue,
-            };
-            let l_src = source_with_tasks(&join.left, l_subtasks.to_vec());
-            let r_src = source_with_tasks(&join.right, r_subtasks.to_vec());
-            let sub = Join::try_new(
-                l_src,
-                r_src,
-                join.on.clone(),
-                join.join_type,
-                join.join_strategy,
-            )?;
-            sub_plans.push(Arc::new(LogicalPlan::Join(sub)));
-        }
+        let l_keyed_tasks: Vec<ScanTaskRef> = l_groups
+            .iter()
+            .filter(|(k, _)| k.is_some())
+            .flat_map(|(_, ts)| ts.iter().cloned())
+            .collect();
 
-        if sub_plans.is_empty() {
-            return Ok(Transformed::no(plan));
-        }
-        // Only one partition? No gain from wrapping in Concat.
-        if sub_plans.len() == 1 && l_groups.get(&None).is_none() {
-            return Ok(Transformed::no(plan));
+        let mut sub_plans: Vec<Arc<LogicalPlan>> = Vec::with_capacity(planned.len());
+        for sub in planned {
+            match sub {
+                SubJoin::LeftUnkeyedVsAllRight => {
+                    let l_unkeyed = l_groups.get(&None).expect("planned implies present");
+                    sub_plans.push(make_sub_join(
+                        l_unkeyed.clone(),
+                        r_tasks.iter().cloned().collect(),
+                    )?);
+                }
+                SubJoin::RightUnkeyedVsKeyedLeft => {
+                    let r_unkeyed = r_groups.get(&None).expect("planned implies present");
+                    sub_plans.push(make_sub_join(l_keyed_tasks.clone(), r_unkeyed.clone())?);
+                }
+                SubJoin::KeyedPair(ps) => {
+                    let l_sub = l_groups.get(&Some(ps.clone())).expect("planned implies present");
+                    let r_sub = r_groups.get(&Some(ps)).expect("planned implies present");
+                    sub_plans.push(make_sub_join(l_sub.clone(), r_sub.clone())?);
+                }
+            }
         }
 
         // Fold sub-plans into a left-leaning Concat tree.
@@ -247,5 +305,89 @@ impl CollocatedJoin {
             .unwrap();
 
         Ok(Transformed::yes(result))
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+
+    // K = i32 stands in for PartitionSpec: the planner is generic over the key.
+
+    #[test]
+    fn keyed_pairs_and_partial_overlap() {
+        // Left has {1,2,3}, right has {2,3,4}: pairs {2,3}; 1 and 4 are genuine
+        // inner-join misses and are correctly skipped (no abort).
+        let l = vec![Some(1), Some(2), Some(3)];
+        let r = vec![Some(2), Some(3), Some(4)];
+        let plan = plan_sub_joins(&l, &r).expect("partial overlap must not abort");
+        assert!(plan.contains(&SubJoin::KeyedPair(2)));
+        assert!(plan.contains(&SubJoin::KeyedPair(3)));
+        assert_eq!(plan.len(), 2);
+    }
+
+    #[test]
+    fn right_unkeyed_tasks_are_joined_against_keyed_left() {
+        let l = vec![Some(1), Some(2)];
+        let r = vec![Some(1), None];
+        let plan = plan_sub_joins(&l, &r).unwrap();
+        assert!(plan.contains(&SubJoin::RightUnkeyedVsKeyedLeft));
+        assert!(plan.contains(&SubJoin::KeyedPair(1)));
+    }
+
+    #[test]
+    fn unkeyed_on_both_sides_is_not_double_counted() {
+        // left-unkeyed × right-unkeyed must be covered by LeftUnkeyedVsAllRight
+        // ONLY (RightUnkeyedVsKeyedLeft pairs with keyed left tasks exclusively).
+        let l = vec![Some(1), None];
+        let r = vec![Some(1), None];
+        let plan = plan_sub_joins(&l, &r).unwrap();
+        assert!(plan.contains(&SubJoin::LeftUnkeyedVsAllRight));
+        assert!(plan.contains(&SubJoin::RightUnkeyedVsKeyedLeft));
+        assert!(plan.contains(&SubJoin::KeyedPair(1)));
+        assert_eq!(plan.len(), 3);
+    }
+
+    #[test]
+    fn systematic_mismatch_aborts() {
+        // Both sides keyed, zero pairs: e.g. dtype-divergent PartitionSpecs that can
+        // never compare equal. Skipping would silently drop every row — abort instead.
+        let l = vec![Some(1), Some(2)];
+        let r = vec![Some(10), Some(20)];
+        assert!(plan_sub_joins(&l, &r).is_none());
+    }
+
+    #[test]
+    fn systematic_mismatch_with_left_unkeyed_still_aborts() {
+        // The dangerous variant: a left unkeyed group used to bypass the guards and
+        // fire a rewrite that drops all keyed left tasks.
+        let l = vec![Some(1), Some(2), None];
+        let r = vec![Some(10)];
+        assert!(plan_sub_joins(&l, &r).is_none());
+    }
+
+    #[test]
+    fn all_right_unkeyed_pairs_with_keyed_left() {
+        // e.g. differently-named partition column on the right: every right task
+        // groups under None; keyed left must still see them.
+        let l = vec![Some(1), Some(2)];
+        let r = vec![None];
+        let plan = plan_sub_joins(&l, &r).unwrap();
+        assert_eq!(plan, vec![SubJoin::RightUnkeyedVsKeyedLeft]);
+    }
+
+    #[test]
+    fn find_shared_partition_key_requires_both_sides() {
+        use daft_dsl::resolved_col;
+        let l_pkeys = vec!["region".to_string()];
+        let r_pkeys: Vec<String> = vec![];
+        let l_eq = vec![resolved_col("region")];
+        let r_eq = vec![resolved_col("region")];
+        assert_eq!(find_shared_partition_key(&l_pkeys, &r_pkeys, &l_eq, &r_eq), None);
+        let r_pkeys = vec!["region".to_string()];
+        assert_eq!(
+            find_shared_partition_key(&l_pkeys, &r_pkeys, &l_eq, &r_eq),
+            Some("region")
+        );
     }
 }
