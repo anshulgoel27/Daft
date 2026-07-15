@@ -167,8 +167,11 @@ impl PipelineNodeImpl for SpatialHashJoinNode {
                                 phys_right,
                                 self.spatial_filter.clone(),
                                 self.build_side,
-                                None, // no per-key partition; each hash partition already
-                                      // contains only rows with compatible partition keys
+                                None, // no per-key R-tree grouping in the distributed path;
+                                      // the equi-keys are enforced by `spatial_filter`, which
+                                      // carries the full ON predicate — hash-partitioning
+                                      // alone does NOT prevent different key values from
+                                      // sharing a partition.
                                 self.config.schema.clone(),
                                 StatsState::NotMaterialized,
                                 LocalNodeContext::new(Some(self.node_id() as usize)),

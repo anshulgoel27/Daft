@@ -2,8 +2,8 @@
 
 Overview
 --------
-A *spatial index* is a small JSON sidecar file (``_spatial_index.json``)
-stored alongside a directory of parquet files.  It records the spatial
+A *spatial index* is a small inverted-Parquet sidecar file
+(``_spatial_index.idx``) stored alongside a directory of parquet files.  It records the spatial
 coverage of each file so the ``SpatialPartitionPruning`` optimizer rule can
 skip files that cannot possibly intersect the query geometry.
 
@@ -557,7 +557,7 @@ def build_spatial_index(
     h3_resolution: int = DEFAULT_H3_RESOLUTION,
     max_cells_per_file: Optional[int] = None,
 ) -> dict:
-    """Scan every parquet file in *directory* and write ``_spatial_index.json``.
+    """Scan every parquet file in *directory* and write ``_spatial_index.idx``.
 
     Parameters
     ----------
@@ -567,7 +567,7 @@ def build_spatial_index(
         Name of the WKB-encoded geometry column.
     output_path:
         Path for the index file.  Defaults to
-        ``{directory}/_spatial_index.json``.
+        ``{directory}/_spatial_index.idx``.
     glob_pattern:
         Glob pattern for parquet files within *directory*.
     h3_resolution:
@@ -686,14 +686,14 @@ def _build_h3_index(
         for fut in as_completed(futs):
             scan_results[futs[fut]] = fut.result()
 
-    file_mbrs = {fp: r[0] for fp, r in scan_results.items()}
+    per_file_mbr = {fp: r[0] for fp, r in scan_results.items()}
 
     # ── Determine a single safe resolution for ALL files ──────────────────
     # Resolution capping only matters for polygon/MBR-indexed files (those that
     # go through polyfill or grid-walk).  Pure-point files map each point to
     # exactly one cell at any resolution, so their MBR size is irrelevant.
     all_points = all(r[1] for r in scan_results.values() if r[0] is not None)
-    valid_mbrs = [m for m in file_mbrs.values() if m is not None]
+    valid_mbrs = [m for m in per_file_mbr.values() if m is not None]
     if valid_mbrs and not all_points:
         ux0 = min(m[0] for m in valid_mbrs)
         uy0 = min(m[1] for m in valid_mbrs)
@@ -799,8 +799,10 @@ class SpatialIndex:
         Path to the ``.idx`` Parquet file (used for lazy queries).
     file_h3_cells : dict
         ``{basename: [cell_str, ...]}`` — H3 cells covering each file.
-        Populated lazily on first full load; prefer ``filter_paths`` for
-        query-time pruning which reads only the relevant rows.
+        A property: accessing it triggers a full materialization of the
+        index sidecar on first access if it hasn't been loaded yet (see
+        ``load_full``). Prefer ``filter_paths`` for query-time pruning,
+        which reads only the relevant rows instead of the whole sidecar.
     """
 
     def __init__(
@@ -812,7 +814,7 @@ class SpatialIndex:
         index_path: Optional[str] = None,
     ):
         self.geom_col = geom_col
-        self.file_h3_cells: dict[str, list[str]] = file_h3_cells or {}
+        self._file_h3_cells: dict[str, list[str]] = file_h3_cells or {}
         self.h3_resolution = h3_resolution
         self.index_path = index_path
 
@@ -827,16 +829,40 @@ class SpatialIndex:
         # Don't load all rows yet — filter_paths will query lazily
         return cls(geom_col=geom_col, h3_resolution=h3_resolution, index_path=path)
 
-    def _load_full(self) -> None:
-        """Materialise the full forward dict (for repr / introspection)."""
-        if self.file_h3_cells or self.index_path is None:
-            return
+    @property
+    def file_h3_cells(self) -> dict[str, list[str]]:
+        """``{basename: [cell_str, ...]}`` — H3 cells covering each file.
+
+        Triggers ``load_full`` on first access to materialise the full
+        forward dict from the ``.idx`` sidecar. Prefer ``filter_paths`` for
+        query-time pruning, which reads only the relevant rows.
+        """
+        self.load_full()
+        return self._file_h3_cells
+
+    def load_full(self) -> "SpatialIndex":
+        """Eagerly materialise the full forward ``{filename: [cell, ...]}`` map.
+
+        Populates ``file_h3_cells`` (and this call becomes a no-op) once the
+        sidecar has been loaded, or immediately if ``index_path`` is unset.
+        Useful for repr / introspection / debugging, where the whole index is
+        needed rather than the lazy, query-scoped reads that ``filter_paths``
+        performs.
+
+        Returns
+        -------
+        SpatialIndex
+            ``self``, for chaining, e.g. ``SpatialIndex.load(path).load_full()``.
+        """
+        if self._file_h3_cells or self.index_path is None:
+            return self
         import pyarrow.parquet as pq
         tbl = pq.read_table(self.index_path, columns=["h3_cell", "filename"])
         d: dict[str, list[str]] = {}
         for cell, fname in zip(tbl["h3_cell"].to_pylist(), tbl["filename"].to_pylist()):
             d.setdefault(fname, []).append(cell)
-        self.file_h3_cells = d
+        self._file_h3_cells = d
+        return self
 
     def filter_paths(
         self,
@@ -960,7 +986,7 @@ def spatial_join(
 
     Before running the join, the function:
 
-    1. Detects which side has a ``_spatial_index.json`` (the *probe* side).
+    1. Detects which side has a ``_spatial_index.idx`` (the *probe* side).
     2. Materialises the *build* side's geometry column (the other side).
     3. Computes a union bounding geometry from the build side.
     4. Uses the spatial index to skip probe-side partitions that cannot
@@ -971,7 +997,7 @@ def spatial_join(
     ----------
     left, right:
         Either a ``daft.DataFrame`` or a directory path (str) containing
-        hive-partitioned parquet files with a ``_spatial_index.json`` sidecar.
+        hive-partitioned parquet files with a ``_spatial_index.idx`` sidecar.
     predicate:
         Spatial SQL function name.  One of ``"st_contains"``,
         ``"st_intersects"``, ``"st_within"``.  Applied as

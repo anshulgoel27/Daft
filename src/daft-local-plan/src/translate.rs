@@ -4,13 +4,13 @@ use common_error::{DaftError, DaftResult};
 use common_treenode::{Transformed, TreeNode, TreeNodeRecursion};
 use daft_core::{join::{JoinSide, JoinStrategy}, prelude::Schema};
 use daft_dsl::{
-    Expr, ExprRef, ResolvedColumn,
+    Expr, ExprRef,
     expr::{
         Column,
         agg::extract_agg_expr,
         bound_expr::{BoundAggExpr, BoundExpr, BoundVLLMExpr, BoundWindowExpr},
     },
-    join::normalize_join_keys,
+    join::{normalize_join_keys, strip_join_side_cols},
     resolved_col, unresolved_col, window_to_agg_exprs,
 };
 use daft_functions::random::random_int_expr;
@@ -67,20 +67,6 @@ fn rebind_predicate(expr: ExprRef, schema: &Schema) -> DaftResult<BoundExpr> {
         })?
         .data;
     BoundExpr::try_new(unbound, schema)
-}
-
-/// Convert `ResolvedColumn::JoinSide(field, _)` markers in a join residual predicate
-/// into plain unresolved column references (by the post-deduplication field name),
-/// so the predicate can be re-bound against the join output schema.
-fn strip_join_side_cols(expr: ExprRef) -> DaftResult<ExprRef> {
-    Ok(expr
-        .transform(|e| match e.as_ref() {
-            Expr::Column(Column::Resolved(ResolvedColumn::JoinSide(field, _))) => {
-                Ok(Transformed::yes(unresolved_col(field.name.clone())))
-            }
-            _ => Ok(Transformed::no(e)),
-        })?
-        .data)
 }
 
 /// Build the R-tree-backed `NestedLoopJoin` for a spatial-predicate inner join.
@@ -157,6 +143,15 @@ fn build_spatial_nested_loop_join(
         };
         let probe_idx = phys_left.schema().get_index(&probe_col_name).ok()?;
         let build_idx = phys_right.schema().get_index(&build_col_name).ok()?;
+        // Grouping compares raw per-side values via `str_value`. Equal values of
+        // DIFFERENT dtypes can render differently (e.g. Date vs Timestamp), which
+        // would place matching keys in different groups and silently drop rows —
+        // now that the filter is complete, grouping must be match-preserving.
+        if phys_left.schema().fields()[probe_idx].dtype
+            != phys_right.schema().fields()[build_idx].dtype
+        {
+            return None;
+        }
         Some([build_idx, probe_idx])
     })();
 
@@ -283,9 +278,16 @@ fn translate_helper(
                         let (right_plan, right_inputs) =
                             translate_helper(&join.right, source_counter, psets)?;
                         left_inputs.extend(right_inputs);
+                        // Fold the join's own ON condition (if any) into the NLJ filter
+                        // so its equality conjuncts are actually evaluated — they are
+                        // not enforced by candidate generation.
+                        let mut predicate = filter.predicate.clone();
+                        if let Some(on_expr) = join.on.inner() {
+                            predicate = predicate.and(strip_join_side_cols(on_expr.clone())?);
+                        }
                         return build_spatial_nested_loop_join(
                             join,
-                            filter.predicate.clone(),
+                            predicate,
                             left_plan,
                             right_plan,
                             left_inputs,
@@ -653,7 +655,13 @@ fn translate_helper(
             if !remaining_on.is_empty() {
                 let resid = remaining_on.inner().expect("non-empty residual has an expr").clone();
                 if join.join_type == JoinType::Inner && is_spatial_predicate(&resid) {
-                    let predicate = strip_join_side_cols(resid)?;
+                    // The NLJ filter is the ONLY place join semantics are enforced —
+                    // candidate generation (R-tree, per-key grouping) is a superset
+                    // optimization. Pass the FULL on-predicate (equality AND spatial),
+                    // never just the residual: partition grouping may fail to resolve
+                    // (composite keys, expression keys) and must not carry semantics.
+                    let full_on = join.on.inner().expect("non-empty on has an expr").clone();
+                    let predicate = strip_join_side_cols(full_on)?;
                     return build_spatial_nested_loop_join(
                         join,
                         predicate,

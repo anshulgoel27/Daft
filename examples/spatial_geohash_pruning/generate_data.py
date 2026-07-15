@@ -2,7 +2,7 @@
 
 Creates (by default):
   - points/        : 10 000 000 random points, written as spatially partitioned
-                     parquet files with a ``_spatial_index.json`` sidecar per
+                     parquet files with a ``_spatial_index.idx`` sidecar per
                      partition directory.
   - polygons/      : 5 000 000 random small bounding-box polygons, similarly
                      partitioned and indexed.

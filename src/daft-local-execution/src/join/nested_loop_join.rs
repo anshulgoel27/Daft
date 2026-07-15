@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::{Arc, LazyLock}};
 use common_display::table_display::StrValue;
 use common_error::DaftResult;
 use common_metrics::ops::NodeType;
-use daft_core::{join::JoinSide, prelude::{SchemaRef, UInt64Array}};
+use daft_core::{join::JoinSide, prelude::{Operator, SchemaRef, UInt64Array}};
 use daft_dsl::{
     Expr, ExprRef,
     expr::{Column, bound_expr::BoundExpr},
@@ -76,20 +76,24 @@ struct PartitionedRTreeState {
 
 const SPATIAL_FNS: &[&str] = &[
     "st_intersects", "st_contains", "st_within", "st_covers",
-    "st_covered_by", "st_disjoint", "st_touches", "st_overlaps",
+    "st_covered_by", "st_touches", "st_overlaps",
     "st_crosses", "st_equals", "st_dwithin",
 ];
 
 // ── Column-index extraction (no TreeNode dependency) ─────────────────────
 
 /// Recursively walk `expr` looking for a spatial function call.
-/// Returns `Some((build_local_col, probe_local_col))` on success.
+/// Returns `Some((build_local_col, probe_local_col, required_pad))` on success,
+/// where `required_pad` is the R-tree query-box padding required by the
+/// SPECIFIC node that was selected — never a different node's. This is the
+/// single source of truth for both column selection and padding, so the two
+/// can never disagree (see the `mixed_or_and_dwithin_...` regression test).
 fn extract_from_expr(
     expr: &ExprRef,
     build_side: JoinSide,
     output_schema_len: usize,
     build_n: usize,
-) -> Option<(usize, usize)> {
+) -> Option<(usize, usize, f64)> {
     match expr.as_ref() {
         Expr::ScalarFn(daft_dsl::functions::scalar::ScalarFn::Builtin(sf)) => {
             if !SPATIAL_FNS.contains(&sf.name()) {
@@ -105,16 +109,38 @@ fn extract_from_expr(
                 Expr::Column(Column::Bound(bc)) => bc.index,
                 _ => return None,
             };
+
+            // `st_dwithin` requires the R-tree query box to be padded by its
+            // distance argument on all sides, or true matches whose bboxes
+            // don't already intersect would be missed. The distance must be
+            // a resolvable, non-negative, finite literal — anything else
+            // means the required pad is unknown, so acceleration on this
+            // node must be refused entirely (never default to 0.0, which
+            // would silently under-pad and drop rows). Other spatial
+            // predicates (st_intersects, st_contains, ...) are exact on the
+            // bbox-intersection candidate set, so they need no padding.
+            let pad = if sf.name() == "st_dwithin" {
+                let d = sf.inputs.required(2).ok()?;
+                let lit = d.as_literal()?;
+                let val = lit.as_f64().or_else(|| lit.as_i64().map(|v| v as f64))?;
+                if !val.is_finite() || val < 0.0 {
+                    return None;
+                }
+                val
+            } else {
+                0.0
+            };
+
             let probe_n = output_schema_len - build_n;
             match build_side {
                 JoinSide::Left => {
                     // output = [build(0..build_n) | probe(build_n..)]
                     if idx0 < build_n && idx1 >= build_n {
                         // arg0 = build geom, arg1 = probe geom
-                        Some((idx0, idx1 - build_n))
+                        Some((idx0, idx1 - build_n, pad))
                     } else if idx0 >= build_n && idx1 < build_n {
                         // arg0 = probe geom, arg1 = build geom
-                        Some((idx1, idx0 - build_n))
+                        Some((idx1, idx0 - build_n, pad))
                     } else {
                         None
                     }
@@ -123,21 +149,25 @@ fn extract_from_expr(
                     // output = [probe(0..probe_n) | build(probe_n..)]
                     if idx0 >= probe_n && idx1 < probe_n {
                         // arg0 = build geom, arg1 = probe geom
-                        Some((idx0 - probe_n, idx1))
+                        Some((idx0 - probe_n, idx1, pad))
                     } else if idx0 < probe_n && idx1 >= probe_n {
                         // arg0 = probe geom, arg1 = build geom
-                        Some((idx1 - probe_n, idx0))
+                        Some((idx1 - probe_n, idx0, pad))
                     } else {
                         None
                     }
                 }
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
+        // Only an AND-conjunction preserves superset-soundness: every true pair
+        // must satisfy the spatial conjunct, hence bbox-intersect. Under OR the
+        // other branch can be true for pairs whose bboxes do NOT intersect, and
+        // under NOT the truth of the wrapped predicate is inverted — in both
+        // cases bbox candidate generation would silently drop true rows.
+        Expr::BinaryOp { op: Operator::And, left, right } => {
             extract_from_expr(left, build_side, output_schema_len, build_n)
                 .or_else(|| extract_from_expr(right, build_side, output_schema_len, build_n))
         }
-        Expr::Not(inner) => extract_from_expr(inner, build_side, output_schema_len, build_n),
         _ => None,
     }
 }
@@ -147,28 +177,8 @@ fn extract_geom_col_indices(
     build_side: JoinSide,
     output_schema_len: usize,
     build_n: usize,
-) -> Option<(usize, usize)> {
+) -> Option<(usize, usize, f64)> {
     extract_from_expr(filter.inner(), build_side, output_schema_len, build_n)
-}
-
-/// Walk `expr` looking for an `st_dwithin` call and return its third argument
-/// (distance) as `f64`. Handles `BinaryOp` / `Not` wrappers like `extract_from_expr`.
-fn extract_dwithin_distance(expr: &ExprRef) -> Option<f64> {
-    match expr.as_ref() {
-        Expr::ScalarFn(daft_dsl::functions::scalar::ScalarFn::Builtin(sf))
-            if sf.name() == "st_dwithin" =>
-        {
-            let d = sf.inputs.required(2).ok()?;
-            d.as_literal().and_then(|l| {
-                l.as_f64().or_else(|| l.as_i64().map(|v| v as f64))
-            })
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            extract_dwithin_distance(left).or_else(|| extract_dwithin_distance(right))
-        }
-        Expr::Not(inner) => extract_dwithin_distance(inner),
-        _ => None,
-    }
 }
 
 // ── R-tree construction helpers ───────────────────────────────────────────
@@ -449,13 +459,17 @@ impl NestedLoopJoinOperator {
         build_n_cols: usize,
         partition_key: Option<(usize, usize)>,
     ) -> Self {
-        let geom_cols = extract_geom_col_indices(
+        // Single walk: column selection and pad both come from the same
+        // accelerated node, so they can never disagree (see module-level
+        // doc on `extract_from_expr`).
+        let extracted = extract_geom_col_indices(
             &filter,
             build_side,
             output_schema.len(),
             build_n_cols,
         );
-        let dwithin_distance = extract_dwithin_distance(filter.inner());
+        let geom_cols = extracted.map(|(build_col, probe_col, _)| (build_col, probe_col));
+        let dwithin_distance = extracted.map(|(_, _, pad)| pad);
         Self { filter, output_schema, build_side, geom_cols, partition_key, dwithin_distance }
     }
 }
@@ -802,5 +816,190 @@ impl JoinOperator for NestedLoopJoinOperator {
             format!("Filter = {}", self.filter.inner()),
             format!("Build Side = {:?}", self.build_side),
         ]
+    }
+}
+
+#[cfg(test)]
+mod acceleration_tests {
+    use daft_core::prelude::{DataType, Field, Schema};
+    use daft_dsl::{expr::bound_expr::BoundExpr, unresolved_col};
+
+    use super::*;
+
+    fn geom_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("a", DataType::Geometry),
+            Field::new("b", DataType::Geometry),
+        ])
+    }
+
+    /// 4-geometry-column schema used by tests that need the accelerated node
+    /// and a decoy node to straddle build/probe differently (see
+    /// `mixed_or_and_dwithin_uses_the_accelerated_nodes_distance`).
+    fn geom_schema4() -> Schema {
+        Schema::new(vec![
+            Field::new("a", DataType::Geometry),
+            Field::new("b", DataType::Geometry),
+            Field::new("c", DataType::Geometry),
+            Field::new("d", DataType::Geometry),
+        ])
+    }
+
+    fn extract(expr: daft_dsl::ExprRef) -> Option<(usize, usize, f64)> {
+        let bound = BoundExpr::try_new(expr, &geom_schema()).unwrap();
+        extract_geom_col_indices(&bound, JoinSide::Left, 2, 1)
+    }
+
+    #[test]
+    fn st_intersects_is_accelerated() {
+        let e = daft_geo::st_intersects::st_intersects(unresolved_col("a"), unresolved_col("b"));
+        assert!(extract(e).is_some());
+    }
+
+    #[test]
+    fn st_disjoint_is_never_accelerated() {
+        let e = daft_geo::st_disjoint::st_disjoint(unresolved_col("a"), unresolved_col("b"));
+        assert!(extract(e).is_none());
+    }
+
+    #[test]
+    fn negated_intersects_is_never_accelerated() {
+        let e = daft_geo::st_intersects::st_intersects(unresolved_col("a"), unresolved_col("b"))
+            .not();
+        assert!(extract(e).is_none());
+    }
+
+    #[test]
+    fn or_composed_intersects_is_never_accelerated() {
+        let spatial =
+            daft_geo::st_intersects::st_intersects(unresolved_col("a"), unresolved_col("b"));
+        let e = spatial.or(unresolved_col("a").is_null());
+        assert!(extract(e).is_none());
+    }
+
+    #[test]
+    fn and_composed_intersects_is_still_accelerated() {
+        let spatial =
+            daft_geo::st_intersects::st_intersects(unresolved_col("a"), unresolved_col("b"));
+        let e = spatial.and(unresolved_col("a").not_null());
+        assert!(extract(e).is_some());
+    }
+
+    /// Regression test for the divergent-walk soundness bug: column selection
+    /// and pad computation must both come from the SAME accelerated node.
+    ///
+    /// Schema: `[a, b, c, d]`, all Geometry, bound against a 4-column
+    /// pseudo "output schema" with `build_n = 3` (columns 0..3 = a, b, c are
+    /// build-local; column 3 = d is probe-local, at probe-local index 0).
+    ///
+    /// Filter: `(st_dwithin(a, b, 5) | <non-spatial>) & st_dwithin(c, d, 100)`.
+    ///
+    /// - The left `Or` branch is never descended into — only `And` recurses —
+    ///   so `st_dwithin(a, b, 5)` is structurally unreachable and can never be
+    ///   the accelerated node (it also happens to fail the build/probe
+    ///   straddle check on its own, since a and b are both build-local here;
+    ///   either reason alone is sufficient, so this test doesn't depend on
+    ///   which one applies).
+    /// - The right `st_dwithin(c, d, 100)` node has c build-local (idx 2 < 3)
+    ///   and d probe-local (idx 3 >= 3), so it straddles and IS selected as
+    ///   the accelerated node.
+    ///
+    /// Before the fix, column selection and pad computation were two
+    /// independent walks that could pick different nodes: columns from the
+    /// right node (2, 0) but pad from the left node (5.0). The fix must
+    /// report pad 100.0 — the distance belonging to the very node whose
+    /// columns were selected.
+    #[test]
+    fn mixed_or_and_dwithin_uses_the_accelerated_nodes_distance() {
+        let spatial_left = daft_geo::st_dwithin::st_dwithin(
+            unresolved_col("a"),
+            unresolved_col("b"),
+            daft_dsl::lit(5.0),
+        );
+        let non_spatial = unresolved_col("a").is_null();
+        let left_or = spatial_left.or(non_spatial);
+        let spatial_right = daft_geo::st_dwithin::st_dwithin(
+            unresolved_col("c"),
+            unresolved_col("d"),
+            daft_dsl::lit(100.0),
+        );
+        let filter_expr = left_or.and(spatial_right);
+
+        let bound = BoundExpr::try_new(filter_expr, &geom_schema4()).unwrap();
+        let result = extract_geom_col_indices(&bound, JoinSide::Left, 4, 3);
+
+        let (build_col, probe_col, pad) =
+            result.expect("st_dwithin(c,d,100) should be accelerated");
+        assert_eq!((build_col, probe_col), (2, 0));
+        assert_eq!(
+            pad, 100.0,
+            "pad must come from the accelerated node (c,d,100), not the unreachable (a,b,5) node"
+        );
+    }
+
+    #[test]
+    fn dwithin_with_non_literal_distance_is_not_accelerated() {
+        // Distance argument is a column reference, not a resolvable literal.
+        // The required pad is unknown, so acceleration must be refused
+        // entirely rather than silently defaulting to a pad of 0.0 (which
+        // would under-pad the R-tree query box and drop true matches).
+        let e = daft_geo::st_dwithin::st_dwithin(
+            unresolved_col("a"),
+            unresolved_col("b"),
+            unresolved_col("a"),
+        );
+        assert!(extract(e).is_none());
+    }
+
+    #[test]
+    fn st_intersects_pads_zero() {
+        let e = daft_geo::st_intersects::st_intersects(unresolved_col("a"), unresolved_col("b"));
+        let (_, _, pad) = extract(e).expect("st_intersects should be accelerated");
+        assert_eq!(pad, 0.0);
+    }
+
+    #[test]
+    fn dwithin_with_negative_distance_is_not_accelerated() {
+        let e = daft_geo::st_dwithin::st_dwithin(
+            unresolved_col("a"),
+            unresolved_col("b"),
+            daft_dsl::lit(-1.0),
+        );
+        assert!(extract(e).is_none());
+    }
+
+    /// The guard is a strict `< 0.0`, so an exact-zero distance is the
+    /// boundary value that must still be accelerated, with pad reported as
+    /// 0.0. Pins against a future `<= 0.0` typo that would silently start
+    /// refusing valid zero-distance `st_dwithin` queries.
+    #[test]
+    fn dwithin_zero_distance_is_accelerated_with_zero_pad() {
+        let e = daft_geo::st_dwithin::st_dwithin(
+            unresolved_col("a"),
+            unresolved_col("b"),
+            daft_dsl::lit(0.0),
+        );
+        let (_, _, pad) = extract(e).expect("st_dwithin(a, b, 0.0) should be accelerated");
+        assert_eq!(pad, 0.0);
+    }
+
+    #[test]
+    fn dwithin_nan_distance_is_not_accelerated() {
+        let e = daft_geo::st_dwithin::st_dwithin(
+            unresolved_col("a"),
+            unresolved_col("b"),
+            daft_dsl::lit(f64::NAN),
+        );
+        assert!(extract(e).is_none());
+    }
+
+    #[test]
+    fn dwithin_infinite_distance_is_not_accelerated() {
+        let e = daft_geo::st_dwithin::st_dwithin(
+            unresolved_col("a"),
+            unresolved_col("b"),
+            daft_dsl::lit(f64::INFINITY),
+        );
+        assert!(extract(e).is_none());
     }
 }
