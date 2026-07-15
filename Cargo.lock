@@ -1887,6 +1887,7 @@ version = "0.3.0-dev0"
 dependencies = [
  "common-io-config",
  "common-py-serde",
+ "log",
  "pyo3",
  "serde",
 ]
