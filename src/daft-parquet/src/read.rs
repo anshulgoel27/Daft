@@ -120,6 +120,22 @@ pub struct ParquetReadOptions {
     pub skipped_corrupt_files: SkippedCorruptFilesCollector,
 }
 
+impl ParquetReadOptions {
+    /// The exact whole-file size to trust for the remote HEAD-skip fast path, if
+    /// any.
+    ///
+    /// `size_bytes` is the whole-file size only for a full-file read. A split
+    /// scan task carries a `row_groups` subset and reports `size_bytes` as the
+    /// *chunk* size (the sum of that split's row-group compressed sizes), which
+    /// is smaller than the file. Trusting it would seek the footer at
+    /// `chunk_size - footer_len`, land mid-file, and fail as `CorruptFile`. So
+    /// the fast path is only safe when no row-group subset is requested;
+    /// otherwise the reader must HEAD to discover the true file size.
+    pub(crate) fn known_whole_file_size(&self) -> Option<usize> {
+        self.size_bytes.filter(|_| self.row_groups.is_none())
+    }
+}
+
 /// Per-file overrides for [`ParquetBulkReadOptions`].
 #[derive(Default, Clone)]
 pub struct PerFileOptions {
@@ -904,6 +920,75 @@ mod tests {
         assert!(
             is_parquet_corrupt(&err),
             "a genuinely wrong/stale size must classify as corrupt, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// Network-free decision test backing the split-scan-task footer fix.
+    ///
+    /// The known-size HEAD-skip fast path may only trust `size_bytes` as the
+    /// whole-file size for a full-file read. A split scan task carries a
+    /// `row_groups` subset and reports `size_bytes` as the *chunk* size (smaller
+    /// than the file), which must not be trusted to locate the footer.
+    #[test]
+    fn known_whole_file_size_is_trusted_only_without_a_row_group_subset() {
+        // Full-file read (no subset): a known size is the whole-file size -> trust it.
+        let full = ParquetReadOptions {
+            size_bytes: Some(9882),
+            ..Default::default()
+        };
+        assert_eq!(full.known_whole_file_size(), Some(9882));
+
+        // Split read: a row_groups subset means size_bytes is the *chunk* size,
+        // not the whole file -> must not be trusted (fall back to HEAD).
+        let split = ParquetReadOptions {
+            size_bytes: Some(1260),
+            row_groups: Some(vec![0]),
+            ..Default::default()
+        };
+        assert_eq!(
+            split.known_whole_file_size(),
+            None,
+            "a chunk-sized size_bytes with a row_groups subset must not be trusted as whole-file"
+        );
+    }
+
+    /// Regression test for the split-scan-task footer-corruption bug.
+    ///
+    /// A split scan task carries a `row_groups` subset and reports `size_bytes`
+    /// as the *chunk* size (the sum of that split's row-group compressed sizes),
+    /// which is smaller than the whole file. The known-size fast path must NOT
+    /// trust a chunk-sized `size_bytes` as the whole-file size -- doing so seeks
+    /// the footer mid-file and fails as `CorruptFile`. When a `row_groups`
+    /// subset is present, the reader must fall back to a HEAD to discover the
+    /// true file size instead.
+    #[tokio::test]
+    async fn row_group_subset_does_not_trust_chunk_size() -> DaftResult<()> {
+        let io_client = anonymous_io_client()?;
+        let io_stats = IOStatsContext::new("row_group_subset_does_not_trust_chunk_size");
+
+        let opts = ParquetReadOptions {
+            // Plausible-but-wrong as a whole-file size -- the same value that
+            // `wrong_size_fails_loudly` proves is fatal on the fast path --
+            // standing in for a split task's chunk size...
+            size_bytes: Some(1260),
+            // ...but a row-group subset is present, marking this a split read,
+            // so the chunk-sized `size_bytes` must not be trusted for the footer.
+            row_groups: Some(vec![0]),
+            ..Default::default()
+        };
+        let stream =
+            read_parquet(PUBLIC_PARQUET, io_client, Some(io_stats.clone()), opts).await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+        let num_rows: usize = batches.iter().map(|rb| rb.len()).sum();
+
+        assert!(
+            num_rows > 0,
+            "a row-group-subset read must succeed, not fail as corrupt on a chunk-sized size_bytes"
+        );
+        assert!(
+            io_stats.load_head_requests() >= 1,
+            "a chunk-sized size_bytes with a row_groups subset must fall back to a HEAD, not be trusted"
         );
         Ok(())
     }

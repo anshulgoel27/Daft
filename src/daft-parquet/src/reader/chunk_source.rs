@@ -101,7 +101,7 @@ pub(super) async fn prepare_remote_chunk_source(
     io_stats: Option<daft_io::IOStatsRef>,
     opts: &ParquetReadOptions,
 ) -> crate::Result<(ChunkSourceBuilder, ArrowReaderMetadata)> {
-    let (parquet_metadata_res, file_size) = if let Some(known_size) = opts.size_bytes {
+    let (parquet_metadata_res, file_size) = if let Some(known_size) = opts.known_whole_file_size() {
         // The scan task already knows the exact file size (catalog log or LIST),
         // so skip the HEAD entirely and fetch the footer with an exact range.
         // Because no HEAD was issued, a footer/metadata failure here is most
