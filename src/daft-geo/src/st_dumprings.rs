@@ -1,14 +1,18 @@
 use common_error::DaftResult;
-use daft_core::prelude::{DataType, Field, Schema};
-use daft_core::series::Series;
+use daft_core::{
+    prelude::{DataType, Field, Schema},
+    series::Series,
+};
 use daft_dsl::{
+    functions::{scalar::ScalarFn, FunctionArgs, ScalarUDF},
     ExprRef,
-    functions::{FunctionArgs, ScalarUDF, scalar::ScalarFn},
 };
 use geo::{Geometry, Polygon};
 use serde::{Deserialize, Serialize};
 
-use crate::utils::{unary_geom_to_list_dump_item, validate_geometry_field};
+use crate::utils::{
+    dump_item_struct_fields, unary_geom_to_list_dump_item, validate_geometry_field,
+};
 
 fn polygon_rings_with_paths(polygon: &Polygon) -> Vec<(Vec<i64>, Geometry)> {
     if polygon.exterior().0.is_empty() && polygon.interiors().is_empty() {
@@ -61,10 +65,7 @@ impl ScalarUDF for StDumpRings {
         validate_geometry_field(&inputs, schema, 0, "geom", self.name())?;
         Ok(Field::new(
             self.name(),
-            DataType::List(Box::new(DataType::Struct(vec![
-                Field::new("path", DataType::List(Box::new(DataType::Int64))),
-                Field::new("geom", DataType::Geometry),
-            ]))),
+            DataType::List(Box::new(DataType::Struct(dump_item_struct_fields()))),
         ))
     }
 

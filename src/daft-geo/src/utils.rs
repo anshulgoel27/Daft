@@ -4,17 +4,28 @@ use arrow_buffer::NullBufferBuilder;
 use common_error::{DaftError, DaftResult};
 use daft_core::{
     prelude::{
-        BinaryArray, BooleanArray, DataType, Field, Float64Array, FullNull, Int64Array,
-        IntoSeries, ListArray, Schema, StructArray, Utf8Array,
+        BinaryArray, BooleanArray, DataType, Field, Float64Array, FullNull, Int64Array, IntoSeries,
+        ListArray, Schema, StructArray, Utf8Array,
     },
     series::Series,
 };
-use daft_dsl::{ExprRef, functions::FunctionArgs};
+use daft_dsl::{functions::FunctionArgs, ExprRef};
 use geo::{Geometry, MultiPolygon};
-use geo_traits::to_geo::ToGeoGeometry;
+use geo_traits::{to_geo::ToGeoGeometry, GeometryTrait};
 
 /// Encode a `geo::Geometry` into standard (ISO) little-endian WKB bytes.
 pub fn geom_to_wkb(geom: &Geometry) -> DaftResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    wkb::writer::write_geometry(&mut buf, geom, &wkb::writer::WriteOptions::default())
+        .map_err(|e| DaftError::ComputeError(format!("WKB write error: {e:?}")))?;
+    Ok(buf)
+}
+
+/// Encode any borrowed geo geometry object into standard (ISO) little-endian WKB bytes.
+pub fn geom_ref_to_wkb<G>(geom: &G) -> DaftResult<Vec<u8>>
+where
+    G: GeometryTrait<T = f64>,
+{
     let mut buf = Vec::new();
     wkb::writer::write_geometry(&mut buf, geom, &wkb::writer::WriteOptions::default())
         .map_err(|e| DaftError::ComputeError(format!("WKB write error: {e:?}")))?;
@@ -67,9 +78,7 @@ pub fn read_f64_arg_expr(
     expr.as_literal()
         .and_then(|l| l.as_f64().or_else(|| l.as_i64().map(|v| v as f64)))
         .ok_or_else(|| {
-            DaftError::ValueError(format!(
-                "{fn_name}: {name} must be a numeric literal"
-            ))
+            DaftError::ValueError(format!("{fn_name}: {name} must be a numeric literal"))
         })
 }
 
@@ -127,12 +136,9 @@ pub fn read_bool_arg_expr(
     let opt = inputs.optional((pos, name))?;
     match opt {
         None => Ok(false),
-        Some(expr) => expr
-            .as_literal()
-            .and_then(|l| l.as_bool())
-            .ok_or_else(|| {
-                DaftError::ValueError(format!("{fn_name}: {name} must be a boolean literal"))
-            }),
+        Some(expr) => expr.as_literal().and_then(|l| l.as_bool()).ok_or_else(|| {
+            DaftError::ValueError(format!("{fn_name}: {name} must be a boolean literal"))
+        }),
     }
 }
 
@@ -308,8 +314,7 @@ pub(crate) fn wkb_opts_to_geometry_series(
 
     let phys_field = Field::new(out_name, DataType::Binary);
     let phys_arr = BinaryArray::from_iter(&phys_field.name, phys_values.into_iter());
-    let logical =
-        LogicalArray::<GeometryType>::new(field, phys_arr.with_nulls(builder.finish())?);
+    let logical = LogicalArray::<GeometryType>::new(field, phys_arr.with_nulls(builder.finish())?);
     Ok(logical.into_series())
 }
 
@@ -334,7 +339,7 @@ pub(crate) fn wkb_offsets_to_geometry_list_series(
     Ok(ListArray::new(field, child_series, offsets, Some(nulls)).into_series())
 }
 
-fn dump_item_struct_fields() -> Vec<Field> {
+pub(crate) fn dump_item_struct_fields() -> Vec<Field> {
     vec![
         Field::new("path", DataType::List(Box::new(DataType::Int64))),
         Field::new("geom", DataType::Geometry),

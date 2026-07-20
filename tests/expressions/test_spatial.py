@@ -656,14 +656,21 @@ def test_st_dumprings_sql_postgis_projection_example_equivalent() -> None:
 def test_st_dumprings_sql_postgis_close_holes_scenario() -> None:
     """PostGIS close-hole scenario adapted to Daft: holes are within distance 1.0 of shell."""
     query = """
-        WITH rings AS (
-            SELECT st_astext(struct_get(explode(st_dumprings(st_geomfromtext('POLYGON ((
+        WITH dumped AS (
+            SELECT explode(st_dumprings(st_geomfromtext('POLYGON ((
                 0 0, 10 0, 10 10, 0 10, 0 0
             ), (
                 1 1, 1 2, 2 2, 2 1, 1 1
             ), (
                 8.5 1, 8.5 2, 9.5 2, 9.5 1, 8.5 1
-            ))'))), 'geom')) AS ring_wkt
+            ))'))) AS item
+        ),
+        rings AS (
+            SELECT
+                struct_get(item, 'path') AS ring_path,
+                st_astext(struct_get(item, 'geom')) AS ring_wkt
+            FROM dumped
+            ORDER BY ring_path[0]
         )
         SELECT
             st_dwithin(

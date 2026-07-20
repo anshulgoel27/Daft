@@ -1,58 +1,55 @@
 use common_error::DaftResult;
-use daft_core::prelude::{DataType, Field, Schema};
-use daft_core::series::Series;
+use daft_core::{
+    prelude::{DataType, Field, Schema},
+    series::Series,
+};
 use daft_dsl::{
+    functions::{scalar::ScalarFn, FunctionArgs, ScalarUDF},
     ExprRef,
-    functions::{FunctionArgs, ScalarUDF, scalar::ScalarFn},
 };
 use geo::Geometry;
 use serde::{Deserialize, Serialize};
 
-use crate::utils::{unary_geom_to_list_dump_item, validate_geometry_field};
+use crate::utils::{
+    dump_item_struct_fields, dump_items_to_list_struct_series, geom_ref_to_wkb, geom_to_wkb,
+    get_geometry_binary, parse_wkb, validate_geometry_field,
+};
 
-fn dump_geometry_parts_with_paths(geom: &Geometry, prefix: &[i64]) -> Vec<(Vec<i64>, Geometry)> {
+fn dump_geometry_parts_wkb_with_paths(
+    geom: &Geometry,
+    prefix: &[i64],
+    out: &mut Vec<(Vec<i64>, Option<Vec<u8>>)>,
+) {
     match geom {
-        Geometry::MultiPoint(multi_point) => multi_point
-            .0
-            .iter()
-            .enumerate()
-            .map(|(i, point)| {
+        Geometry::MultiPoint(multi_point) => {
+            for (i, point) in multi_point.0.iter().enumerate() {
                 let mut path = prefix.to_vec();
                 path.push((i + 1) as i64);
-                (path, Geometry::Point(point.clone()))
-            })
-            .collect(),
-        Geometry::MultiLineString(multi_line_string) => multi_line_string
-            .0
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
+                out.push((path, geom_ref_to_wkb(point).ok()));
+            }
+        }
+        Geometry::MultiLineString(multi_line_string) => {
+            for (i, line) in multi_line_string.0.iter().enumerate() {
                 let mut path = prefix.to_vec();
                 path.push((i + 1) as i64);
-                (path, Geometry::LineString(line.clone()))
-            })
-            .collect(),
-        Geometry::MultiPolygon(multi_polygon) => multi_polygon
-            .0
-            .iter()
-            .enumerate()
-            .map(|(i, poly)| {
+                out.push((path, geom_ref_to_wkb(line).ok()));
+            }
+        }
+        Geometry::MultiPolygon(multi_polygon) => {
+            for (i, poly) in multi_polygon.0.iter().enumerate() {
                 let mut path = prefix.to_vec();
                 path.push((i + 1) as i64);
-                (path, Geometry::Polygon(poly.clone()))
-            })
-            .collect(),
-        Geometry::GeometryCollection(collection) => collection
-            .0
-            .iter()
-            .enumerate()
-            .flat_map(|(i, child)| {
+                out.push((path, geom_ref_to_wkb(poly).ok()));
+            }
+        }
+        Geometry::GeometryCollection(collection) => {
+            for (i, child) in collection.0.iter().enumerate() {
                 let mut child_prefix = prefix.to_vec();
                 child_prefix.push((i + 1) as i64);
-                dump_geometry_parts_with_paths(child, &child_prefix)
-            })
-            .collect(),
-        _ => vec![(prefix.to_vec(), geom.clone())],
+                dump_geometry_parts_wkb_with_paths(child, &child_prefix, out);
+            }
+        }
+        _ => out.push((prefix.to_vec(), geom_to_wkb(geom).ok())),
     }
 }
 
@@ -70,9 +67,39 @@ impl ScalarUDF for StDump {
         inputs: FunctionArgs<Series>,
         _ctx: &daft_dsl::functions::scalar::EvalContext,
     ) -> DaftResult<Series> {
-        unary_geom_to_list_dump_item(inputs.required(0)?, self.name(), |geom| {
-            Some(dump_geometry_parts_with_paths(geom, &[]))
-        })
+        let series = inputs.required(0)?;
+        let binary = get_geometry_binary(series)?;
+
+        let len = binary.len();
+        let mut child_paths: Vec<Vec<i64>> = Vec::new();
+        let mut child_wkb_values: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut offsets: Vec<i64> = Vec::with_capacity(len + 1);
+        let mut outer_validity: Vec<bool> = Vec::with_capacity(len);
+        offsets.push(0);
+
+        for opt in binary.into_iter() {
+            match opt.and_then(|b| parse_wkb(b).ok()) {
+                Some(geom) => {
+                    outer_validity.push(true);
+                    let mut row_items: Vec<(Vec<i64>, Option<Vec<u8>>)> = Vec::new();
+                    dump_geometry_parts_wkb_with_paths(&geom, &[], &mut row_items);
+                    for (path, wkb) in row_items {
+                        child_paths.push(path);
+                        child_wkb_values.push(wkb);
+                    }
+                }
+                None => outer_validity.push(false),
+            }
+            offsets.push(child_wkb_values.len() as i64);
+        }
+
+        dump_items_to_list_struct_series(
+            self.name(),
+            child_paths,
+            child_wkb_values,
+            offsets,
+            outer_validity,
+        )
     }
 
     fn get_return_field(
@@ -83,10 +110,7 @@ impl ScalarUDF for StDump {
         validate_geometry_field(&inputs, schema, 0, "geom", self.name())?;
         Ok(Field::new(
             self.name(),
-            DataType::List(Box::new(DataType::Struct(vec![
-                Field::new("path", DataType::List(Box::new(DataType::Int64))),
-                Field::new("geom", DataType::Geometry),
-            ]))),
+            DataType::List(Box::new(DataType::Struct(dump_item_struct_fields()))),
         ))
     }
 
