@@ -139,31 +139,34 @@ def st_centroid(geom: Expression) -> Expression:
 
 
 def st_dump(geom: Expression) -> Expression:
-    """Return a list of geometry members for each input geometry.
+    """Return a list of dumped members with PostGIS-style path metadata.
 
-    Atomic geometries return a singleton list containing themselves. Multi-geometries
-    return one item per member. Geometry collections are recursively flattened.
+    Each output element is a struct ``{path, geom}``, where ``path`` is a list of
+    integer indexes describing the component location and ``geom`` is the component
+    geometry. Atomic geometries return a singleton element with an empty path.
+    Multi-geometries and geometry collections use 1-based path indexing.
 
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
 
     Returns:
-        ``List[Geometry]`` column.
+        ``List[Struct{path: List[Int64], geom: Geometry}]`` column.
     """
     return Expression._call_builtin_scalar_fn("st_dump", geom)
 
 
 def st_dumprings(geom: Expression) -> Expression:
-    """Return polygon rings as a list of closed LineString geometries.
+    """Return polygon rings with PostGIS-style path metadata.
 
-    Polygon inputs return the exterior ring first, followed by interior rings.
-    This function is polygon-only; non-polygonal inputs return null.
+    Each output element is a struct ``{path, geom}``, where ``geom`` is a single-ring
+    Polygon and ``path`` is ``[0]`` for the exterior ring, then ``[1..n]``
+    for interior rings. This function is polygon-only; non-polygonal inputs return null.
 
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
 
     Returns:
-        ``List[Geometry]`` column.
+        ``List[Struct{path: List[Int64], geom: Geometry}]`` column.
     """
     return Expression._call_builtin_scalar_fn("st_dumprings", geom)
 

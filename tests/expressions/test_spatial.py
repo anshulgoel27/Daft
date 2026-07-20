@@ -265,15 +265,24 @@ def test_st_dump_schema_and_python_sql_explode() -> None:
     )
     dumped = df.select(st_dump(st_geomfromtext(daft.col("g"))).alias("parts"))
 
-    assert dumped.schema()["parts"].dtype == daft.DataType.list(daft.DataType.geometry())
+    assert dumped.schema()["parts"].dtype == daft.DataType.list(
+        daft.DataType.struct({
+            "path": daft.DataType.list(daft.DataType.int64()),
+            "geom": daft.DataType.geometry(),
+        })
+    )
 
     py = (
         dumped.explode(daft.col("parts"), ignore_empty_and_null=True)
-        .select(st_astext(daft.col("parts")).alias("wkt"))
+        .select(
+            st_astext(daft.col("parts").get("geom")).alias("wkt"),
+            daft.col("parts").get("path").alias("path"),
+        )
         .to_pydict()
     )
     sql = daft.sql(
-        "SELECT st_astext(explode(st_dump(st_geomfromtext(g)))) AS wkt FROM df"
+        "SELECT st_astext(struct_get(explode(st_dump(st_geomfromtext(g))), 'geom')) AS wkt, "
+        "struct_get(explode(st_dump(st_geomfromtext(g))), 'path') AS path FROM df"
     ).to_pydict()
 
     expected = [
@@ -283,8 +292,11 @@ def test_st_dump_schema_and_python_sql_explode() -> None:
         "POINT(3 3)",
         "POINT(4 4)",
     ]
+    expected_paths = [[1], [2], [1], [2, 1], [2, 2]]
     assert py["wkt"] == expected
+    assert py["path"] == expected_paths
     assert sql["wkt"] == expected
+    assert sql["path"] == expected_paths
 
 
 def test_st_dump_postgis_multipolygon_scenario() -> None:
@@ -303,12 +315,30 @@ def test_st_dump_postgis_multipolygon_scenario() -> None:
 
     exploded = (
         df.explode(daft.col("parts"), ignore_empty_and_null=True)
-        .select(st_astext(daft.col("parts")).alias("wkt"))
+        .select(
+            st_astext(daft.col("parts").get("geom")).alias("wkt"),
+            daft.col("parts").get("path").alias("path"),
+        )
         .to_pydict()
     )
     assert exploded["wkt"] == [
         "POLYGON((0 0,0 9,9 9,9 0,0 0))",
         "POLYGON((10 10,10 19,19 19,19 10,10 10))",
+    ]
+    assert exploded["path"] == [[1], [2]]
+
+
+def test_st_dump_sql_postgis_multipolygon_primary_example() -> None:
+    """PostGIS-style SQL scenario: ST_Dump over MultiPolygon returns path and polygon members."""
+    out = daft.sql(
+        "SELECT "
+        "struct_get(explode(st_dump(st_geomfromtext('MULTIPOLYGON(((0 0, 0 2, 2 2, 2 0, 0 0)), ((10 10, 10 12, 12 12, 12 10, 10 10)))'))), 'path') AS path, "
+        "st_astext(struct_get(explode(st_dump(st_geomfromtext('MULTIPOLYGON(((0 0, 0 2, 2 2, 2 0, 0 0)), ((10 10, 10 12, 12 12, 12 10, 10 10)))'))), 'geom')) AS single_geom"
+    ).to_pydict()
+    assert out["path"] == [[1], [2]]
+    assert out["single_geom"] == [
+        "POLYGON((0 0,0 2,2 2,2 0,0 0))",
+        "POLYGON((10 10,10 12,12 12,12 10,10 10))",
     ]
 
 
@@ -328,7 +358,10 @@ def test_st_dump_postgis_geometry_collection_scenario() -> None:
     )
     exploded = (
         df.explode(daft.col("parts"), ignore_empty_and_null=True)
-        .select(st_astext(daft.col("parts")).alias("wkt"))
+        .select(
+            st_astext(daft.col("parts").get("geom")).alias("wkt"),
+            daft.col("parts").get("path").alias("path"),
+        )
         .to_pydict()
     )
     assert exploded["wkt"] == [
@@ -337,6 +370,7 @@ def test_st_dump_postgis_geometry_collection_scenario() -> None:
         "POINT(3 3)",
         "POINT(4 4)",
     ]
+    assert exploded["path"] == [[1], [2], [3, 1], [3, 2]]
 
 
 def test_st_dump_atomic_geometry_returns_singleton_list() -> None:
@@ -348,10 +382,14 @@ def test_st_dump_atomic_geometry_returns_singleton_list() -> None:
     )
     exploded = (
         df.explode(daft.col("parts"), ignore_empty_and_null=True)
-        .select(st_astext(daft.col("parts")).alias("wkt"))
+        .select(
+            st_astext(daft.col("parts").get("geom")).alias("wkt"),
+            daft.col("parts").get("path").alias("path"),
+        )
         .to_pydict()
     )
     assert exploded["wkt"] == ["POINT(7 8)"]
+    assert exploded["path"] == [[]]
 
 
 def test_st_dump_geometry_collection_nested_members_are_flattened() -> None:
@@ -364,10 +402,14 @@ def test_st_dump_geometry_collection_nested_members_are_flattened() -> None:
     )
     exploded = (
         df.explode(daft.col("parts"), ignore_empty_and_null=True)
-        .select(st_astext(daft.col("parts")).alias("wkt"))
+        .select(
+            st_astext(daft.col("parts").get("geom")).alias("wkt"),
+            daft.col("parts").get("path").alias("path"),
+        )
         .to_pydict()
     )
     assert exploded["wkt"] == ["POINT(1 1)", "POINT(2 2)", "POINT(3 3)"]
+    assert exploded["path"] == [[1], [2, 1], [2, 2]]
 
 
 def test_st_dump_failure_invalid_input_type() -> None:
@@ -398,23 +440,35 @@ def test_st_dumprings_schema_and_python_sql_explode() -> None:
     )
     dumped = df.select(st_dumprings(st_geomfromtext(daft.col("g"))).alias("rings"))
 
-    assert dumped.schema()["rings"].dtype == daft.DataType.list(daft.DataType.geometry())
+    assert dumped.schema()["rings"].dtype == daft.DataType.list(
+        daft.DataType.struct({
+            "path": daft.DataType.list(daft.DataType.int64()),
+            "geom": daft.DataType.geometry(),
+        })
+    )
 
     py = (
         dumped.explode(daft.col("rings"), ignore_empty_and_null=True)
-        .select(st_astext(daft.col("rings")).alias("wkt"))
+        .select(
+            st_astext(daft.col("rings").get("geom")).alias("wkt"),
+            daft.col("rings").get("path").alias("path"),
+        )
         .to_pydict()
     )
     sql = daft.sql(
-        "SELECT st_astext(explode(st_dumprings(st_geomfromtext(g)))) AS wkt FROM df"
+        "SELECT st_astext(struct_get(explode(st_dumprings(st_geomfromtext(g))), 'geom')) AS wkt, "
+        "struct_get(explode(st_dumprings(st_geomfromtext(g))), 'path') AS path FROM df"
     ).to_pydict()
 
     expected = [
-        "LINESTRING(0 0,4 0,4 4,0 4,0 0)",
-        "LINESTRING(1 1,1 2,2 2,2 1,1 1)",
+        "POLYGON((0 0,4 0,4 4,0 4,0 0))",
+        "POLYGON((1 1,1 2,2 2,2 1,1 1))",
     ]
+    expected_paths = [[0], [1]]
     assert py["wkt"] == expected
+    assert py["path"] == expected_paths
     assert sql["wkt"] == expected
+    assert sql["path"] == expected_paths
 
 
 def test_st_dumprings_postgis_polygon_with_holes() -> None:
@@ -434,14 +488,18 @@ def test_st_dumprings_postgis_polygon_with_holes() -> None:
 
     exploded = (
         df.explode(daft.col("rings"), ignore_empty_and_null=True)
-        .select(st_astext(daft.col("rings")).alias("wkt"))
+        .select(
+            st_astext(daft.col("rings").get("geom")).alias("wkt"),
+            daft.col("rings").get("path").alias("path"),
+        )
         .to_pydict()
     )
     assert exploded["wkt"] == [
-        "LINESTRING(0 0,0 10,10 10,10 0,0 0)",
-        "LINESTRING(1 1,1 9,9 9,9 1,1 1)",
-        "LINESTRING(2 2,2 4,4 4,4 2,2 2)",
+        "POLYGON((0 0,0 10,10 10,10 0,0 0))",
+        "POLYGON((1 1,1 9,9 9,9 1,1 1))",
+        "POLYGON((2 2,2 4,4 4,4 2,2 2))",
     ]
+    assert exploded["path"] == [[0], [1], [2]]
 
 
 def test_st_dumprings_failure_non_polygon_returns_null() -> None:
@@ -470,20 +528,24 @@ def test_st_dumprings_failure_invalid_input_type() -> None:
 def test_st_dump_sql_direct_execution() -> None:
     """SQL-first check: st_dump should work with direct SQL literals and explode."""
     out = daft.sql(
-        "SELECT st_astext(explode(st_dump(st_geomfromtext('MULTIPOINT((0 0),(1 1))')))) AS wkt"
+        "SELECT st_astext(struct_get(explode(st_dump(st_geomfromtext('MULTIPOINT((0 0),(1 1))'))), 'geom')) AS wkt, "
+        "struct_get(explode(st_dump(st_geomfromtext('MULTIPOINT((0 0),(1 1))'))), 'path') AS path"
     ).to_pydict()
     assert out["wkt"] == ["POINT(0 0)", "POINT(1 1)"]
+    assert out["path"] == [[1], [2]]
 
 
 def test_st_dumprings_sql_direct_execution() -> None:
     """SQL-first check: st_dumprings should return exterior then interior rings."""
     out = daft.sql(
-        "SELECT st_astext(explode(st_dumprings(st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0),(1 1,1 2,2 2,2 1,1 1))')))) AS wkt"
+        "SELECT st_astext(struct_get(explode(st_dumprings(st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0),(1 1,1 2,2 2,2 1,1 1))'))), 'geom')) AS wkt, "
+        "struct_get(explode(st_dumprings(st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0),(1 1,1 2,2 2,2 1,1 1))'))), 'path') AS path"
     ).to_pydict()
     assert out["wkt"] == [
-        "LINESTRING(0 0,4 0,4 4,0 4,0 0)",
-        "LINESTRING(1 1,1 2,2 2,2 1,1 1)",
+        "POLYGON((0 0,4 0,4 4,0 4,0 0))",
+        "POLYGON((1 1,1 2,2 2,2 1,1 1))",
     ]
+    assert out["path"] == [[0], [1]]
 
 
 def test_st_dumprings_sql_non_polygon_returns_null() -> None:
@@ -498,7 +560,7 @@ def test_st_dumprings_sql_non_polygon_returns_null() -> None:
 def test_st_dump_sql_postgis_compoundcurve_example() -> None:
     """PostGIS example: ST_Dump over COMPOUNDCURVE should emit two components."""
     out = daft.sql(
-        "SELECT st_astext(explode(st_dump(st_geomfromtext('COMPOUNDCURVE(CIRCULARSTRING(0 0,1 1,1 0),(1 0,0 1))')))) AS geom"
+        "SELECT st_astext(struct_get(explode(st_dump(st_geomfromtext('COMPOUNDCURVE(CIRCULARSTRING(0 0,1 1,1 0),(1 0,0 1))'))), 'geom')) AS geom"
     ).to_pydict()
     assert out["geom"] == [
         "CIRCULARSTRING(0 0,1 1,1 0)",
@@ -510,7 +572,7 @@ def test_st_dump_sql_postgis_compoundcurve_example() -> None:
 def test_st_dump_sql_postgis_polyhedralsurface_example() -> None:
     """PostGIS example: ST_Dump over POLYHEDRALSURFACE should emit six polygon faces."""
     out = daft.sql(
-        "SELECT st_astext(explode(st_dump(st_geomfromtext('POLYHEDRALSURFACE(((0 0 0,0 0 1,0 1 1,0 1 0,0 0 0)),((0 0 0,0 1 0,1 1 0,1 0 0,0 0 0)),((0 0 0,1 0 0,1 0 1,0 0 1,0 0 0)),((1 1 0,1 1 1,1 0 1,1 0 0,1 1 0)),((0 1 0,0 1 1,1 1 1,1 1 0,0 1 0)),((0 0 1,1 0 1,1 1 1,0 1 1,0 0 1)))')))) AS geom_ewkt"
+        "SELECT st_astext(struct_get(explode(st_dump(st_geomfromtext('POLYHEDRALSURFACE(((0 0 0,0 0 1,0 1 1,0 1 0,0 0 0)),((0 0 0,0 1 0,1 1 0,1 0 0,0 0 0)),((0 0 0,1 0 0,1 0 1,0 0 1,0 0 0)),((1 1 0,1 1 1,1 0 1,1 0 0,1 1 0)),((0 1 0,0 1 1,1 1 1,1 1 0,0 1 0)),((0 0 1,1 0 1,1 1 1,0 1 1,0 0 1)))'))), 'geom')) AS geom_ewkt"
     ).to_pydict()
     assert out["geom_ewkt"] == [
         "POLYGON((0 0 0,0 0 1,0 1 1,0 1 0,0 0 0))",
@@ -526,7 +588,7 @@ def test_st_dump_sql_postgis_polyhedralsurface_example() -> None:
 def test_st_dump_sql_postgis_tin_example() -> None:
     """PostGIS example: ST_Dump over TIN should emit triangle primitives."""
     out = daft.sql(
-        "SELECT st_astext(explode(st_dump(st_geomfromtext('TIN (((0 0 0,0 0 1,0 1 0,0 0 0)),((0 0 0,0 1 0,1 1 0,0 0 0)))')))) AS wkt"
+        "SELECT st_astext(struct_get(explode(st_dump(st_geomfromtext('TIN (((0 0 0,0 0 1,0 1 0,0 0 0)),((0 0 0,0 1 0,1 1 0,0 0 0)))'))), 'geom')) AS wkt"
     ).to_pydict()
     assert out["wkt"] == [
         "TRIANGLE((0 0 0,0 0 1,0 1 0,0 0 0))",
@@ -537,18 +599,21 @@ def test_st_dump_sql_postgis_tin_example() -> None:
 def test_st_dump_sql_postgis_supported_multilinestring_components() -> None:
     """Daft-supported subset of PostGIS scenario: ST_Dump over MULTILINESTRING emits components."""
     out = daft.sql(
-        "SELECT st_astext(explode(st_dump(st_geomfromtext('MULTILINESTRING((0 0,2 2),(2 0,0 2))')))) AS geom"
+        "SELECT st_astext(struct_get(explode(st_dump(st_geomfromtext('MULTILINESTRING((0 0,2 2),(2 0,0 2))'))), 'geom')) AS geom, "
+        "struct_get(explode(st_dump(st_geomfromtext('MULTILINESTRING((0 0,2 2),(2 0,0 2))'))), 'path') AS path"
     ).to_pydict()
     assert out["geom"] == [
         "LINESTRING(0 0,2 2)",
         "LINESTRING(2 0,0 2)",
     ]
+    assert out["path"] == [[1], [2]]
 
 
 def test_st_dump_sql_postgis_supported_multipoint_components() -> None:
     """Daft-supported subset of PostGIS scenario: ST_Dump over MULTIPOINT emits points."""
     out = daft.sql(
-        "SELECT st_astext(explode(st_dump(st_geomfromtext('MULTIPOINT((10 40),(40 30),(20 20),(30 10))')))) AS geom"
+        "SELECT st_astext(struct_get(explode(st_dump(st_geomfromtext('MULTIPOINT((10 40),(40 30),(20 20),(30 10))'))), 'geom')) AS geom, "
+        "struct_get(explode(st_dump(st_geomfromtext('MULTIPOINT((10 40),(40 30),(20 20),(30 10))'))), 'path') AS path"
     ).to_pydict()
     assert out["geom"] == [
         "POINT(10 40)",
@@ -556,32 +621,49 @@ def test_st_dump_sql_postgis_supported_multipoint_components() -> None:
         "POINT(20 20)",
         "POINT(30 10)",
     ]
+    assert out["path"] == [[1], [2], [3], [4]]
 
 
 def test_st_dumprings_sql_postgis_primary_example() -> None:
-    """PostGIS ST_DumpRings example adapted to Daft's List[Geometry] output."""
+    """PostGIS ST_DumpRings example adapted to Daft's List[Struct{path,geom}] output."""
     out = daft.sql(
-        "SELECT st_astext(explode(st_dumprings(st_geomfromtext('POLYGON ((1 9,9 9,9 1,1 1,1 9),(2 2,2 3,3 3,3 2,2 2),(4 2,4 4,6 4,6 2,4 2))')))) AS geom"
+        "SELECT st_astext(struct_get(explode(st_dumprings(st_geomfromtext('POLYGON ((1 9,9 9,9 1,1 1,1 9),(2 2,2 3,3 3,3 2,2 2),(4 2,4 4,6 4,6 2,4 2))'))), 'geom')) AS geom, "
+        "struct_get(explode(st_dumprings(st_geomfromtext('POLYGON ((1 9,9 9,9 1,1 1,1 9),(2 2,2 3,3 3,3 2,2 2),(4 2,4 4,6 4,6 2,4 2))'))), 'path') AS path"
     ).to_pydict()
     assert out["geom"] == [
-        "LINESTRING(1 9,9 9,9 1,1 1,1 9)",
-        "LINESTRING(2 2,2 3,3 3,3 2,2 2)",
-        "LINESTRING(4 2,4 4,6 4,6 2,4 2)",
+        "POLYGON((1 9,9 9,9 1,1 1,1 9))",
+        "POLYGON((2 2,2 3,3 3,3 2,2 2))",
+        "POLYGON((4 2,4 4,6 4,6 2,4 2))",
+    ]
+    assert out["path"] == [[0], [1], [2]]
+
+
+def test_st_dumprings_sql_postgis_projection_example_equivalent() -> None:
+    """Projection-style PostGIS ST_DumpRings use case, translated to Daft's explode/struct_get SQL form."""
+    out = daft.sql(
+        "SELECT "
+        "struct_get(explode(st_dumprings(st_geomfromtext('POLYGON ((1 9,9 9,9 1,1 1,1 9),(2 2,2 3,3 3,3 2,2 2),(4 2,4 4,6 4,6 2,4 2))'))), 'path') AS path, "
+        "st_astext(struct_get(explode(st_dumprings(st_geomfromtext('POLYGON ((1 9,9 9,9 1,1 1,1 9),(2 2,2 3,3 3,3 2,2 2),(4 2,4 4,6 4,6 2,4 2))'))), 'geom')) AS geom"
+    ).to_pydict()
+    assert out["path"] == [[0], [1], [2]]
+    assert out["geom"] == [
+        "POLYGON((1 9,9 9,9 1,1 1,1 9))",
+        "POLYGON((2 2,2 3,3 3,3 2,2 2))",
+        "POLYGON((4 2,4 4,6 4,6 2,4 2))",
     ]
 
 
-@pytest.mark.xfail(reason="Daft spatial distance/topology currently lacks full line-to-line semantics used by this PostGIS scenario")
 def test_st_dumprings_sql_postgis_close_holes_scenario() -> None:
     """PostGIS close-hole scenario adapted to Daft: holes are within distance 1.0 of shell."""
     query = """
         WITH rings AS (
-            SELECT st_astext(explode(st_dumprings(st_geomfromtext('POLYGON ((
+            SELECT st_astext(struct_get(explode(st_dumprings(st_geomfromtext('POLYGON ((
                 0 0, 10 0, 10 10, 0 10, 0 0
             ), (
                 1 1, 1 2, 2 2, 2 1, 1 1
             ), (
                 8.5 1, 8.5 2, 9.5 2, 9.5 1, 8.5 1
-            ))')))) AS ring_wkt
+            ))'))), 'geom')) AS ring_wkt
         )
         SELECT
             st_dwithin(
@@ -603,13 +685,15 @@ def test_st_dumprings_sql_postgis_close_holes_scenario() -> None:
 def test_st_dumprings_sql_postgis_supported_polygon_rings() -> None:
     """Daft-supported subset of PostGIS scenario: ST_DumpRings returns exterior and interior rings."""
     out = daft.sql(
-        "SELECT st_astext(explode(st_dumprings(st_geomfromtext('POLYGON((0 0,8 0,8 8,0 8,0 0),(1 1,1 3,3 3,3 1,1 1),(5 5,5 6,6 6,6 5,5 5))')))) AS geom"
+        "SELECT st_astext(struct_get(explode(st_dumprings(st_geomfromtext('POLYGON((0 0,8 0,8 8,0 8,0 0),(1 1,1 3,3 3,3 1,1 1),(5 5,5 6,6 6,6 5,5 5))'))), 'geom')) AS geom, "
+        "struct_get(explode(st_dumprings(st_geomfromtext('POLYGON((0 0,8 0,8 8,0 8,0 0),(1 1,1 3,3 3,3 1,1 1),(5 5,5 6,6 6,6 5,5 5))'))), 'path') AS path"
     ).to_pydict()
     assert out["geom"] == [
-        "LINESTRING(0 0,8 0,8 8,0 8,0 0)",
-        "LINESTRING(1 1,1 3,3 3,3 1,1 1)",
-        "LINESTRING(5 5,5 6,6 6,6 5,5 5)",
+        "POLYGON((0 0,8 0,8 8,0 8,0 0))",
+        "POLYGON((1 1,1 3,3 3,3 1,1 1))",
+        "POLYGON((5 5,5 6,6 6,6 5,5 5))",
     ]
+    assert out["path"] == [[0], [1], [2]]
 
 
 def test_sql_geodesic_distance():

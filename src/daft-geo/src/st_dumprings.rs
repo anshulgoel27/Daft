@@ -8,24 +8,30 @@ use daft_dsl::{
 use geo::{Geometry, Polygon};
 use serde::{Deserialize, Serialize};
 
-use crate::utils::{unary_geom_to_list_geom, validate_geometry_field};
+use crate::utils::{unary_geom_to_list_dump_item, validate_geometry_field};
 
-fn polygon_rings(polygon: &Polygon) -> Vec<Geometry> {
+fn polygon_rings_with_paths(polygon: &Polygon) -> Vec<(Vec<i64>, Geometry)> {
     if polygon.exterior().0.is_empty() && polygon.interiors().is_empty() {
         return Vec::new();
     }
 
     let mut rings = Vec::with_capacity(1 + polygon.interiors().len());
-    rings.push(Geometry::LineString(polygon.exterior().clone()));
-    for ring in polygon.interiors() {
-        rings.push(Geometry::LineString(ring.clone()));
+    rings.push((
+        vec![0],
+        Geometry::Polygon(Polygon::new(polygon.exterior().clone(), vec![])),
+    ));
+    for (i, ring) in polygon.interiors().iter().enumerate() {
+        rings.push((
+            vec![(i + 1) as i64],
+            Geometry::Polygon(Polygon::new(ring.clone(), vec![])),
+        ));
     }
     rings
 }
 
-fn dump_polygon_rings(geom: &Geometry) -> Option<Vec<Geometry>> {
+fn dump_polygon_rings(geom: &Geometry) -> Option<Vec<(Vec<i64>, Geometry)>> {
     match geom {
-        Geometry::Polygon(polygon) => Some(polygon_rings(polygon)),
+        Geometry::Polygon(polygon) => Some(polygon_rings_with_paths(polygon)),
         _ => None,
     }
 }
@@ -44,7 +50,7 @@ impl ScalarUDF for StDumpRings {
         inputs: FunctionArgs<Series>,
         _ctx: &daft_dsl::functions::scalar::EvalContext,
     ) -> DaftResult<Series> {
-        unary_geom_to_list_geom(inputs.required(0)?, self.name(), dump_polygon_rings)
+        unary_geom_to_list_dump_item(inputs.required(0)?, self.name(), dump_polygon_rings)
     }
 
     fn get_return_field(
@@ -55,12 +61,15 @@ impl ScalarUDF for StDumpRings {
         validate_geometry_field(&inputs, schema, 0, "geom", self.name())?;
         Ok(Field::new(
             self.name(),
-            DataType::List(Box::new(DataType::Geometry)),
+            DataType::List(Box::new(DataType::Struct(vec![
+                Field::new("path", DataType::List(Box::new(DataType::Int64))),
+                Field::new("geom", DataType::Geometry),
+            ]))),
         ))
     }
 
     fn docstring(&self) -> &'static str {
-        "Returns polygon rings as a List[Geometry] of closed LineStrings. Only Polygon inputs are supported: exterior ring first followed by interior rings. Non-polygonal inputs return null."
+        "Returns polygon rings as List[Struct{path, geom}] where geom is a single-ring Polygon and path is [0] for exterior ring then [1..n] for interior rings. Only Polygon inputs are supported; non-polygonal inputs return null."
     }
 }
 

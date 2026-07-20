@@ -4,8 +4,8 @@ use arrow_buffer::NullBufferBuilder;
 use common_error::{DaftError, DaftResult};
 use daft_core::{
     prelude::{
-        BinaryArray, BooleanArray, DataType, Field, Float64Array, FullNull, IntoSeries, Schema,
-        Utf8Array,
+        BinaryArray, BooleanArray, DataType, Field, Float64Array, FullNull, Int64Array,
+        IntoSeries, ListArray, Schema, StructArray, Utf8Array,
     },
     series::Series,
 };
@@ -334,6 +334,66 @@ pub(crate) fn wkb_offsets_to_geometry_list_series(
     Ok(ListArray::new(field, child_series, offsets, Some(nulls)).into_series())
 }
 
+fn dump_item_struct_fields() -> Vec<Field> {
+    vec![
+        Field::new("path", DataType::List(Box::new(DataType::Int64))),
+        Field::new("geom", DataType::Geometry),
+    ]
+}
+
+/// Wrap flattened dump items and list offsets into a `List[Struct{path, geom}]` Series.
+pub(crate) fn dump_items_to_list_struct_series(
+    out_name: &str,
+    child_paths: Vec<Vec<i64>>,
+    child_wkb_values: Vec<Option<Vec<u8>>>,
+    offsets: Vec<i64>,
+    outer_validity: Vec<bool>,
+) -> DaftResult<Series> {
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+
+    let mut flat_path_values: Vec<i64> = Vec::new();
+    let mut path_offsets: Vec<i64> = Vec::with_capacity(child_paths.len() + 1);
+    path_offsets.push(0);
+    for path in &child_paths {
+        flat_path_values.extend(path.iter().copied());
+        path_offsets.push(flat_path_values.len() as i64);
+    }
+
+    let path_child = Int64Array::from_iter(
+        Field::new("item", DataType::Int64),
+        flat_path_values.into_iter().map(Some),
+    )
+    .into_series();
+    let path_offsets = OffsetBuffer::new(ScalarBuffer::from(path_offsets));
+    let path_series = ListArray::new(
+        Field::new("path", DataType::List(Box::new(DataType::Int64))),
+        path_child,
+        path_offsets,
+        None,
+    )
+    .into_series();
+
+    let geom_series = wkb_opts_to_geometry_series("geom", child_wkb_values)?;
+
+    let struct_dtype = DataType::Struct(dump_item_struct_fields());
+    let struct_series = StructArray::new(
+        Field::new("item", struct_dtype.clone()),
+        vec![path_series, geom_series],
+        None,
+    )
+    .into_series();
+
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    let nulls = NullBuffer::from_iter(outer_validity);
+    Ok(ListArray::new(
+        Field::new(out_name, DataType::List(Box::new(struct_dtype))),
+        struct_series,
+        offsets,
+        Some(nulls),
+    )
+    .into_series())
+}
+
 /// Apply a unary mapping over a geometry column → Geometry (WKB Binary) Series.
 pub fn unary_geom_to_geom(
     series: &Series,
@@ -384,6 +444,45 @@ pub fn unary_geom_to_list_geom(
     }
 
     wkb_offsets_to_geometry_list_series(out_name, child_wkb_values, offsets, outer_validity)
+}
+
+/// Apply a unary mapping over a geometry column -> `List[Struct{path, geom}]` Series.
+pub fn unary_geom_to_list_dump_item(
+    series: &Series,
+    out_name: &str,
+    f: impl Fn(&Geometry) -> Option<Vec<(Vec<i64>, Geometry)>>,
+) -> DaftResult<Series> {
+    let binary = get_geometry_binary(series)?;
+    let len = binary.len();
+    let mut child_paths: Vec<Vec<i64>> = Vec::new();
+    let mut child_wkb_values: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut offsets: Vec<i64> = Vec::with_capacity(len + 1);
+    let mut outer_validity: Vec<bool> = Vec::with_capacity(len);
+
+    offsets.push(0);
+
+    for opt in binary.into_iter() {
+        let row_result = opt.and_then(|b| parse_wkb(b).ok()).and_then(|g| f(&g));
+        match row_result {
+            Some(items) => {
+                outer_validity.push(true);
+                for (path, geom) in items {
+                    child_paths.push(path);
+                    child_wkb_values.push(geom_to_wkb(&geom).ok());
+                }
+            }
+            None => outer_validity.push(false),
+        }
+        offsets.push(child_wkb_values.len() as i64);
+    }
+
+    dump_items_to_list_struct_series(
+        out_name,
+        child_paths,
+        child_wkb_values,
+        offsets,
+        outer_validity,
+    )
 }
 
 /// Apply a binary predicate over two geometry columns → Boolean Series.
