@@ -14,26 +14,24 @@ use crate::utils::{
     dump_item_struct_fields, unary_geom_to_list_dump_item, validate_geometry_field,
 };
 
-fn polygon_rings_with_paths(polygon: &Polygon) -> Vec<(Vec<i64>, Geometry)> {
-    if polygon.exterior().0.is_empty() && polygon.interiors().is_empty() {
+fn polygon_rings_with_paths(polygon: Polygon) -> Vec<(Vec<i64>, Geometry)> {
+    let (exterior, interiors) = polygon.into_inner();
+    if exterior.0.is_empty() && interiors.is_empty() {
         return Vec::new();
     }
 
-    let mut rings = Vec::with_capacity(1 + polygon.interiors().len());
-    rings.push((
-        vec![0],
-        Geometry::Polygon(Polygon::new(polygon.exterior().clone(), vec![])),
-    ));
-    for (i, ring) in polygon.interiors().iter().enumerate() {
+    let mut rings = Vec::with_capacity(1 + interiors.len());
+    rings.push((vec![0], Geometry::Polygon(Polygon::new(exterior, vec![]))));
+    for (i, ring) in interiors.into_iter().enumerate() {
         rings.push((
             vec![(i + 1) as i64],
-            Geometry::Polygon(Polygon::new(ring.clone(), vec![])),
+            Geometry::Polygon(Polygon::new(ring, vec![])),
         ));
     }
     rings
 }
 
-fn dump_polygon_rings(geom: &Geometry) -> Option<Vec<(Vec<i64>, Geometry)>> {
+fn dump_polygon_rings(geom: Geometry) -> Option<Vec<(Vec<i64>, Geometry)>> {
     match geom {
         Geometry::Polygon(polygon) => Some(polygon_rings_with_paths(polygon)),
         _ => None,

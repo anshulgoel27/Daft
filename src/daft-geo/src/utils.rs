@@ -318,27 +318,6 @@ pub(crate) fn wkb_opts_to_geometry_series(
     Ok(logical.into_series())
 }
 
-/// Wrap flattened child WKB values plus list offsets into a `List[Geometry]` Series.
-pub(crate) fn wkb_offsets_to_geometry_list_series(
-    out_name: &str,
-    child_wkb_values: Vec<Option<Vec<u8>>>,
-    offsets: Vec<i64>,
-    outer_validity: Vec<bool>,
-) -> DaftResult<Series> {
-    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-    use daft_core::prelude::ListArray;
-
-    let child_series = wkb_opts_to_geometry_series("item", child_wkb_values)?;
-    let field = Arc::new(Field::new(
-        out_name,
-        DataType::List(Box::new(DataType::Geometry)),
-    ));
-    let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
-    let nulls = NullBuffer::from_iter(outer_validity);
-
-    Ok(ListArray::new(field, child_series, offsets, Some(nulls)).into_series())
-}
-
 pub(crate) fn dump_item_struct_fields() -> Vec<Field> {
     vec![
         Field::new("path", DataType::List(Box::new(DataType::Int64))),
@@ -420,42 +399,11 @@ pub fn unary_geom_to_geom(
     wkb_opts_to_geometry_series(out_name, wkb_values)
 }
 
-/// Apply a unary mapping over a geometry column -> `List[Geometry]` Series.
-pub fn unary_geom_to_list_geom(
-    series: &Series,
-    out_name: &str,
-    f: impl Fn(&Geometry) -> Option<Vec<Geometry>>,
-) -> DaftResult<Series> {
-    let binary = get_geometry_binary(series)?;
-    let len = binary.len();
-    let mut child_wkb_values: Vec<Option<Vec<u8>>> = Vec::new();
-    let mut offsets: Vec<i64> = Vec::with_capacity(len + 1);
-    let mut outer_validity: Vec<bool> = Vec::with_capacity(len);
-
-    offsets.push(0);
-
-    for opt in binary.into_iter() {
-        let row_result = opt.and_then(|b| parse_wkb(b).ok()).and_then(|g| f(&g));
-        match row_result {
-            Some(geometries) => {
-                outer_validity.push(true);
-                for geom in geometries {
-                    child_wkb_values.push(geom_to_wkb(&geom).ok());
-                }
-            }
-            None => outer_validity.push(false),
-        }
-        offsets.push(child_wkb_values.len() as i64);
-    }
-
-    wkb_offsets_to_geometry_list_series(out_name, child_wkb_values, offsets, outer_validity)
-}
-
 /// Apply a unary mapping over a geometry column -> `List[Struct{path, geom}]` Series.
 pub fn unary_geom_to_list_dump_item(
     series: &Series,
     out_name: &str,
-    f: impl Fn(&Geometry) -> Option<Vec<(Vec<i64>, Geometry)>>,
+    f: impl Fn(Geometry) -> Option<Vec<(Vec<i64>, Geometry)>>,
 ) -> DaftResult<Series> {
     let binary = get_geometry_binary(series)?;
     let len = binary.len();
@@ -467,7 +415,7 @@ pub fn unary_geom_to_list_dump_item(
     offsets.push(0);
 
     for opt in binary.into_iter() {
-        let row_result = opt.and_then(|b| parse_wkb(b).ok()).and_then(|g| f(&g));
+        let row_result = opt.and_then(|b| parse_wkb(b).ok()).and_then(&f);
         match row_result {
             Some(items) => {
                 outer_validity.push(true);
