@@ -643,6 +643,8 @@ __all__ = [
     "st_difference",
     "st_disjoint",
     "st_distance",
+    "st_dump",
+    "st_dumprings",
     "st_dwithin",
     "st_envelope",
     "st_equals",
