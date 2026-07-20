@@ -138,6 +138,36 @@ def st_centroid(geom: Expression) -> Expression:
     return Expression._call_builtin_scalar_fn("st_centroid", geom)
 
 
+def st_dump(geom: Expression) -> Expression:
+    """Return a list of geometry members for each input geometry.
+
+    Atomic geometries return a singleton list containing themselves. Multi-geometries
+    return one item per member. Geometry collections are recursively flattened.
+
+    Args:
+        geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
+
+    Returns:
+        ``List[Geometry]`` column.
+    """
+    return Expression._call_builtin_scalar_fn("st_dump", geom)
+
+
+def st_dumprings(geom: Expression) -> Expression:
+    """Return polygon rings as a list of closed LineString geometries.
+
+    Polygon inputs return the exterior ring first, followed by interior rings.
+    This function is polygon-only; non-polygonal inputs return null.
+
+    Args:
+        geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
+
+    Returns:
+        ``List[Geometry]`` column.
+    """
+    return Expression._call_builtin_scalar_fn("st_dumprings", geom)
+
+
 # ── Binary geometry predicates ─────────────────────────────────────────────
 
 

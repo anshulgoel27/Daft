@@ -1,0 +1,70 @@
+use common_error::DaftResult;
+use daft_core::prelude::{DataType, Field, Schema};
+use daft_core::series::Series;
+use daft_dsl::{
+    ExprRef,
+    functions::{FunctionArgs, ScalarUDF, scalar::ScalarFn},
+};
+use geo::{Geometry, Polygon};
+use serde::{Deserialize, Serialize};
+
+use crate::utils::{unary_geom_to_list_geom, validate_geometry_field};
+
+fn polygon_rings(polygon: &Polygon) -> Vec<Geometry> {
+    if polygon.exterior().0.is_empty() && polygon.interiors().is_empty() {
+        return Vec::new();
+    }
+
+    let mut rings = Vec::with_capacity(1 + polygon.interiors().len());
+    rings.push(Geometry::LineString(polygon.exterior().clone()));
+    for ring in polygon.interiors() {
+        rings.push(Geometry::LineString(ring.clone()));
+    }
+    rings
+}
+
+fn dump_polygon_rings(geom: &Geometry) -> Option<Vec<Geometry>> {
+    match geom {
+        Geometry::Polygon(polygon) => Some(polygon_rings(polygon)),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct StDumpRings;
+
+#[typetag::serde]
+impl ScalarUDF for StDumpRings {
+    fn name(&self) -> &'static str {
+        "st_dumprings"
+    }
+
+    fn call(
+        &self,
+        inputs: FunctionArgs<Series>,
+        _ctx: &daft_dsl::functions::scalar::EvalContext,
+    ) -> DaftResult<Series> {
+        unary_geom_to_list_geom(inputs.required(0)?, self.name(), dump_polygon_rings)
+    }
+
+    fn get_return_field(
+        &self,
+        inputs: FunctionArgs<ExprRef>,
+        schema: &Schema,
+    ) -> DaftResult<Field> {
+        validate_geometry_field(&inputs, schema, 0, "geom", self.name())?;
+        Ok(Field::new(
+            self.name(),
+            DataType::List(Box::new(DataType::Geometry)),
+        ))
+    }
+
+    fn docstring(&self) -> &'static str {
+        "Returns polygon rings as a List[Geometry] of closed LineStrings. Only Polygon inputs are supported: exterior ring first followed by interior rings. Non-polygonal inputs return null."
+    }
+}
+
+#[must_use]
+pub fn st_dumprings(geom: ExprRef) -> ExprRef {
+    ScalarFn::builtin(StDumpRings, vec![geom]).into()
+}

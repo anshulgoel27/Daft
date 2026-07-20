@@ -258,6 +258,8 @@ from .spatial import (
     st_covers,
     st_crosses,
     st_difference,
+    st_dump,
+    st_dumprings,
     st_disjoint,
     st_distance,
     st_dwithin,
