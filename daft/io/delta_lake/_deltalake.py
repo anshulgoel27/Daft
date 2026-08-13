@@ -7,10 +7,9 @@ from typing import TYPE_CHECKING, Any, Union
 
 from daft import context, runners
 from daft.api_annotations import PublicAPI
-from daft.daft import IOConfig, ScanOperatorHandle, StorageConfig
+from daft.daft import IOConfig, StorageConfig
 from daft.dataframe import DataFrame
 from daft.dependencies import unity_catalog
-from daft.logical.builder import LogicalPlanBuilder
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -64,7 +63,7 @@ def read_deltalake(
         >>> df = daft.read_deltalake("s3://daft-oss-public-data/test_fixtures/delta_table/", io_config=io_config)
         >>> df.show()
     """
-    from daft.io.delta_lake.delta_lake_scan import DeltaLakeScanOperator
+    from daft.io.delta_lake.delta_lake_scan import DeltaLakeDataSource
 
     # If running on Ray, we want to limit the amount of concurrency and requests being made.
     # This is because each Ray worker process receives its own pool of thread workers and connections
@@ -88,13 +87,10 @@ def read_deltalake(
         raise ValueError(
             f"table argument must be a table URI string or UnityCatalogTable instance, but got: {type(table)}, {table}"
         )
-    delta_lake_operator = DeltaLakeScanOperator(
+    delta_lake_source = DeltaLakeDataSource(
         table_uri, storage_config=storage_config, version=version, ignore_deletion_vectors=ignore_deletion_vectors
     )
-
-    handle = ScanOperatorHandle.from_python_scan_operator(delta_lake_operator)
-    builder = LogicalPlanBuilder.from_tabular_scan(scan_operator=handle)
-    df = DataFrame(builder)
+    df = delta_lake_source.read()
     df._resolved_deltalake_path = table_uri
     df._resolved_deltalake_io_config = io_config
     return df
@@ -1213,7 +1209,7 @@ class DistributedDeltaMergeBuilder:
         Reuses ``delta_schema_to_pyarrow`` — the module's single Delta->Arrow source of
         truth (version-robust: ``schema.to_pyarrow()`` before deltalake 1.0.0, an arro3
         ``pa.schema(schema.to_arrow())`` conversion after). This is exactly what
-        ``DeltaLakeScanOperator`` feeds ``Schema.from_pyarrow_schema`` to build the schema
+        ``DeltaLakeDataSource`` feeds ``Schema.from_pyarrow_schema`` to build the schema
         that ``execute()`` reads its target from, so the dtypes checked here are the same
         ones the alignment (``_decomposed_outer_join``) and output casts actually run. No
         data is read.
