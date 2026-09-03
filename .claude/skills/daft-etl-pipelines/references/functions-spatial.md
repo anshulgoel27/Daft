@@ -455,6 +455,31 @@ Args:
 Returns:
     Geometry column. Returns null when the geometry cannot be repaired.
 
+## st_normalize
+
+```python
+st_normalize(geom: Expression) -> Expression
+```
+
+Returns the geometry in a canonical, normalized form.
+
+Polygon rings are wound consistently (clockwise exterior, counter-clockwise
+interiors) and rotated to start at their lexicographically smallest vertex.
+The non-semantic ordering of multi-part geometry and geometry-collection
+members is sorted deterministically. Geometrically equivalent inputs that
+differ only in ring orientation, ring starting vertex, or part order
+produce identical output.
+
+This is useful as a pre-step to hashing (e.g. ``st_astext`` + a hash
+function) so that spatially-identical geometries with different vertex
+ordering don't produce false-positive change detections.
+
+Args:
+    geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
+
+Returns:
+    Geometry column with each geometry in its canonical form.
+
 ## st_overlaps
 
 ```python

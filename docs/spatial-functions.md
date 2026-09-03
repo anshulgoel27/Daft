@@ -21,18 +21,19 @@ Function names are identical across Rust, Python, and SQL. Import from Python as
 
 | Surface | Count |
 |---|---|
-| Rust `SpatialFunctions` module | **41** |
-| Python bindings (`daft.functions`) | **40** |
-| SQL (`ST_*`) | **39** |
+| Rust `SpatialFunctions` module | **44** |
+| Python bindings (`daft.functions`) | **42** |
+| SQL (`ST_*`) | **41** |
 
 ### Functions NOT exposed everywhere
 
 | Function | Python | SQL | Notes |
 |---|:---:|:---:|---|
 | `great_circle_distance` | ✅ | ❌ | Great-circle distance in meters from lat/lon scalars. No SQL binding. |
+| `st_geohash_cells` | ❌ | ❌ | **Rust-only.** Internal optimizer helper for geohash cell covering — not a user-facing function. |
 | `st_geohash_covers` | ❌ | ❌ | **Rust-only.** Internal optimizer helper for geohash partition pruning — not a user-facing function. |
 
-Everything else (39 functions) is available identically in both Python and SQL.
+Everything else (41 functions) is available identically in both Python and SQL.
 
 ## Function catalog
 
@@ -124,6 +125,7 @@ Legend: **P** = Python, **S** = SQL.
 | Function | Signature (Python) | P | S | Description |
 |---|---|:-:|:-:|---|
 | `st_geohash` | `st_geohash(geom, precision=5)` | ✅ | ✅ | Geohash string of the geometry's centroid. |
+| `st_geohash_cells` | _(internal)_ | ❌ | ❌ | Rust-only geohash-cell-covering helper for partition pruning. |
 | `st_geohash_covers` | _(internal)_ | ❌ | ❌ | Rust-only geohash-covering predicate for partition pruning. |
 
 ## Usage examples

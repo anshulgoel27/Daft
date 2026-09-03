@@ -680,6 +680,7 @@ st_isvalid | daft.functions | (geom: Expression) -> Expression | Return whether 
 st_length | daft.functions | (geom: Expression, use_spheroid: bool=False) -> Expression | Return the length of line geometries. | functions-spatial.md#st_length
 st_makeline | daft.functions | (geom_a: Expression, geom_b: Expression) -> Expression | Construct a LineString geometry from two Point geometries. | functions-spatial.md#st_makeline
 st_makevalid | daft.functions | (geom: Expression) -> Expression | Repair an invalid geometry, returning a valid one. | functions-spatial.md#st_makevalid
+st_normalize | daft.functions | (geom: Expression) -> Expression | Returns the geometry in a canonical, normalized form. | functions-spatial.md#st_normalize
 st_overlaps | daft.functions | (geom_a: Expression, geom_b: Expression) -> Expression | Return true where A and B overlap (same dimension, partial intersection). | functions-spatial.md#st_overlaps
 st_perimeter | daft.functions | (geom: Expression, use_spheroid: bool=False) -> Expression | Return the perimeter of areal geometries (Polygon, MultiPolygon). | functions-spatial.md#st_perimeter
 st_point | daft.functions | (x: Expression, y: Expression) -> Expression | Construct a Point geometry from x and y coordinate columns. | functions-spatial.md#st_point
