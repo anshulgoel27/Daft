@@ -160,6 +160,7 @@ from daft.io import (
     update_deltalake,
     read_video_frames,
     read_warc,
+    read_webdataset,
     read_huggingface,
     read_mcap,
 )
@@ -305,6 +306,7 @@ __all__ = [
     "update_deltalake",
     "read_video_frames",
     "read_warc",
+    "read_webdataset",
     "refresh_logger",
     "register_viz_hook",
     "runners",

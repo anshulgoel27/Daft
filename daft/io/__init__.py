@@ -39,6 +39,7 @@ from daft.io._sql import read_sql
 from daft.io._warc import read_warc
 from daft.io.huggingface import read_huggingface
 from daft.io.mcap._mcap import read_mcap
+from daft.io.webdataset import read_webdataset
 from daft.io._range import _range
 from daft.io._files import from_files
 from daft.io.file_path import from_glob_path
@@ -98,6 +99,7 @@ __all__ = [
     "read_text",
     "read_video_frames",
     "read_warc",
+    "read_webdataset",
     "update_deltalake",
     "merge_deltalake",
 ]

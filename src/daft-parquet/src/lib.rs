@@ -171,6 +171,12 @@ pub enum Error {
         // type here.
         source: Box<Error>,
     },
+    #[snafu(display(
+        "{path} carries no parquet field IDs, but a field ID mapping was supplied, so every \
+         mapped column would read as null. Tables registered with `add_files` rely on the \
+         `schema.name-mapping.default` property, which Daft does not apply yet"
+    ))]
+    MissingParquetFieldIds { path: String },
 
     /// Remote fetch tasks store their results in a `Shared` future whose error
     /// type must be `Clone`, so we keep `Arc<Error>` internally and surface the
