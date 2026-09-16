@@ -296,5 +296,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 1);
+        let col = result.concat_or_get().unwrap().unwrap();
+        let vals = col.get_column(0).i64().unwrap();
+        assert_eq!(
+            vals.get(0),
+            Some(16),
+            "anti join should keep 16, not the matched 15"
+        );
     }
 }
