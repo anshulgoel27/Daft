@@ -203,6 +203,7 @@ impl PyRecordBatch {
                     &right.record_batch,
                     left_exprs.as_slice(),
                     right_exprs.as_slice(),
+                    JoinType::Inner,
                     is_sorted,
                 )?
                 .into())

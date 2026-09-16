@@ -120,8 +120,21 @@ impl RecordBatch {
         right: &Self,
         left_on: &[BoundExpr],
         right_on: &[BoundExpr],
+        how: JoinType,
         is_sorted: bool,
     ) -> DaftResult<Self> {
+        // The merge-join implementation below hardcodes Inner-join logic and
+        // schema inference. Calling it with any other `how` would either
+        // silently produce wrong results or panic, and whether that happens
+        // now depends on whether the range-stats short-circuit in
+        // `MicroPartition::join` happens to fire first — a nondeterministic
+        // debugging trap. Fail loudly instead.
+        if how != JoinType::Inner {
+            return Err(DaftError::ValueError(format!(
+                "sort_merge_join only supports Inner joins, got {how:?}"
+            )));
+        }
+
         // sort first and then call join recursively
         if !is_sorted {
             if left_on.is_empty() {
@@ -153,7 +166,7 @@ impl RecordBatch {
                     .as_slice(),
             )?;
 
-            return left.sort_merge_join(&right, left_on, right_on, true);
+            return left.sort_merge_join(&right, left_on, right_on, how, true);
         }
 
         let join_schema = infer_join_schema(&self.schema, &right.schema, JoinType::Inner)?;
@@ -270,4 +283,69 @@ pub fn get_columns_by_name<S: AsRef<str>>(
         .collect::<DaftResult<Vec<_>>>()?;
 
     Ok(recordbatch.get_columns(&indices))
+}
+
+#[cfg(test)]
+mod tests {
+    use daft_core::{datatypes::Int64Array, join::JoinType, series::IntoSeries};
+    use daft_dsl::{expr::bound_expr::BoundExpr, resolved_col};
+
+    use crate::RecordBatch;
+
+    fn single_col_batch(name: &str, values: &[i64]) -> RecordBatch {
+        RecordBatch::from_nonempty_columns(vec![
+            Int64Array::from_slice(name, values).into_series(),
+        ])
+        .unwrap()
+    }
+
+    fn on(batch: &RecordBatch, name: &str) -> Vec<BoundExpr> {
+        vec![BoundExpr::try_new(resolved_col(name), &batch.schema).unwrap()]
+    }
+
+    /// Before this test existed, `sort_merge_join` silently ignored `how` and
+    /// always executed Inner-join logic against an Inner-inferred schema.
+    /// Calling it with any other join type is now a clear, explicit error
+    /// instead of a nondeterministic "correct or silently wrong depending on
+    /// whether the range-stats short-circuit happened to fire" trap.
+    #[test]
+    fn test_sort_merge_join_rejects_non_inner_join_types() {
+        let left = single_col_batch("a", &[1, 2, 3]);
+        let right = single_col_batch("a", &[2, 3, 4]);
+
+        for how in [
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Outer,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let err = left
+                .sort_merge_join(&right, &on(&left, "a"), &on(&right, "a"), how, false)
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("sort_merge_join only supports Inner joins"),
+                "unexpected error for {how:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sort_merge_join_still_supports_inner() {
+        let left = single_col_batch("a", &[1, 2, 3]);
+        let right = single_col_batch("a", &[2, 3, 4]);
+
+        let result = left
+            .sort_merge_join(
+                &right,
+                &on(&left, "a"),
+                &on(&right, "a"),
+                JoinType::Inner,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+    }
 }
