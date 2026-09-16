@@ -130,6 +130,23 @@ The private `join` cannot currently see the flag (`:98`). Thread
 entry is `false`. This is a pre-existing hazard for `Inner`, so Piece 2's first task is a
 failing test that proves it before anything is extended.
 
+**CORRECTION (post-implementation review, 2026-09-16):** the motivating claim above —
+that this short-circuit helps this merge, or any `DataFrame.join()` call — is **wrong**.
+`MicroPartition::hash_join` is **not** on `DataFrame.join()`'s execution path for either
+the native or Ray runner: both compile down to `LocalPhysicalPlan::hash_join` →
+`HashJoinOperator` in `daft-local-execution`, which never calls `MicroPartition::hash_join`
+and never reads `MicroPartition::statistics`. As implemented, `MicroPartition::hash_join`
+is reachable only via the PyO3 binding (`RecordBatch`/`MicroPartition` exposed directly to
+Python, bypassing the query planner) and via `MicroPartition::sort_merge_join` when a
+caller explicitly requests `strategy="sort_merge"` (which routes through
+`SortMergeJoinOperator` in `daft-local-execution`, a different operator from
+`HashJoinOperator`). Piece 2, as implemented, does **not** deliver the Delta-merge
+speedup this spec motivated it with. Delivering that speedup would require moving the
+short-circuit into `daft-local-execution`'s join operators (`HashJoinOperator`,
+`left_right_join.rs`, `anti_semi_join.rs`, `outer_join.rs`) — a separate, larger change
+not attempted here. The code that was added is still correct and independently useful for
+its actual callers; only the motivation above is stale.
+
 ## Independence
 
 Piece 1 is Python in `_deltalake.py`; Piece 2 is Rust in `daft-micropartition`. Neither

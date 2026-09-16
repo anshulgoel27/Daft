@@ -659,3 +659,16 @@ bug fix and worth its own PR. Tasks 2-3 close the standing
 `TODO(Kevin): short circuits are also possible for other join types` at `join.rs:41`.
 Reference [#4047](https://github.com/Eventual-Inc/Daft/issues/4047) for motivation only —
 the merge itself is not being proposed upstream here.
+
+**CORRECTION (post-implementation review, 2026-09-16):** "closes the standing TODO" is
+accurate, but do not overstate what that buys — this does **not** "help every
+`left`/`anti`/`semi` join in Daft". `MicroPartition::hash_join` is not on
+`DataFrame.join()`'s execution path for either the native or Ray runner (both go through
+`LocalPhysicalPlan::hash_join` → `HashJoinOperator` in `daft-local-execution`, a separate
+code path that never calls `MicroPartition::hash_join`). What this plan actually helps is
+narrower: `MicroPartition::hash_join`'s only callers — the PyO3 binding — and
+`MicroPartition::sort_merge_join`'s `SortMergeJoinOperator`, reached only when a caller
+explicitly requests `strategy="sort_merge"`. It is still a correct, worthwhile, and
+independently upstreamable fix on its own terms; it just doesn't move the needle on the
+primary `DataFrame.join()` query-execution path, and should not be pitched to upstream
+maintainers as if it did.
