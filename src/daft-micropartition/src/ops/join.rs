@@ -15,6 +15,7 @@ impl MicroPartition {
         right: &Self,
         left_on: &[BoundExpr],
         right_on: &[BoundExpr],
+        null_equals_nulls: Option<&[bool]>,
         how: JoinType,
         table_join: F,
     ) -> DaftResult<Self>
@@ -37,8 +38,15 @@ impl MicroPartition {
             _ => {}
         }
 
+        // Range statistics carry no null information: `column_stats/mod.rs:166`
+        // computes `_null_count` and throws it away. So disjoint NON-NULL ranges
+        // do not prove "no match" when NULL keys are allowed to compare equal —
+        // the NULL/NULL pair would still match. Only short-circuit when nulls
+        // are unequal.
+        let nulls_never_equal = null_equals_nulls.map_or(true, |n| n.iter().all(|&x| !x));
+
         // TODO(Kevin): short circuits are also possible for other join types
-        if how == JoinType::Inner {
+        if how == JoinType::Inner && nulls_never_equal {
             let tv = match (&self.statistics, &right.statistics) {
                 (_, None) => TruthValue::Maybe,
                 (None, _) => TruthValue::Maybe,
@@ -95,7 +103,14 @@ impl MicroPartition {
             RecordBatch::hash_join(lt, rt, lo, ro, null_equals_nulls.as_slice(), _how)
         };
 
-        self.join(right, left_on, right_on, how, table_join)
+        self.join(
+            right,
+            left_on,
+            right_on,
+            Some(null_equals_nulls.as_slice()),
+            how,
+            table_join,
+        )
     }
 
     pub fn sort_merge_join(
@@ -114,7 +129,7 @@ impl MicroPartition {
             RecordBatch::sort_merge_join(lt, rt, lo, ro, is_sorted)
         };
 
-        self.join(right, left_on, right_on, how, table_join)
+        self.join(right, left_on, right_on, None, how, table_join)
     }
 
     pub fn cross_join(&self, right: &Self, outer_loop_side: JoinSide) -> DaftResult<Self> {
@@ -123,6 +138,84 @@ impl MicroPartition {
                 RecordBatch::cross_join(lt, rt, outer_loop_side)
             };
 
-        self.join(right, &[], &[], JoinType::Inner, table_join)
+        self.join(right, &[], &[], None, JoinType::Inner, table_join)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use daft_core::{
+        datatypes::{DataType, Field, Int64Array},
+        join::JoinType,
+        prelude::Schema,
+        series::IntoSeries,
+    };
+    use daft_dsl::{expr::bound_expr::BoundExpr, resolved_col};
+    use daft_recordbatch::RecordBatch;
+    use daft_stats::TableStatistics;
+
+    use crate::MicroPartition;
+
+    /// Builds a one-column i64 MicroPartition whose declared stats range is
+    /// [stat_min, stat_max], independent of the rows it actually holds.
+    fn mp(name: &str, rows: Vec<Option<i64>>, stat_min: i64, stat_max: i64) -> MicroPartition {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64)]));
+        let data = RecordBatch::from_nonempty_columns(vec![
+            Int64Array::from_iter(Field::new(name, DataType::Int64), rows).into_series(),
+        ])
+        .unwrap();
+        let stats_table = RecordBatch::from_nonempty_columns(vec![
+            Int64Array::from_slice(name, &[stat_min, stat_max]).into_series(),
+        ])
+        .unwrap();
+        let stats = TableStatistics::from_stats_table(&stats_table).unwrap();
+        MicroPartition::new_loaded(schema, Arc::new(vec![data]), Some(stats))
+    }
+
+    fn on(mp: &MicroPartition, name: &str) -> Vec<BoundExpr> {
+        vec![BoundExpr::try_new(resolved_col(name), &mp.schema).unwrap()]
+    }
+
+    #[test]
+    fn test_inner_short_circuit_respects_null_equals_nulls() {
+        // Non-null ranges are disjoint ([10,20] vs [30,40]) so the range
+        // verdict is False — but both sides hold NULL keys, and with
+        // null_equals_nulls the NULL/NULL pair is a real match. Range stats
+        // discard null counts (`column_stats/mod.rs:166`), so the
+        // short-circuit MUST NOT fire here.
+        let left = mp("a", vec![Some(15), None], 10, 20);
+        let right = mp("a", vec![Some(35), None], 30, 40);
+
+        let result = left
+            .hash_join(
+                &right,
+                &on(&left, "a"),
+                &on(&right, "a"),
+                Some(vec![true]),
+                JoinType::Inner,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 1, "NULL == NULL match was wrongly pruned");
+    }
+
+    #[test]
+    fn test_inner_short_circuit_still_fires_when_nulls_unequal() {
+        let left = mp("a", vec![Some(15), None], 10, 20);
+        let right = mp("a", vec![Some(35), None], 30, 40);
+
+        let result = left
+            .hash_join(
+                &right,
+                &on(&left, "a"),
+                &on(&right, "a"),
+                None,
+                JoinType::Inner,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 0);
     }
 }
