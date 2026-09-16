@@ -1583,3 +1583,26 @@ def test_self_join_with_projection():
     }
 
     assert pa.Table.from_pydict(result_df.to_pydict()) == pa.Table.from_pydict(expected)
+
+
+def test_left_join_disjoint_ranges_preserves_all_left_rows():
+    """Regression guard: the range-stats short-circuit must null-extend, not empty."""
+    left = daft.from_pydict({"a": [1, 2, 3], "lv": ["x", "y", "z"]})
+    right = daft.from_pydict({"a": [100, 200], "rv": ["p", "q"]})
+
+    out = left.join(right, on="a", how="left").sort("a").to_pydict()
+    assert out["a"] == [1, 2, 3]
+    assert out["lv"] == ["x", "y", "z"]
+    assert out["rv"] == [None, None, None]
+
+
+def test_anti_join_disjoint_ranges_keeps_all_left_rows():
+    left = daft.from_pydict({"a": [1, 2, 3]})
+    right = daft.from_pydict({"a": [100, 200]})
+    assert left.join(right, on="a", how="anti").sort("a").to_pydict()["a"] == [1, 2, 3]
+
+
+def test_semi_join_disjoint_ranges_is_empty():
+    left = daft.from_pydict({"a": [1, 2, 3]})
+    right = daft.from_pydict({"a": [100, 200]})
+    assert left.join(right, on="a", how="semi").to_pydict()["a"] == []
