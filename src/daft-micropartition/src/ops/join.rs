@@ -45,8 +45,7 @@ impl MicroPartition {
         // are unequal.
         let nulls_never_equal = null_equals_nulls.map_or(true, |n| n.iter().all(|&x| !x));
 
-        // TODO(Kevin): short circuits are also possible for other join types
-        if how == JoinType::Inner && nulls_never_equal {
+        if nulls_never_equal {
             let tv = match (&self.statistics, &right.statistics) {
                 (_, None) => TruthValue::Maybe,
                 (None, _) => TruthValue::Maybe,
@@ -63,8 +62,25 @@ impl MicroPartition {
                     curr_tv
                 }
             };
+
             if tv == TruthValue::False {
-                return Ok(Self::empty(Some(join_schema)));
+                // No pair of key ranges can overlap, so no row can match. What
+                // that implies depends on which side the join preserves.
+                match how {
+                    // Nothing survives.
+                    JoinType::Inner | JoinType::Semi => {
+                        return Ok(Self::empty(Some(join_schema)));
+                    }
+                    // Every left row survives untouched. `infer_join_schema`
+                    // returns `left_schema.clone()` for Anti/Semi
+                    // (`daft-dsl/src/join.rs:23`), so `self` already carries the
+                    // output schema — and cloning keeps it unloaded, skipping
+                    // the read entirely.
+                    JoinType::Anti => return Ok(self.clone()),
+                    // Outer joins are handled in Task 3; Outer stays on the
+                    // normal path because its common columns take a supertype.
+                    JoinType::Left | JoinType::Right | JoinType::Outer => {}
+                }
             }
         }
 
@@ -217,5 +233,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_semi_join_short_circuits_to_empty() {
+        // No left row can have a match, so a semi join keeps nothing.
+        let left = mp("a", vec![Some(15), Some(16)], 10, 20);
+        let right = mp("a", vec![Some(35)], 30, 40);
+
+        let result = left
+            .hash_join(
+                &right,
+                &on(&left, "a"),
+                &on(&right, "a"),
+                None,
+                JoinType::Semi,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 0);
+        assert_eq!(result.schema, left.schema);
+    }
+
+    #[test]
+    fn test_anti_join_short_circuits_to_all_of_left() {
+        // No left row can have a match, so an anti join keeps ALL of left —
+        // emphatically not empty.
+        let left = mp("a", vec![Some(15), Some(16)], 10, 20);
+        let right = mp("a", vec![Some(35)], 30, 40);
+
+        let result = left
+            .hash_join(
+                &right,
+                &on(&left, "a"),
+                &on(&right, "a"),
+                None,
+                JoinType::Anti,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.schema, left.schema);
+        let col = result.concat_or_get().unwrap().unwrap();
+        let vals = col.get_column(0).i64().unwrap();
+        assert_eq!((vals.get(0), vals.get(1)), (Some(15), Some(16)));
+    }
+
+    #[test]
+    fn test_anti_join_overlapping_ranges_still_probes() {
+        // Ranges overlap → Maybe → normal path, which must actually exclude 15.
+        let left = mp("a", vec![Some(15), Some(16)], 10, 20);
+        let right = mp("a", vec![Some(15)], 10, 20);
+
+        let result = left
+            .hash_join(
+                &right,
+                &on(&left, "a"),
+                &on(&right, "a"),
+                None,
+                JoinType::Anti,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
     }
 }
