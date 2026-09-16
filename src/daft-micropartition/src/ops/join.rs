@@ -437,12 +437,25 @@ mod tests {
 
         let batch = result.concat_or_get().unwrap().unwrap();
         let names: Vec<&str> = result.schema.into_iter().map(|f| f.name.as_ref()).collect();
+        assert_eq!(names, vec!["a", "lv", "rv"]);
+
         let lv_idx = names.iter().position(|n| *n == "lv").unwrap();
-        assert_eq!(batch.get_column(lv_idx).i64().unwrap().get(0), None);
+        let lv = batch.get_column(lv_idx);
+        assert_eq!(lv.len(), 2);
+        assert_eq!(lv.i64().unwrap().get(0), None);
+        assert_eq!(lv.i64().unwrap().get(1), None);
 
         let a_idx = names.iter().position(|n| *n == "a").unwrap();
         let a = batch.get_column(a_idx).i64().unwrap();
         assert_eq!((a.get(0), a.get(1)), (Some(35), Some(36)));
+
+        let rv_idx = names.iter().position(|n| *n == "rv").unwrap();
+        let rv = batch.get_column(rv_idx).i64().unwrap();
+        assert_eq!(
+            (rv.get(0), rv.get(1)),
+            (Some(9), Some(8)),
+            "right join must preserve rv's real values, not null-fill them"
+        );
     }
 
     #[test]
