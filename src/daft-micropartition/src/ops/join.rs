@@ -74,10 +74,24 @@ impl MicroPartition {
         ) -> DaftResult<RecordBatch>,
     {
         let join_schema = infer_join_schema(&self.schema, &right.schema, how)?;
+        // `Left`/`Right` must never return empty: an empty preserved side has
+        // zero rows regardless (nothing to null-extend), but an empty
+        // *other* side means every preserved row survives null-extended, not
+        // dropped. Route those two cases to `null_extend` explicitly instead
+        // of falling through to the later `concat_or_get` -> `None` ->
+        // `Self::empty` path, which would incorrectly drop the preserved
+        // side's rows too.
         match (how, self.len(), right.len()) {
-            (JoinType::Inner | JoinType::Left | JoinType::Semi, 0, _)
-            | (JoinType::Inner | JoinType::Right, _, 0)
-            | (JoinType::Outer, 0, 0) => {
+            (JoinType::Inner | JoinType::Semi, 0, _) | (JoinType::Inner, _, 0) => {
+                return Ok(Self::empty(Some(join_schema)));
+            }
+            (JoinType::Left, _, 0) => {
+                return null_extend(self, &join_schema);
+            }
+            (JoinType::Right, 0, _) => {
+                return null_extend(right, &join_schema);
+            }
+            (JoinType::Outer, 0, 0) => {
                 return Ok(Self::empty(Some(join_schema)));
             }
             _ => {}
@@ -88,7 +102,7 @@ impl MicroPartition {
         // do not prove "no match" when NULL keys are allowed to compare equal —
         // the NULL/NULL pair would still match. Only short-circuit when nulls
         // are unequal.
-        let nulls_never_equal = null_equals_nulls.map_or(true, |n| n.iter().all(|&x| !x));
+        let nulls_never_equal = null_equals_nulls.is_none_or(|n| n.iter().all(|&x| !x));
 
         if nulls_never_equal {
             let tv = match (&self.statistics, &right.statistics) {
@@ -123,10 +137,11 @@ impl MicroPartition {
                     // the read entirely.
                     JoinType::Anti => return Ok(self.clone()),
                     // No match exists, so the preserved side's rows all come
-                    // through null-extended. This replaces the per-row no-match
-                    // path in `join/left_right_join.rs:113-135` (a per-row
-                    // `add_nulls(1)` plus `probe_side_idxs.push`, then a full
-                    // `take`) with one bulk construction.
+                    // through null-extended. This is the bulk equivalent of
+                    // the per-row no-match construction in
+                    // `daft-local-execution/src/join/left_right_join.rs` — a
+                    // separate execution path this change does not touch or
+                    // replace.
                     JoinType::Left => return null_extend(self, &join_schema),
                     JoinType::Right => return null_extend(right, &join_schema),
                     // Outer's common columns take a supertype, so null-extension
@@ -193,8 +208,8 @@ impl MicroPartition {
                           rt: &RecordBatch,
                           lo: &[BoundExpr],
                           ro: &[BoundExpr],
-                          _how: JoinType| {
-            RecordBatch::sort_merge_join(lt, rt, lo, ro, is_sorted)
+                          how: JoinType| {
+            RecordBatch::sort_merge_join(lt, rt, lo, ro, how, is_sorted)
         };
 
         self.join(right, left_on, right_on, None, how, table_join)
@@ -456,6 +471,83 @@ mod tests {
             (Some(9), Some(8)),
             "right join must preserve rv's real values, not null-fill them"
         );
+    }
+
+    #[test]
+    fn test_left_join_with_empty_right_preserves_all_left_rows() {
+        // Regression test: `right.len() == 0` must never make a `Left` join
+        // return empty. Every left row must survive, null-extended, even
+        // though nothing here is disjoint-by-stats — it's the plain
+        // `right.len() == 0` guard at the top of `join`, not the range-stats
+        // short-circuit, that must handle this.
+        let left = mp2("a", "lv", vec![Some(15), Some(16)], vec![Some(1), Some(2)], 10, 20);
+        let right = mp2("a", "rv", vec![], vec![], 10, 20);
+        assert_eq!(right.len(), 0);
+
+        let result = left
+            .hash_join(
+                &right,
+                &on(&left, "a"),
+                &on(&right, "a"),
+                None,
+                JoinType::Left,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            2,
+            "left join with an empty right must still preserve all left rows"
+        );
+
+        let batch = result.concat_or_get().unwrap().unwrap();
+        let names: Vec<&str> = result.schema.into_iter().map(|f| f.name.as_ref()).collect();
+        let rv_idx = names.iter().position(|n| *n == "rv").unwrap();
+        let rv = batch.get_column(rv_idx).i64().unwrap();
+        assert_eq!((rv.get(0), rv.get(1)), (None, None));
+
+        let lv_idx = names.iter().position(|n| *n == "lv").unwrap();
+        let lv = batch.get_column(lv_idx).i64().unwrap();
+        assert_eq!((lv.get(0), lv.get(1)), (Some(1), Some(2)));
+    }
+
+    #[test]
+    fn test_right_join_with_empty_left_preserves_all_right_rows() {
+        // Mirror of the above: `self.len() == 0` must never make a `Right`
+        // join return empty.
+        let left = mp2("a", "lv", vec![], vec![], 10, 20);
+        let right = mp2("a", "rv", vec![Some(35), Some(36)], vec![Some(9), Some(8)], 30, 40);
+        assert_eq!(left.len(), 0);
+
+        let result = left
+            .hash_join(
+                &right,
+                &on(&left, "a"),
+                &on(&right, "a"),
+                None,
+                JoinType::Right,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            2,
+            "right join with an empty left must still preserve all right rows"
+        );
+
+        let batch = result.concat_or_get().unwrap().unwrap();
+        let names: Vec<&str> = result.schema.into_iter().map(|f| f.name.as_ref()).collect();
+        let lv_idx = names.iter().position(|n| *n == "lv").unwrap();
+        let lv = batch.get_column(lv_idx).i64().unwrap();
+        assert_eq!((lv.get(0), lv.get(1)), (None, None));
+
+        let a_idx = names.iter().position(|n| *n == "a").unwrap();
+        let a = batch.get_column(a_idx).i64().unwrap();
+        assert_eq!((a.get(0), a.get(1)), (Some(35), Some(36)));
+
+        let rv_idx = names.iter().position(|n| *n == "rv").unwrap();
+        let rv = batch.get_column(rv_idx).i64().unwrap();
+        assert_eq!((rv.get(0), rv.get(1)), (Some(9), Some(8)));
     }
 
     #[test]
