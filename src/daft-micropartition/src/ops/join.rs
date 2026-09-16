@@ -1,13 +1,58 @@
+use std::{collections::HashMap, sync::Arc};
+
 use common_error::DaftResult;
 use daft_core::{
     array::ops::DaftCompare,
     join::{JoinSide, JoinType},
+    prelude::SchemaRef,
+    series::Series,
 };
 use daft_dsl::{expr::bound_expr::BoundExpr, join::infer_join_schema};
 use daft_recordbatch::RecordBatch;
 use daft_stats::TruthValue;
 
 use crate::micropartition::MicroPartition;
+
+/// All rows of `base`, with every output column absent from `base` filled with
+/// typed NULLs, laid out to match `join_schema`.
+///
+/// `infer_join_schema` puts common columns first — taking the *preserved*
+/// side's field (left's for `Left`, right's for `Right`) — then unique left,
+/// then unique right (`daft-dsl/src/join.rs:26-60`). So resolving each output
+/// field by name against `base` and null-filling the misses yields the correct
+/// layout for both directions with one implementation.
+fn null_extend(base: &MicroPartition, join_schema: &SchemaRef) -> DaftResult<MicroPartition> {
+    let Some(batch) = base.concat_or_get()? else {
+        return Ok(MicroPartition::empty(Some(join_schema.clone())));
+    };
+    let num_rows = batch.len();
+
+    let base_idx: HashMap<&str, usize> = base
+        .schema
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.as_ref(), i))
+        .collect();
+
+    let mut columns = Vec::with_capacity(join_schema.len());
+    for field in join_schema.into_iter() {
+        match base_idx.get(field.name.as_ref()) {
+            Some(&i) => columns.push(batch.get_column(i).clone()),
+            None => columns.push(Series::full_null(
+                field.name.as_ref(),
+                &field.dtype,
+                num_rows,
+            )),
+        }
+    }
+
+    let extended = RecordBatch::new_with_size(join_schema.clone(), columns, num_rows)?;
+    Ok(MicroPartition::new_loaded(
+        join_schema.clone(),
+        Arc::new(vec![extended]),
+        None,
+    ))
+}
 
 impl MicroPartition {
     fn join<F>(
@@ -77,9 +122,16 @@ impl MicroPartition {
                     // output schema — and cloning keeps it unloaded, skipping
                     // the read entirely.
                     JoinType::Anti => return Ok(self.clone()),
-                    // Outer joins are handled in Task 3; Outer stays on the
-                    // normal path because its common columns take a supertype.
-                    JoinType::Left | JoinType::Right | JoinType::Outer => {}
+                    // No match exists, so the preserved side's rows all come
+                    // through null-extended. This replaces the per-row no-match
+                    // path in `join/left_right_join.rs:113-135` (a per-row
+                    // `add_nulls(1)` plus `probe_side_idxs.push`, then a full
+                    // `take`) with one bulk construction.
+                    JoinType::Left => return null_extend(self, &join_schema),
+                    JoinType::Right => return null_extend(right, &join_schema),
+                    // Outer's common columns take a supertype, so null-extension
+                    // would need casts. Left on the normal path deliberately.
+                    JoinType::Outer => {}
                 }
             }
         }
@@ -303,5 +355,109 @@ mod tests {
             Some(16),
             "anti join should keep 16, not the matched 15"
         );
+    }
+
+    /// Two-column builder so the join has a genuinely right-only column to null-fill.
+    fn mp2(
+        key: &str,
+        other: &str,
+        keys: Vec<Option<i64>>,
+        others: Vec<Option<i64>>,
+        stat_min: i64,
+        stat_max: i64,
+    ) -> MicroPartition {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(key, DataType::Int64),
+            Field::new(other, DataType::Int64),
+        ]));
+        let data = RecordBatch::from_nonempty_columns(vec![
+            Int64Array::from_iter(Field::new(key, DataType::Int64), keys).into_series(),
+            Int64Array::from_iter(Field::new(other, DataType::Int64), others).into_series(),
+        ])
+        .unwrap();
+        let stats_table = RecordBatch::from_nonempty_columns(vec![
+            Int64Array::from_slice(key, &[stat_min, stat_max]).into_series(),
+            Int64Array::from_slice(other, &[stat_min, stat_max]).into_series(),
+        ])
+        .unwrap();
+        let stats = TableStatistics::from_stats_table(&stats_table).unwrap();
+        MicroPartition::new_loaded(schema, Arc::new(vec![data]), Some(stats))
+    }
+
+    #[test]
+    fn test_left_join_short_circuits_to_null_extended_left() {
+        // Disjoint ranges: every left row survives with the right-only column NULL.
+        // This must NOT be empty.
+        let left = mp2("a", "lv", vec![Some(15), Some(16)], vec![Some(1), Some(2)], 10, 20);
+        let right = mp2("a", "rv", vec![Some(35)], vec![Some(9)], 30, 40);
+
+        let result = left
+            .hash_join(
+                &right,
+                &on(&left, "a"),
+                &on(&right, "a"),
+                None,
+                JoinType::Left,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 2, "left join must preserve all left rows");
+
+        let batch = result.concat_or_get().unwrap().unwrap();
+        let names: Vec<&str> = result.schema.into_iter().map(|f| f.name.as_ref()).collect();
+        assert_eq!(names, vec!["a", "lv", "rv"]);
+
+        let rv_idx = names.iter().position(|n| *n == "rv").unwrap();
+        let rv = batch.get_column(rv_idx);
+        assert_eq!(rv.len(), 2);
+        assert_eq!(rv.i64().unwrap().get(0), None);
+        assert_eq!(rv.i64().unwrap().get(1), None);
+
+        let lv_idx = names.iter().position(|n| *n == "lv").unwrap();
+        let lv = batch.get_column(lv_idx).i64().unwrap();
+        assert_eq!((lv.get(0), lv.get(1)), (Some(1), Some(2)));
+    }
+
+    #[test]
+    fn test_right_join_short_circuits_to_null_extended_right() {
+        let left = mp2("a", "lv", vec![Some(15)], vec![Some(1)], 10, 20);
+        let right = mp2("a", "rv", vec![Some(35), Some(36)], vec![Some(9), Some(8)], 30, 40);
+
+        let result = left
+            .hash_join(
+                &right,
+                &on(&left, "a"),
+                &on(&right, "a"),
+                None,
+                JoinType::Right,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 2, "right join must preserve all right rows");
+
+        let batch = result.concat_or_get().unwrap().unwrap();
+        let names: Vec<&str> = result.schema.into_iter().map(|f| f.name.as_ref()).collect();
+        let lv_idx = names.iter().position(|n| *n == "lv").unwrap();
+        assert_eq!(batch.get_column(lv_idx).i64().unwrap().get(0), None);
+
+        let a_idx = names.iter().position(|n| *n == "a").unwrap();
+        let a = batch.get_column(a_idx).i64().unwrap();
+        assert_eq!((a.get(0), a.get(1)), (Some(35), Some(36)));
+    }
+
+    #[test]
+    fn test_left_join_overlapping_ranges_still_probes() {
+        let left = mp2("a", "lv", vec![Some(15)], vec![Some(1)], 10, 20);
+        let right = mp2("a", "rv", vec![Some(15)], vec![Some(9)], 10, 20);
+
+        let result = left
+            .hash_join(&right, &on(&left, "a"), &on(&right, "a"), None, JoinType::Left)
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let batch = result.concat_or_get().unwrap().unwrap();
+        let names: Vec<&str> = result.schema.into_iter().map(|f| f.name.as_ref()).collect();
+        let rv_idx = names.iter().position(|n| *n == "rv").unwrap();
+        assert_eq!(batch.get_column(rv_idx).i64().unwrap().get(0), Some(9));
     }
 }
