@@ -1585,8 +1585,22 @@ def test_self_join_with_projection():
     assert pa.Table.from_pydict(result_df.to_pydict()) == pa.Table.from_pydict(expected)
 
 
+# NOTE (post-implementation review, 2026-09-16): the three tests below exercise ordinary
+# DataFrame-level left/anti/semi join semantics with disjoint key ranges — a legitimate
+# regression guard on their own — but they do NOT exercise the MicroPartition range-stats
+# short-circuit that motivated adding them. `daft.from_pydict` builds in-memory
+# MicroPartitions with no column statistics attached, and `DataFrame.join()`'s actual
+# execution path (`LocalPhysicalPlan::hash_join` -> `HashJoinOperator` in
+# `daft-local-execution`) never calls `MicroPartition::hash_join` at all, so there is no
+# statistics-driven short-circuit for these tests to hit either way. Keep these tests as
+# they are useful; just don't read them as proof the short-circuit fires on the
+# `DataFrame.join()` path.
 def test_left_join_disjoint_ranges_preserves_all_left_rows():
-    """Regression guard: the range-stats short-circuit must null-extend, not empty."""
+    """Regression guard: the range-stats short-circuit must null-extend, not empty.
+
+    Note: exercises DataFrame-level left join semantics only, not the actual
+    MicroPartition short-circuit — see module-level comment above.
+    """
     left = daft.from_pydict({"a": [1, 2, 3], "lv": ["x", "y", "z"]})
     right = daft.from_pydict({"a": [100, 200], "rv": ["p", "q"]})
 
@@ -1597,12 +1611,18 @@ def test_left_join_disjoint_ranges_preserves_all_left_rows():
 
 
 def test_anti_join_disjoint_ranges_keeps_all_left_rows():
+    """Note: exercises DataFrame-level anti join semantics only, not the actual
+    MicroPartition short-circuit — see module-level comment above.
+    """
     left = daft.from_pydict({"a": [1, 2, 3]})
     right = daft.from_pydict({"a": [100, 200]})
     assert left.join(right, on="a", how="anti").sort("a").to_pydict()["a"] == [1, 2, 3]
 
 
 def test_semi_join_disjoint_ranges_is_empty():
+    """Note: exercises DataFrame-level semi join semantics only, not the actual
+    MicroPartition short-circuit — see module-level comment above.
+    """
     left = daft.from_pydict({"a": [1, 2, 3]})
     right = daft.from_pydict({"a": [100, 200]})
     assert left.join(right, on="a", how="semi").to_pydict()["a"] == []
