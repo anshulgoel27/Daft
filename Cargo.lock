@@ -4797,7 +4797,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "dashmap",
- "fastrand 2.3.0",
+ "fastrand",
  "futures",
  "hostname",
  "io-uring",

@@ -1,3 +1,5 @@
+// if_let_guard is stable on the pinned upstream nightly but not on the older nightly available locally.
+#![feature(if_let_guard)]
 mod azure_auth;
 mod azure_blob;
 mod counting_reader;
