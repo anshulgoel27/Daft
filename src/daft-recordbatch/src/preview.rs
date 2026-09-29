@@ -21,8 +21,10 @@ pub struct Preview {
 /// The .show() table format for box drawing.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PreviewFormat {
     /// Fancy box drawing.
+    #[default]
     Fancy,
     /// No box drawing.
     Plain,
@@ -127,12 +129,6 @@ impl TryFrom<&str> for PreviewFormat {
                 "Unknown preview format: {s}"
             ))),
         }
-    }
-}
-
-impl Default for PreviewFormat {
-    fn default() -> Self {
-        Self::Fancy
     }
 }
 
