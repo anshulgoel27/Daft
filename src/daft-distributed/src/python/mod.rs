@@ -125,7 +125,7 @@ impl PyDistributedPhysicalPlan {
     }
 
     fn flight_shuffle_dirs(&self) -> Vec<String> {
-        self.plan.execution_config().flight_shuffle_dirs.clone()
+        PlanConfig::from(&self.plan).flight_shuffle_dirs()
     }
 
     fn num_partitions(&self) -> PyResult<usize> {

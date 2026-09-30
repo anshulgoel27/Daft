@@ -68,12 +68,8 @@ impl ShuffleContext {
     pub(crate) fn register_cleanup(&self, plan_context: &mut PlanExecutionContext) {
         match &self.backend {
             ShuffleBackend::Ray => {}
-            ShuffleBackend::Flight {
-                shuffle_id,
-                shuffle_dirs,
-                ..
-            } => {
-                flight::register_cleanup(*shuffle_id, shuffle_dirs, plan_context);
+            ShuffleBackend::Flight { shuffle_dirs, .. } => {
+                flight::register_cleanup(shuffle_dirs, plan_context);
             }
         }
     }
@@ -104,7 +100,8 @@ impl ShuffleContext {
                     LocalNodeContext::new(Some(node_id as usize)),
                 );
                 let plan = wrap_plan(in_memory_scan);
-                Ok(SwordfishTaskBuilder::new(plan, node, node_id).with_psets(node_id, partition_refs))
+                Ok(SwordfishTaskBuilder::new(plan, node, node_id)
+                    .with_psets(node_id, partition_refs))
             }
             ShuffleBackend::Flight { .. } => {
                 let read_inputs = flight::read_inputs_from_refs(partition_refs)?;

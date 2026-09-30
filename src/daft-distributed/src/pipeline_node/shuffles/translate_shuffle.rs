@@ -22,11 +22,11 @@ const PARTITION_SLOT_HEAD_MEMORY_BYTES: usize = 3 * 1024;
 impl LogicalPlanToPipelineNodeTranslator {
     /// Pick the shuffle backend implied by the current execution config.
     pub(crate) fn select_backend(&self) -> ShuffleBackend {
-        if self.plan_config.config.shuffle_algorithm.as_str() == "flight_shuffle" {
+        if self.plan_config.uses_flight_shuffle() {
             ShuffleBackend::Flight {
                 // Placeholder; each shuffle node stamps its own id in `ShuffleContext::new`.
                 shuffle_id: 0,
-                shuffle_dirs: self.plan_config.config.flight_shuffle_dirs.clone(),
+                shuffle_dirs: self.plan_config.flight_shuffle_dirs(),
                 compression: self.plan_config.config.flight_shuffle_compression.clone(),
             }
         } else {

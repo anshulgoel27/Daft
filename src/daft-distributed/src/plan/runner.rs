@@ -89,7 +89,11 @@ impl PlanExecutionContext {
 
     /// Register shuffle directories for cleanup when the plan completes
     pub fn register_shuffle_dirs(&mut self, dirs: Vec<String>) {
-        self.shuffle_dirs.extend(dirs);
+        for dir in dirs {
+            if !self.shuffle_dirs.contains(&dir) {
+                self.shuffle_dirs.push(dir);
+            }
+        }
     }
 }
 
@@ -98,6 +102,7 @@ pub(crate) struct PlanConfig {
     pub query_idx: QueryIdx,
     pub query_id: QueryID,
     pub config: Arc<DaftExecutionConfig>,
+    shuffle_namespace: u64,
 }
 
 impl From<&DistributedPhysicalPlan> for PlanConfig {
@@ -106,6 +111,7 @@ impl From<&DistributedPhysicalPlan> for PlanConfig {
             query_idx: plan.idx(),
             query_id: plan.query_id(),
             config: plan.execution_config().clone(),
+            shuffle_namespace: plan.shuffle_namespace(),
         }
     }
 }
@@ -116,7 +122,24 @@ impl PlanConfig {
             query_idx,
             query_id,
             config,
+            shuffle_namespace: rand::random(),
         }
+    }
+
+    pub fn uses_flight_shuffle(&self) -> bool {
+        self.config.shuffle_algorithm == "flight_shuffle"
+    }
+
+    /// This plan's own flight shuffle roots; empty unless the plan uses flight shuffle.
+    pub fn flight_shuffle_dirs(&self) -> Vec<String> {
+        if !self.uses_flight_shuffle() {
+            return Vec::new();
+        }
+        self.config
+            .flight_shuffle_dirs
+            .iter()
+            .map(|dir| format!("{dir}/daft_shuffle/{:016x}", self.shuffle_namespace))
+            .collect()
     }
 }
 

@@ -17,16 +17,8 @@ use crate::{
     utils::channel::Sender,
 };
 
-pub(crate) fn register_cleanup(
-    shuffle_id: u64,
-    shuffle_dirs: &[String],
-    plan_context: &mut PlanExecutionContext,
-) {
-    let shuffle_dirs_to_register: Vec<String> = shuffle_dirs
-        .iter()
-        .map(|base_dir| format!("{}/daft_shuffle/{}", base_dir, shuffle_id))
-        .collect();
-    plan_context.register_shuffle_dirs(shuffle_dirs_to_register);
+pub(crate) fn register_cleanup(shuffle_dirs: &[String], plan_context: &mut PlanExecutionContext) {
+    plan_context.register_shuffle_dirs(shuffle_dirs.to_vec());
 }
 
 /// `partition_ref_id` layout: `(input_id << 32) | partition_idx`.
@@ -69,7 +61,8 @@ pub(crate) async fn fold_outputs_from_stream(
             .downcast_ref::<FlightPartitionRef>()
             .ok_or_else(|| {
                 DaftError::InternalError(
-                    "expected flight partition ref while folding flight-shuffle outputs".to_string(),
+                    "expected flight partition ref while folding flight-shuffle outputs"
+                        .to_string(),
                 )
             })?;
         inputs_by_server

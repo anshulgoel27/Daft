@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import random
 import tempfile
 import threading
@@ -13,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import daft
+from daft import col
 from daft.io._generator import read_generator
 from daft.recordbatch.recordbatch import RecordBatch
 from tests.conftest import get_tests_daft_runner_name
@@ -254,6 +256,60 @@ def test_flight_shuffle(flight_shuffle_ctx, input_partitions, output_partitions)
 
         assert base_df.to_arrow().sort_by("ids") == df.to_arrow().sort_by("ids")
         assert len(df) == input_partitions * output_partitions
+
+
+def _plan_flight_shuffle_dirs(shuffle_root: str, shuffle_algorithm: str) -> list[str]:
+    from daft.daft import DistributedPhysicalPlan
+
+    df = daft.from_pydict({"id": list(range(8))}).repartition(2, "id")
+    with daft.execution_config_ctx(shuffle_algorithm=shuffle_algorithm, flight_shuffle_dirs=[shuffle_root]):
+        config = daft.context.get_context().daft_execution_config
+    plan = DistributedPhysicalPlan.from_logical_plan_builder(df._builder._builder, "query", config)
+    return plan.flight_shuffle_dirs()
+
+
+def test_flight_shuffle_dirs_are_unique_per_plan(tmp_path):
+    """Concurrent plans (even from separate drivers) must never share shuffle directories."""
+    first = _plan_flight_shuffle_dirs(str(tmp_path), "flight_shuffle")
+    second = _plan_flight_shuffle_dirs(str(tmp_path), "flight_shuffle")
+
+    assert first != second
+    for dirs in (first, second):
+        assert len(dirs) == 1
+        assert os.path.dirname(dirs[0]) == os.path.join(str(tmp_path), "daft_shuffle")
+
+
+def test_flight_shuffle_dirs_empty_without_flight_shuffle(tmp_path):
+    assert _plan_flight_shuffle_dirs(str(tmp_path), "map_reduce") == []
+
+
+@pytest.mark.skipif(
+    get_tests_daft_runner_name() != "ray",
+    reason="shuffle tests are meant for the ray runner",
+)
+@pytest.mark.parametrize("fail", [False, True])
+def test_flight_shuffle_cleanup_spares_other_plans_files(tmp_path, fail):
+    """Cleanup after success or failure must delete only this plan's shuffle files."""
+    other_plan_file = tmp_path / "daft_shuffle" / "other-plan" / "map_0.arrow"
+    other_plan_file.parent.mkdir(parents=True)
+    other_plan_file.write_bytes(b"shuffle data still being read by another plan")
+
+    @daft.func
+    def maybe_fail(x: int) -> int:
+        if fail:
+            raise ValueError("injected failure")
+        return x
+
+    with daft.execution_config_ctx(shuffle_algorithm="flight_shuffle", flight_shuffle_dirs=[str(tmp_path)]):
+        df = daft.from_pydict({"id": list(range(32))}).repartition(4, "id").select(maybe_fail(col("id")))
+        if fail:
+            with pytest.raises(Exception, match="injected failure"):
+                df.collect()
+        else:
+            assert sorted(df.to_pydict()["id"]) == list(range(32))
+
+    assert other_plan_file.exists()
+    assert os.listdir(tmp_path / "daft_shuffle") == ["other-plan"]
 
 
 @pytest.mark.skipif(

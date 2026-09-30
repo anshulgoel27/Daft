@@ -651,7 +651,7 @@ class RemoteFlotillaRunner:
         self.curr_result_gens[plan.idx()] = self.plan_runner.run_plan(plan, psets)
         shuffle_dirs = plan.flight_shuffle_dirs()
         if shuffle_dirs:
-            self._plan_shuffle_dirs[plan.idx()] = [f"{d}/daft_shuffle" for d in shuffle_dirs]
+            self._plan_shuffle_dirs[plan.idx()] = shuffle_dirs
 
     async def cleanup_plan_shuffle(self, plan_id: str) -> None:
         """Clean up flight shuffle dirs for a plan that failed or was cancelled."""
