@@ -74,6 +74,9 @@ def _clear_flight_shuffle_dirs(shuffle_dirs: list[str]) -> None:
             try:
                 shutil.rmtree(shuffle_dir)
                 logger.info("Cleared flight shuffle directory: %s", shuffle_dir)
+            except FileNotFoundError:
+                # Already removed by the plan's other cleanup path (Rust or driver side).
+                pass
             except Exception as e:
                 logger.warning("Failed to clear flight shuffle directory %s: %s", shuffle_dir, e)
 
@@ -654,12 +657,12 @@ class RemoteFlotillaRunner:
             self._plan_shuffle_dirs[plan.idx()] = shuffle_dirs
 
     async def cleanup_plan_shuffle(self, plan_id: str) -> None:
-        """Clean up flight shuffle dirs for a plan that failed or was cancelled."""
+        """Clean up flight shuffle dirs for a plan that failed, was cancelled, or was abandoned early."""
         self.curr_plans.pop(plan_id, None)
         self.curr_result_gens.pop(plan_id, None)
         shuffle_dirs = self._plan_shuffle_dirs.pop(plan_id, [])
         if shuffle_dirs:
-            logger.info("Cleaning up flight shuffle dirs after failure: %s", shuffle_dirs)
+            logger.info("Cleaning up flight shuffle dirs of unfinished plan: %s", shuffle_dirs)
             await clear_flight_shuffle_dirs_on_all_nodes(shuffle_dirs)
 
     async def get_next_partition(self, plan_id: str) -> RayMaterializedResult | PyExecutionStats | None:
@@ -863,8 +866,13 @@ class FlotillaRunner:
                 if isinstance(result, PyExecutionStats):
                     return result
                 yield result
-        except Exception:
-            ray.get(self.runner.cleanup_plan_shuffle.remote(plan_id))
+        except BaseException:
+            # Also on GeneratorExit (e.g. `.show()` stops early): this plan's shuffle namespace is
+            # never reused, so nothing else would delete it.
+            try:
+                ray.get(self.runner.cleanup_plan_shuffle.remote(plan_id))
+            except Exception as e:
+                logger.warning("Flight shuffle cleanup failed for plan %s: %s", plan_id, e)
             raise
         finally:
             self._active_plan_id = None

@@ -61,8 +61,7 @@ pub(crate) async fn fold_outputs_from_stream(
             .downcast_ref::<FlightPartitionRef>()
             .ok_or_else(|| {
                 DaftError::InternalError(
-                    "expected flight partition ref while folding flight-shuffle outputs"
-                        .to_string(),
+                    "expected flight partition ref while folding flight-shuffle outputs".to_string(),
                 )
             })?;
         inputs_by_server

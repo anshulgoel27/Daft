@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use common_daft_config::DaftExecutionConfig;
-use common_error::DaftResult;
+use common_error::{DaftError, DaftResult};
 use common_metrics::QueryID;
 use common_runtime::{JoinSet, create_join_set};
 use futures::{Stream, StreamExt};
@@ -117,6 +117,7 @@ impl From<&DistributedPhysicalPlan> for PlanConfig {
 }
 
 impl PlanConfig {
+    #[cfg(test)]
     pub fn new(query_idx: QueryIdx, query_id: QueryID, config: Arc<DaftExecutionConfig>) -> Self {
         Self {
             query_idx,
@@ -227,18 +228,25 @@ impl<W: Worker<Task = SwordfishTask>> PlanRunner<W> {
         let running_stage = RunningPlan::new(running_node, plan_context);
 
         let mut materialized_result_stream = running_stage.materialize(scheduler_handle);
-        while let Some(result) = materialized_result_stream.next().await {
-            if sender.send(result?).await.is_err() {
-                break;
+        let result = async {
+            while let Some(result) = materialized_result_stream.next().await {
+                if sender.send(result?).await.is_err() {
+                    break;
+                }
             }
+            Ok::<(), DaftError>(())
         }
+        .await;
+        drop(materialized_result_stream);
 
+        // Clean up on failure too: this plan's shuffle namespace is never reused, so nothing
+        // else would delete it.
         if !shuffle_dirs.is_empty()
             && let Err(e) = self.worker_manager.cleanup_shuffle_dirs(shuffle_dirs).await
         {
             tracing::warn!("Failed to clear flight shuffle directories: {}", e);
         }
 
-        Ok(())
+        result
     }
 }

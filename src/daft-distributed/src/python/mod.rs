@@ -130,11 +130,7 @@ impl PyDistributedPhysicalPlan {
 
     fn num_partitions(&self) -> PyResult<usize> {
         // Create pipeline nodes from the logical plan
-        let plan_config = PlanConfig::new(
-            self.plan.idx(),
-            self.plan.query_id(),
-            self.plan.execution_config().clone(),
-        );
+        let plan_config = PlanConfig::from(&self.plan);
         let translation = logical_plan_to_pipeline_node(
             plan_config,
             self.plan.logical_plan().clone(),
@@ -149,11 +145,7 @@ impl PyDistributedPhysicalPlan {
     /// caller receives a single self-contained string — emitting them as `warnings.warn` here
     /// would write to stderr mid-call and interleave with the plan body on stdout.
     fn repr_ascii(&self, simple: bool) -> PyResult<String> {
-        let plan_config = PlanConfig::new(
-            self.plan.idx(),
-            self.plan.query_id(),
-            self.plan.execution_config().clone(),
-        );
+        let plan_config = PlanConfig::from(&self.plan);
         let translation = logical_plan_to_pipeline_node(
             plan_config,
             self.plan.logical_plan().clone(),
@@ -176,11 +168,7 @@ impl PyDistributedPhysicalPlan {
     /// Visualize the distributed pipeline as Mermaid markdown
     fn repr_mermaid(&self, simple: bool, bottom_up: bool) -> PyResult<String> {
         // Create a pipeline node from the stage plan
-        let plan_config = PlanConfig::new(
-            self.plan.idx(),
-            self.plan.query_id(),
-            self.plan.execution_config().clone(),
-        );
+        let plan_config = PlanConfig::from(&self.plan);
         let translation = logical_plan_to_pipeline_node(
             plan_config,
             self.plan.logical_plan().clone(),
@@ -203,11 +191,7 @@ impl PyDistributedPhysicalPlan {
 
     #[pyo3(signature = (psets=None))]
     fn repr_json(&self, psets: Option<HashMap<String, Vec<RayPartitionRef>>>) -> PyResult<String> {
-        let plan_config = PlanConfig::new(
-            self.plan.idx(),
-            self.plan.query_id(),
-            self.plan.execution_config().clone(),
-        );
+        let plan_config = PlanConfig::from(&self.plan);
         let psets = match psets {
             Some(psets) => Arc::new(
                 psets

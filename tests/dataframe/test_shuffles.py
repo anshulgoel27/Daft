@@ -309,7 +309,24 @@ def test_flight_shuffle_cleanup_spares_other_plans_files(tmp_path, fail):
             assert sorted(df.to_pydict()["id"]) == list(range(32))
 
     assert other_plan_file.exists()
+    assert os.listdir(tmp_path) == ["daft_shuffle"]
     assert os.listdir(tmp_path / "daft_shuffle") == ["other-plan"]
+
+
+@pytest.mark.skipif(
+    get_tests_daft_runner_name() != "ray",
+    reason="shuffle tests are meant for the ray runner",
+)
+def test_flight_shuffle_cleanup_after_early_stop(tmp_path):
+    """A query abandoned partway (e.g. `.show()`) must still delete its own shuffle files."""
+    with daft.execution_config_ctx(shuffle_algorithm="flight_shuffle", flight_shuffle_dirs=[str(tmp_path)]):
+        df = daft.from_pydict({"id": list(range(32))}).into_partitions(4).repartition(4, "id")
+        parts = df.iter_partitions()
+        next(parts)
+        parts.close()
+
+    assert os.listdir(tmp_path) == ["daft_shuffle"]
+    assert os.listdir(tmp_path / "daft_shuffle") == []
 
 
 @pytest.mark.skipif(

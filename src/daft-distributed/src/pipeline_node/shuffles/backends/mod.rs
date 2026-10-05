@@ -100,8 +100,7 @@ impl ShuffleContext {
                     LocalNodeContext::new(Some(node_id as usize)),
                 );
                 let plan = wrap_plan(in_memory_scan);
-                Ok(SwordfishTaskBuilder::new(plan, node, node_id)
-                    .with_psets(node_id, partition_refs))
+                Ok(SwordfishTaskBuilder::new(plan, node, node_id).with_psets(node_id, partition_refs))
             }
             ShuffleBackend::Flight { .. } => {
                 let read_inputs = flight::read_inputs_from_refs(partition_refs)?;
