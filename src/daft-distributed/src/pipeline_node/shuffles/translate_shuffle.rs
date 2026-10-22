@@ -19,18 +19,74 @@ const LARGE_SHUFFLE_PARTITION_PRODUCT_HINT_THRESHOLD: usize = 500_000;
 // Map-reduce shuffle materializes one object per (input, output) slot on the head node.
 const PARTITION_SLOT_HEAD_MEMORY_BYTES: usize = 3 * 1024;
 
+enum LargeShuffleTrigger {
+    Bytes,
+    PartitionProduct(usize),
+}
+
+/// Whether a shuffle is large enough to risk Ray object-store / head-node memory pressure.
+fn large_shuffle_trigger(
+    input_size_bytes: usize,
+    input_num_partitions: usize,
+    output_num_partitions: usize,
+) -> Option<LargeShuffleTrigger> {
+    let partition_product = input_num_partitions.saturating_mul(output_num_partitions);
+    if input_size_bytes >= LARGE_SHUFFLE_SIZE_BYTES_HINT_THRESHOLD {
+        Some(LargeShuffleTrigger::Bytes)
+    } else if partition_product >= LARGE_SHUFFLE_PARTITION_PRODUCT_HINT_THRESHOLD {
+        Some(LargeShuffleTrigger::PartitionProduct(partition_product))
+    } else {
+        None
+    }
+}
+
+fn target_num_partitions(spec: &RepartitionSpec, input_num_partitions: usize) -> usize {
+    match spec {
+        RepartitionSpec::Hash(c) => c.num_partitions,
+        RepartitionSpec::Random(c) => c.num_partitions,
+        RepartitionSpec::Range(c) => c.num_partitions,
+    }
+    .unwrap_or(input_num_partitions)
+}
+
 impl LogicalPlanToPipelineNodeTranslator {
-    /// Pick the shuffle backend implied by the current execution config.
+    fn flight_backend(&self) -> ShuffleBackend {
+        ShuffleBackend::Flight {
+            // Placeholder; each shuffle node stamps its own id in `ShuffleContext::new`.
+            shuffle_id: 0,
+            shuffle_dirs: self.plan_config.config.flight_shuffle_dirs.clone(),
+            compression: self.plan_config.config.flight_shuffle_compression.clone(),
+        }
+    }
+
+    /// Pick the shuffle backend implied by the current execution config, ignoring shuffle size.
     pub(crate) fn select_backend(&self) -> ShuffleBackend {
         if self.plan_config.config.shuffle_algorithm.as_str() == "flight_shuffle" {
-            ShuffleBackend::Flight {
-                // Placeholder; each shuffle node stamps its own id in `ShuffleContext::new`.
-                shuffle_id: 0,
-                shuffle_dirs: self.plan_config.config.flight_shuffle_dirs.clone(),
-                compression: self.plan_config.config.flight_shuffle_compression.clone(),
-            }
+            self.flight_backend()
         } else {
             ShuffleBackend::Ray
+        }
+    }
+
+    /// Like `select_backend`, but in `"auto"` mode switches to flight shuffle when the shuffle is
+    /// large enough to risk Ray object-store / head-node memory pressure.
+    pub(crate) fn select_backend_for_shuffle(
+        &self,
+        input_size_bytes: usize,
+        input_num_partitions: usize,
+        output_num_partitions: usize,
+    ) -> ShuffleBackend {
+        if self.plan_config.config.shuffle_algorithm.as_str() == "auto"
+            && large_shuffle_trigger(
+                input_size_bytes,
+                input_num_partitions,
+                output_num_partitions,
+            )
+            .is_some()
+        {
+            self.flight_backend()
+        } else {
+            self.select_backend()
         }
     }
 
@@ -41,7 +97,10 @@ impl LogicalPlanToPipelineNodeTranslator {
         child: DistributedPipelineNode,
         input_size_bytes: usize,
     ) -> DaftResult<DistributedPipelineNode> {
-        let backend = self.select_backend();
+        let input_num_partitions = child.config().clustering_spec.num_partitions();
+        let num_partitions = target_num_partitions(&repartition_spec, input_num_partitions);
+        let backend =
+            self.select_backend_for_shuffle(input_size_bytes, input_num_partitions, num_partitions);
         self.gen_repartition_node_with_backend(
             repartition_spec,
             schema,
@@ -60,12 +119,7 @@ impl LogicalPlanToPipelineNodeTranslator {
         input_size_bytes: usize,
     ) -> DaftResult<DistributedPipelineNode> {
         let input_num_partitions = child.config().clustering_spec.num_partitions();
-        let num_partitions = match &repartition_spec {
-            RepartitionSpec::Hash(c) => c.num_partitions,
-            RepartitionSpec::Random(c) => c.num_partitions,
-            RepartitionSpec::Range(c) => c.num_partitions,
-        }
-        .unwrap_or(input_num_partitions);
+        let num_partitions = target_num_partitions(&repartition_spec, input_num_partitions);
 
         self.maybe_warn_large_shuffle(
             &backend,
@@ -74,7 +128,9 @@ impl LogicalPlanToPipelineNodeTranslator {
             num_partitions,
         );
 
-        let use_pre_shuffle_merge = self.should_use_pre_shuffle_merge(&child, num_partitions)?;
+        // Flight shuffle spills to disk itself, so merging ahead of it is redundant.
+        let use_pre_shuffle_merge = !matches!(backend, ShuffleBackend::Flight { .. })
+            && self.should_use_pre_shuffle_merge(&child, num_partitions)?;
 
         let child_node = if use_pre_shuffle_merge {
             // Create merge node first
@@ -141,7 +197,7 @@ impl LogicalPlanToPipelineNodeTranslator {
             return input_node;
         }
 
-        let backend = self.select_backend();
+        let backend = self.select_backend_for_shuffle(input_size_bytes, input_num_partitions, 1);
 
         self.maybe_warn_large_shuffle(&backend, input_size_bytes, input_num_partitions, 1);
 
@@ -172,25 +228,32 @@ impl LogicalPlanToPipelineNodeTranslator {
         }
 
         let algo = &self.plan_config.config.shuffle_algorithm;
-
         // Both triggers point to the same fix (switch to flight_shuffle), so emit at most one
         // hint per shuffle op even if both thresholds are crossed.
-        let partition_product = input_num_partitions.saturating_mul(output_num_partitions);
-        if input_size_bytes >= LARGE_SHUFFLE_SIZE_BYTES_HINT_THRESHOLD {
-            self.record_flight_shuffle_hint(format!(
-                "Large shuffle (~{} via `{}` shuffle algorithm)",
-                bytes_to_human_readable(input_size_bytes),
-                algo,
-            ));
-        } else if partition_product >= LARGE_SHUFFLE_PARTITION_PRODUCT_HINT_THRESHOLD {
-            let head_memory = partition_product.saturating_mul(PARTITION_SLOT_HEAD_MEMORY_BYTES);
-            self.record_flight_shuffle_hint(format!(
-                "Shuffle with many partitions ({} × {} = {} pieces, ~{} of head-node memory)",
-                input_num_partitions,
-                output_num_partitions,
-                partition_product,
-                bytes_to_human_readable(head_memory),
-            ));
+        match large_shuffle_trigger(
+            input_size_bytes,
+            input_num_partitions,
+            output_num_partitions,
+        ) {
+            Some(LargeShuffleTrigger::Bytes) => {
+                self.record_flight_shuffle_hint(format!(
+                    "Large shuffle (~{} via `{}` shuffle algorithm)",
+                    bytes_to_human_readable(input_size_bytes),
+                    algo,
+                ));
+            }
+            Some(LargeShuffleTrigger::PartitionProduct(partition_product)) => {
+                let head_memory =
+                    partition_product.saturating_mul(PARTITION_SLOT_HEAD_MEMORY_BYTES);
+                self.record_flight_shuffle_hint(format!(
+                    "Shuffle with many partitions ({} × {} = {} pieces, ~{} of head-node memory)",
+                    input_num_partitions,
+                    output_num_partitions,
+                    partition_product,
+                    bytes_to_human_readable(head_memory),
+                ));
+            }
+            None => {}
         }
     }
 
