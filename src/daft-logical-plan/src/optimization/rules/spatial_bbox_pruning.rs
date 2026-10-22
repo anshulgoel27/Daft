@@ -40,7 +40,6 @@ use std::sync::Arc;
 use common_error::DaftResult;
 use common_treenode::{Transformed, TreeNode};
 use daft_algebra::boolean::{combine_conjunction, split_conjunction};
-use daft_core::prelude::Operator;
 use daft_dsl::{
     Expr, ExprRef,
     expr::{Column, ResolvedColumn},

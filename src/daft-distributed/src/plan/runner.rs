@@ -131,16 +131,32 @@ impl PlanConfig {
         self.config.shuffle_algorithm == "flight_shuffle"
     }
 
-    /// This plan's own flight shuffle roots; empty unless the plan uses flight shuffle.
-    pub fn flight_shuffle_dirs(&self) -> Vec<String> {
-        if !self.uses_flight_shuffle() {
-            return Vec::new();
-        }
+    /// Whether any shuffle in this plan may use flight shuffle: explicitly, or via `"auto"`
+    /// picking it for a large shuffle.
+    pub fn may_use_flight_shuffle(&self) -> bool {
+        matches!(
+            self.config.shuffle_algorithm.as_str(),
+            "flight_shuffle" | "auto"
+        )
+    }
+
+    /// This plan's own flight shuffle roots, regardless of the shuffle algorithm.
+    pub fn namespaced_flight_shuffle_dirs(&self) -> Vec<String> {
         self.config
             .flight_shuffle_dirs
             .iter()
             .map(|dir| format!("{dir}/daft_shuffle/{:016x}", self.shuffle_namespace))
             .collect()
+    }
+
+    /// Flight shuffle roots to clean up if the plan fails; empty unless the plan may use flight
+    /// shuffle. Dirs of a plan that never ended up using flight don't exist, so cleaning them is
+    /// a no-op.
+    pub fn flight_shuffle_dirs(&self) -> Vec<String> {
+        if !self.may_use_flight_shuffle() {
+            return Vec::new();
+        }
+        self.namespaced_flight_shuffle_dirs()
     }
 }
 

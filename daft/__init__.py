@@ -136,7 +136,7 @@ from daft.session import (
     set_session,
     write_table,
 )
-from daft.udf import udf, udaf, func, cls, method, metrics
+from daft.udf import udaf, func, cls, method, metrics
 from daft.io._range import _range
 from daft.io import (
     IOConfig,
@@ -156,6 +156,7 @@ from daft.io import (
     read_json,
     read_kafka,
     read_parquet,
+    read_orc,
     read_sql,
     read_text,
     update_deltalake,
@@ -300,6 +301,7 @@ __all__ = [
     "read_kafka",
     "read_lance",
     "read_mcap",
+    "read_orc",
     "read_paimon",
     "read_parquet",
     "read_sql",
@@ -325,7 +327,6 @@ __all__ = [
     "sql",
     "sql_expr",
     "udaf",
-    "udf",
     "with_subscriber",
     "write_table",
 ]

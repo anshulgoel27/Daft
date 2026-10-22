@@ -201,7 +201,8 @@ impl PackedRTree {
         }
     }
 
-    /// Collecting convenience for tests and small callers.
+    /// Collecting convenience for tests.
+    #[cfg(test)]
     pub fn search(&self, q: &[f64; 4]) -> Vec<u32> {
         let mut out = Vec::new();
         self.for_each_intersecting(q, |i| out.push(i));
