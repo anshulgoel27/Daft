@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use arrow::array::ArrayRef;
 use common_error::DaftResult;
@@ -12,7 +12,7 @@ use daft_recordbatch::RecordBatch;
 use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 
-use crate::{DaftParquetMetadata, infer_schema_from_daft_metadata};
+use crate::{DaftParquetMetadata, infer_schema_from_daft_metadata, metadata::FieldIdMapping};
 
 /// (path, reason, partial). `partial=true` means some batches were already emitted before
 /// corruption was detected; the file is not fully skipped.
@@ -104,7 +104,7 @@ pub struct ParquetReadOptions {
     pub row_groups: Option<Vec<i64>>,
     pub predicate: Option<ExprRef>,
     pub schema_infer: ParquetSchemaInferenceOptions,
-    pub field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
+    pub field_id_mapping: Option<Arc<FieldIdMapping>>,
     pub delete_rows: Option<Vec<i64>>,
     pub batch_size: Option<usize>,
     /// Exact on-disk file size when already known (e.g. from a catalog transaction
@@ -156,7 +156,7 @@ pub struct ParquetBulkReadOptions {
     pub num_rows: Option<usize>,
     pub predicate: Option<ExprRef>,
     pub schema_infer: ParquetSchemaInferenceOptions,
-    pub field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
+    pub field_id_mapping: Option<Arc<FieldIdMapping>>,
     pub batch_size: Option<usize>,
     pub num_parallel_tasks: usize,
     /// Per-uri overrides. Must be empty or `len() == uris.len()`.
@@ -491,7 +491,7 @@ pub async fn read_parquet_schema_and_metadata(
     io_client: Arc<IOClient>,
     io_stats: Option<IOStatsRef>,
     schema_inference_options: ParquetSchemaInferenceOptions,
-    field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
+    field_id_mapping: Option<Arc<FieldIdMapping>>,
 ) -> DaftResult<(Schema, DaftParquetMetadata)> {
     let metadata = crate::metadata::read_parquet_metadata(
         uri,
@@ -511,7 +511,7 @@ pub async fn read_parquet_metadata(
     uri: &str,
     io_client: Arc<IOClient>,
     io_stats: Option<IOStatsRef>,
-    field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
+    field_id_mapping: Option<Arc<FieldIdMapping>>,
 ) -> DaftResult<DaftParquetMetadata> {
     let metadata = crate::metadata::read_parquet_metadata(
         uri,
@@ -529,7 +529,7 @@ pub async fn read_parquet_metadata_bulk(
     uris: &[&str],
     io_client: Arc<IOClient>,
     io_stats: Option<IOStatsRef>,
-    field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
+    field_id_mapping: Option<Arc<FieldIdMapping>>,
 ) -> DaftResult<Vec<DaftParquetMetadata>> {
     let io_runtime = get_io_runtime(true);
     let mut joinset: OrderedJoinSet<DaftResult<DaftParquetMetadata>> = OrderedJoinSet::new();
@@ -558,7 +558,7 @@ pub async fn stream_parquet_count_pushdown(
     url: &str,
     io_client: Arc<IOClient>,
     io_stats: Option<IOStatsRef>,
-    field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
+    field_id_mapping: Option<Arc<FieldIdMapping>>,
     aggregation: &ExprRef,
     row_groups: Option<&[i64]>,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
@@ -600,7 +600,7 @@ pub fn read_parquet_statistics(
     uris: &Series,
     io_client: Arc<IOClient>,
     io_stats: Option<IOStatsRef>,
-    field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
+    field_id_mapping: Option<Arc<FieldIdMapping>>,
 ) -> DaftResult<RecordBatch> {
     if uris.data_type() != &DataType::Utf8 {
         return Err(common_error::DaftError::ValueError(format!(
@@ -749,18 +749,9 @@ mod tests {
 
     #[test]
     fn test_invalid_utf8_parquet_reading() {
-        let parquet: Arc<str> = path_macro::path!(
-            env!("CARGO_MANIFEST_DIR")
-                / ".."
-                / ".."
-                / "tests"
-                / "assets"
-                / "parquet-data"
-                / "invalid_utf8.parquet"
-        )
-        .to_str()
-        .unwrap()
-        .into();
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("../../tests/assets/parquet-data/invalid_utf8.parquet");
+        let parquet: Arc<str> = path.to_str().unwrap().into();
         let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
         let runtime = get_io_runtime(true);
         let file_metadata = runtime
