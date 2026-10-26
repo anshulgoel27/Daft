@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,9 @@ try:
     import ray
 except ImportError:
     raise
+
+# Ray actor states before the actor's __init__ has finished (see ray.util.state.ActorState).
+_ACTOR_STATES_NOT_YET_UP = ("DEPENDENCIES_UNREADY", "PENDING_CREATION")
 
 MAX_UDFACTOR_ACTOR_RESTARTS = 4
 MAX_UDFACTOR_ACTOR_TASK_RETRIES = 4
@@ -63,6 +67,15 @@ def get_ready_actors_by_location(
 
     current_node_id = ray.get_runtime_context().get_node_id()
 
+    # An elastic pool (see start_udf_actors_elastic) includes actors Ray has not scheduled yet. Only the
+    # ones that are up can take work; the rest join the pool for tasks that start after they come up.
+    # If none are up yet, keep them all so calls queue on the actors instead of leaving no actors at all.
+    up_actor_handles = [
+        h for h in actor_handles if (actors(h.actor_id()) or {}).get("State") not in _ACTOR_STATES_NOT_YET_UP
+    ]
+    if up_actor_handles:
+        actor_handles = up_actor_handles
+
     local_actors = []
     remote_actors = []
     for actor_handle in actor_handles:
@@ -76,7 +89,7 @@ def get_ready_actors_by_location(
     return local_actors, remote_actors
 
 
-async def start_udf_actors(
+def _create_udf_actors(
     projection: PyExpr,
     num_actors: int,
     num_gpus_per_actor: float,
@@ -85,7 +98,12 @@ async def start_udf_actors(
     ray_options: dict[str, Any] | None,
     timeout: int,
     actor_name: str | None = None,
-) -> list[UDFActorHandle]:
+) -> list[RayActorHandle]:
+    """Validate the resource request and submit ``num_actors`` UDF actors to Ray.
+
+    Returns immediately: the actors are created asynchronously by Ray and may not be ready (or even
+    scheduled, if the cluster has no free resources for them yet).
+    """
     expr_projection = ExpressionsProjection([Expression._from_pyexpr(projection)])
 
     # If resources are already in ray_options, we should prioritize them and avoid passing them twice
@@ -145,6 +163,110 @@ async def start_udf_actors(
         ).remote(expr_projection)
         for rank in range(num_actors)
     ]
+    return actors
+
+
+async def start_udf_actors_elastic(
+    projection: PyExpr,
+    num_actors: int,
+    num_gpus_per_actor: float,
+    num_cpus_per_actor: float,
+    memory_per_actor: float,
+    ray_options: dict[str, Any] | None,
+    timeout: int,
+    actor_name: str | None = None,
+    min_ready: int = 1,
+) -> list[UDFActorHandle]:
+    """Start ``num_actors`` UDF actors but return as soon as ``min_ready`` of them are ready.
+
+    Unlike ``start_udf_actors``, actors that are not ready yet (for example because the cluster has no free
+    resources for them) are returned too, not dropped. Ray keeps scheduling them, and every task skips the
+    ones that are not alive yet when it resolves its actors (see ``get_ready_actors_by_location``), so
+    later tasks use a larger pool as the pending actors come up.
+
+    If fewer than ``min_ready`` are ready after ``timeout`` seconds, it proceeds with the ones that are;
+    if none are ready, it kills them all and raises.
+    """
+    needed = min(max(min_ready, 1), num_actors)
+    actors = _create_udf_actors(
+        projection,
+        num_actors,
+        num_gpus_per_actor,
+        num_cpus_per_actor,
+        memory_per_actor,
+        ray_options,
+        timeout,
+        actor_name,
+    )
+    pending = {actor.__ray_ready__.remote(): actor for actor in actors}
+    num_ready = 0
+
+    def _teardown() -> None:
+        for actor in actors:
+            try:
+                ray.kill(actor)
+            except (ValueError, ray.exceptions.RayError) as e:
+                logger.warning("Error tearing down UDF actor: %s", e)
+
+    deadline = time.monotonic() + timeout
+    while True:
+        if pending:
+            done, _ = ray.wait(list(pending), num_returns=len(pending), timeout=0)
+            for ref in done:
+                pending.pop(ref)
+                try:
+                    ray.get(ref)
+                    num_ready += 1
+                except ray.exceptions.RayError as e:
+                    logger.warning("UDF actor failed to start: %s", e)
+        if num_ready >= needed:
+            break
+        if not pending:
+            # Every actor either became ready or failed, and fewer than `needed` are usable.
+            if num_ready:
+                break
+            _teardown()
+            raise RuntimeError(f"All {num_actors} UDF actors failed to start; see the warnings above for the cause.")
+        if time.monotonic() >= deadline:
+            if num_ready:
+                logger.warning(
+                    "Only %d of the %d UDF actors wanted are ready after %ds; starting with them. "
+                    "The remaining actors join the pool when Ray schedules them.",
+                    num_ready,
+                    needed,
+                    timeout,
+                )
+                break
+            _teardown()
+            raise RuntimeError(
+                f"UDF actors failed to start within {timeout} seconds, please increase the actor_udf_ready_timeout config "
+                f"via daft.set_execution_config(actor_udf_ready_timeout=timeout)"
+            )
+        await asyncio.sleep(0.2)
+
+    return [UDFActorHandle(actor) for actor in actors]
+
+
+async def start_udf_actors(
+    projection: PyExpr,
+    num_actors: int,
+    num_gpus_per_actor: float,
+    num_cpus_per_actor: float,
+    memory_per_actor: float,
+    ray_options: dict[str, Any] | None,
+    timeout: int,
+    actor_name: str | None = None,
+) -> list[UDFActorHandle]:
+    actors = _create_udf_actors(
+        projection,
+        num_actors,
+        num_gpus_per_actor,
+        num_cpus_per_actor,
+        memory_per_actor,
+        ray_options,
+        timeout,
+        actor_name,
+    )
 
     # Wait for actors to be ready
     ready_futures = [asyncio.wrap_future(actor.__ray_ready__.remote().future()) for actor in actors]

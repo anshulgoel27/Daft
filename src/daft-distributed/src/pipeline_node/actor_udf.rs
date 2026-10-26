@@ -41,6 +41,7 @@ impl UDFActors {
         udf_expr: &BoundExpr,
         udf_properties: &UDFProperties,
         actor_ready_timeout: usize,
+        min_ready: usize,
     ) -> DaftResult<Vec<PyObjectWrapper>> {
         let py_expr = PyExpr {
             expr: udf_expr.inner().clone(),
@@ -68,19 +69,39 @@ impl UDFActors {
                     Some(ro) => ro.as_ref().clone_ref(py),
                     None => py.None(),
                 };
-                ray_actor_pool_udf_module.call_method1(
-                    pyo3::intern!(py, "start_udf_actors"),
-                    (
-                        py_expr,
-                        num_actors,
-                        gpu_request,
-                        cpu_request,
-                        memory_request,
-                        py_ray_options,
-                        actor_ready_timeout,
-                        actor_name,
-                    ),
-                )
+                if min_ready > 0 {
+                    // Elastic pool: returns once `min_ready` actors are ready, but the list also holds
+                    // the actors Ray has not scheduled yet. Each task skips the ones that are not up
+                    // when it resolves its actors, so later tasks use more of them as they come up.
+                    ray_actor_pool_udf_module.call_method1(
+                        pyo3::intern!(py, "start_udf_actors_elastic"),
+                        (
+                            py_expr,
+                            num_actors,
+                            gpu_request,
+                            cpu_request,
+                            memory_request,
+                            py_ray_options,
+                            actor_ready_timeout,
+                            actor_name,
+                            min_ready,
+                        ),
+                    )
+                } else {
+                    ray_actor_pool_udf_module.call_method1(
+                        pyo3::intern!(py, "start_udf_actors"),
+                        (
+                            py_expr,
+                            num_actors,
+                            gpu_request,
+                            cpu_request,
+                            memory_request,
+                            py_ray_options,
+                            actor_ready_timeout,
+                            actor_name,
+                        ),
+                    )
+                }
             })
             .await?;
 
@@ -91,12 +112,20 @@ impl UDFActors {
         Ok(actors)
     }
 
-    async fn get_actors(&mut self, actor_ready_timeout: usize) -> DaftResult<Vec<PyObjectWrapper>> {
+    async fn get_actors(
+        &mut self,
+        actor_ready_timeout: usize,
+        min_ready: usize,
+    ) -> DaftResult<Vec<PyObjectWrapper>> {
         match self {
             Self::Uninitialized(projection, udf_properties) => {
-                let actors =
-                    Self::initialize_actors(projection, udf_properties, actor_ready_timeout)
-                        .await?;
+                let actors = Self::initialize_actors(
+                    projection,
+                    udf_properties,
+                    actor_ready_timeout,
+                    min_ready,
+                )
+                .await?;
                 *self = Self::Initialized {
                     actors: actors.clone(),
                 };
@@ -128,6 +157,8 @@ pub(crate) struct ActorUDF {
     required_columns: Vec<usize>,
     udf_properties: UDFProperties,
     actor_ready_timeout: usize,
+    /// Non-zero starts an elastic pool (see `initialize_actors`).
+    actor_min_ready: usize,
 }
 
 impl ActorUDF {
@@ -169,6 +200,7 @@ impl ActorUDF {
             required_columns,
             udf_properties,
             actor_ready_timeout: plan_config.config.actor_udf_ready_timeout,
+            actor_min_ready: plan_config.config.actor_udf_min_ready,
         })
     }
 
@@ -182,7 +214,9 @@ impl ActorUDF {
 
         let mut running_tasks = JoinSet::new();
         while let Some(builder) = input_task_stream.next().await {
-            let actors = udf_actors.get_actors(self.actor_ready_timeout).await?;
+            let actors = udf_actors
+                .get_actors(self.actor_ready_timeout, self.actor_min_ready)
+                .await?;
 
             let modified_builder = self.append_actor_udf_to_builder(builder, actors);
             let (builder_with_token, notify_token) = modified_builder.add_notify_token();

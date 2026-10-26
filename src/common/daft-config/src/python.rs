@@ -117,6 +117,7 @@ impl PyDaftExecutionConfig {
         scantask_max_parallel=None,
         native_parquet_writer=None,
         actor_udf_ready_timeout=None,
+        actor_udf_min_ready=None,
         maintain_order=None,
         enable_dynamic_batching=None,
         dynamic_batching_strategy=None,
@@ -154,6 +155,7 @@ impl PyDaftExecutionConfig {
         scantask_max_parallel: Option<usize>,
         native_parquet_writer: Option<bool>,
         actor_udf_ready_timeout: Option<usize>,
+        actor_udf_min_ready: Option<usize>,
         maintain_order: Option<bool>,
         enable_dynamic_batching: Option<bool>,
         dynamic_batching_strategy: Option<&str>,
@@ -268,6 +270,10 @@ impl PyDaftExecutionConfig {
 
         if let Some(actor_udf_ready_timeout) = actor_udf_ready_timeout {
             config.actor_udf_ready_timeout = actor_udf_ready_timeout;
+        }
+
+        if let Some(actor_udf_min_ready) = actor_udf_min_ready {
+            config.actor_udf_min_ready = actor_udf_min_ready;
         }
 
         if let Some(maintain_order) = maintain_order {
@@ -448,6 +454,11 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn actor_udf_ready_timeout(&self) -> PyResult<usize> {
         Ok(self.config.actor_udf_ready_timeout)
+    }
+
+    #[getter]
+    fn actor_udf_min_ready(&self) -> PyResult<usize> {
+        Ok(self.config.actor_udf_min_ready)
     }
 
     #[getter]

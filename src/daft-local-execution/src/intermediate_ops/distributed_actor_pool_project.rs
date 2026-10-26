@@ -1,9 +1,10 @@
 use std::{
     num::NonZeroUsize,
     sync::{
-        Arc,
+        Arc, Mutex, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
     vec,
 };
 
@@ -100,12 +101,81 @@ impl From<common_py_serde::PyObjectWrapper> for ActorHandle {
     }
 }
 
+/// How often an elastic pool re-checks which of its actors are up.
+const ACTOR_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The actors of an elastic pool (`actor_udf_min_ready`): some were not up when the operator was built,
+/// and Ray keeps scheduling them. The operator is built once per worker and shared by every task of the
+/// plan, so the usable set is refreshed here, and the actor is picked per batch instead of being fixed
+/// per concurrency slot, which lets later batches use actors that came up after the first task started.
+struct DynamicActorPool {
+    all: Vec<ActorHandle>,
+    usable: RwLock<Vec<ActorHandle>>,
+    /// When to next refresh; `None` once every actor is up.
+    next_refresh: Mutex<Option<Instant>>,
+    counter: AtomicUsize,
+}
+
+impl DynamicActorPool {
+    fn new(all: Vec<ActorHandle>, usable: Vec<ActorHandle>) -> Self {
+        let counter = AtomicUsize::new(rand::rng().random_range(0..usable.len()));
+        Self {
+            all,
+            usable: RwLock::new(usable),
+            next_refresh: Mutex::new(Some(Instant::now() + ACTOR_REFRESH_INTERVAL)),
+            counter,
+        }
+    }
+
+    fn next_actor(&self) -> ActorHandle {
+        self.refresh_if_due();
+        let usable = self.usable.read().expect("actor list lock poisoned");
+        let idx = self.counter.fetch_add(1, Ordering::SeqCst) % usable.len();
+        usable[idx].clone()
+    }
+
+    fn refresh_if_due(&self) {
+        // One caller refreshes at a time; the others keep using the current list.
+        let Ok(mut next_refresh) = self.next_refresh.try_lock() else {
+            return;
+        };
+        match *next_refresh {
+            Some(due) if Instant::now() >= due => {}
+            _ => return,
+        }
+        match ActorHandle::get_actors_on_current_node(self.all.clone()) {
+            Ok((local, remote)) => {
+                let usable = if local.is_empty() { remote } else { local };
+                let all_up = usable.len() == self.all.len();
+                if !usable.is_empty() {
+                    *self.usable.write().expect("actor list lock poisoned") = usable;
+                }
+                *next_refresh = if all_up {
+                    None
+                } else {
+                    Some(Instant::now() + ACTOR_REFRESH_INTERVAL)
+                };
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to refresh the UDF actor pool, keeping the current actors: {e}"
+                );
+                *next_refresh = Some(Instant::now() + ACTOR_REFRESH_INTERVAL);
+            }
+        }
+    }
+}
+
 pub(crate) struct DistributedActorPoolProjectState {
     actor_handle: ActorHandle,
 }
 
 pub(crate) struct DistributedActorPoolProjectOperator {
     actor_handles: Vec<ActorHandle>,
+    /// Number of actors in the pool, including ones that are not up yet.
+    total_actors: usize,
+    /// Set only for an elastic pool that had actors pending at build time.
+    dynamic: Option<Arc<DynamicActorPool>>,
     batch_size: Option<usize>,
     memory_request: u64,
     passthrough_columns: Vec<BoundExpr>, // Columns that no need to be passed to UDFActor for processing
@@ -123,14 +193,25 @@ impl DistributedActorPoolProjectOperator {
         required_columns: Vec<usize>,
         schema: SchemaRef,
     ) -> DaftResult<Self> {
-        let actor_handles: Vec<ActorHandle> = actor_handles.into_iter().map(|e| e.into()).collect();
+        let all_actor_handles: Vec<ActorHandle> =
+            actor_handles.into_iter().map(|e| e.into()).collect();
+        let total_actors = all_actor_handles.len();
         let (local_actor_handles, remote_actor_handles) =
-            ActorHandle::get_actors_on_current_node(actor_handles)?;
+            ActorHandle::get_actors_on_current_node(all_actor_handles.clone())?;
 
         let actor_handles = match local_actor_handles.len() {
             0 => remote_actor_handles,
             _ => local_actor_handles,
         };
+
+        // The pool lists actors that are not up yet (an elastic pool): keep watching for them.
+        let dynamic =
+            (!actor_handles.is_empty() && actor_handles.len() < total_actors).then(|| {
+                Arc::new(DynamicActorPool::new(
+                    all_actor_handles,
+                    actor_handles.clone(),
+                ))
+            });
 
         let init_counter = if actor_handles.is_empty() {
             0
@@ -140,6 +221,8 @@ impl DistributedActorPoolProjectOperator {
 
         Ok(Self {
             actor_handles,
+            total_actors,
+            dynamic,
             batch_size,
             memory_request,
             passthrough_columns,
@@ -168,6 +251,11 @@ impl IntermediateOperator for DistributedActorPoolProjectOperator {
             let required_columns = self.required_columns.clone();
             let passthrough_columns = self.passthrough_columns.clone();
             let output_schema = self.schema.clone();
+            // A fixed pool keeps the actor its concurrency slot was given; an elastic one picks per batch.
+            let actor_handle = match &self.dynamic {
+                Some(pool) => pool.next_actor(),
+                None => state.actor_handle.clone(),
+            };
 
             let fut = task_spawner.spawn_with_memory_request(
                 memory_request,
@@ -192,7 +280,7 @@ impl IntermediateOperator for DistributedActorPoolProjectOperator {
                     let input_num_rows = pruned_input.num_rows();
 
                     // Call the UDF with pruned input
-                    let eval_output = state.actor_handle.eval_input(pruned_input).await?;
+                    let eval_output = actor_handle.eval_input(pruned_input).await?;
                     if eval_output.schema().fields().len() != 1 {
                         return Err(DaftError::InternalError(format!(
                             "UDF output schema must be a single column, but got '{}'",
@@ -283,7 +371,12 @@ impl IntermediateOperator for DistributedActorPoolProjectOperator {
     fn max_concurrency(&self) -> usize {
         // We set the max concurrency to be the number of actor handles * 2 to such that each actor handle has 2 workers submitting to it.
         // This allows inputs to be queued up concurrently with UDF execution.
-        self.actor_handles.len() * 2
+        match &self.dynamic {
+            // An elastic pool counts actors that are not up yet too: concurrency is fixed when the
+            // pipeline starts, and batches simply queue on the actors that are up until the rest join.
+            Some(_) => self.total_actors * 2,
+            None => self.actor_handles.len() * 2,
+        }
     }
 
     fn morsel_size_requirement(&self) -> Option<MorselSizeRequirement> {

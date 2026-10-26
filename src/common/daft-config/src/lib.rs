@@ -146,6 +146,9 @@ pub struct DaftExecutionConfig {
     pub scantask_max_parallel: usize,
     pub native_parquet_writer: bool,
     pub actor_udf_ready_timeout: usize,
+    /// If non-zero, UDF actor pools are elastic: execution starts once this many actors are ready and
+    /// the remaining ones join the pool as Ray schedules them. Zero keeps the fixed-size pool.
+    pub actor_udf_min_ready: usize,
     pub maintain_order: bool,
     pub enable_dynamic_batching: bool,
     pub dynamic_batching_strategy: String,
@@ -192,6 +195,7 @@ impl Default for DaftExecutionConfig {
             scantask_max_parallel: 8,
             native_parquet_writer: true,
             actor_udf_ready_timeout: 120,
+            actor_udf_min_ready: 0,
             maintain_order: true,
             enable_dynamic_batching: false,
             dynamic_batching_strategy: "auto".to_string(),
@@ -207,6 +211,7 @@ impl DaftExecutionConfig {
     const ENV_DAFT_SCANTASK_MAX_PARALLEL: &'static str = "DAFT_SCANTASK_MAX_PARALLEL";
     const ENV_DAFT_NATIVE_PARQUET_WRITER: &'static str = "DAFT_NATIVE_PARQUET_WRITER";
     const ENV_DAFT_ACTOR_UDF_READY_TIMEOUT: &'static str = "DAFT_ACTOR_UDF_READY_TIMEOUT";
+    const ENV_DAFT_ACTOR_UDF_MIN_READY: &'static str = "DAFT_ACTOR_UDF_MIN_READY";
     const ENV_PARQUET_INFLATION_FACTOR: &'static str = "DAFT_PARQUET_INFLATION_FACTOR";
     const ENV_CSV_INFLATION_FACTOR: &'static str = "DAFT_CSV_INFLATION_FACTOR";
     const ENV_JSON_INFLATION_FACTOR: &'static str = "DAFT_JSON_INFLATION_FACTOR";
@@ -240,6 +245,12 @@ impl DaftExecutionConfig {
             cfg.actor_udf_ready_timeout,
         ) {
             cfg.actor_udf_ready_timeout = val;
+        }
+
+        if let Some(val) =
+            parse_number_from_env(Self::ENV_DAFT_ACTOR_UDF_MIN_READY, cfg.actor_udf_min_ready)
+        {
+            cfg.actor_udf_min_ready = val;
         }
 
         if let Some(val) = parse_bool_from_env(Self::ENV_DAFT_MAINTAIN_ORDER) {
@@ -523,6 +534,28 @@ mod tests {
 
             unsafe {
                 std::env::remove_var(DaftExecutionConfig::ENV_DAFT_ACTOR_UDF_READY_TIMEOUT);
+            }
+        }
+
+        // ENV_DAFT_ACTOR_UDF_MIN_READY
+        {
+            let cfg = DaftExecutionConfig::from_env();
+            assert_eq!(cfg.actor_udf_min_ready, 0);
+
+            unsafe {
+                std::env::set_var(DaftExecutionConfig::ENV_DAFT_ACTOR_UDF_MIN_READY, "8");
+            }
+            let cfg = DaftExecutionConfig::from_env();
+            assert_eq!(cfg.actor_udf_min_ready, 8);
+
+            unsafe {
+                std::env::set_var(DaftExecutionConfig::ENV_DAFT_ACTOR_UDF_MIN_READY, "invalid");
+            }
+            let cfg = DaftExecutionConfig::from_env();
+            assert_eq!(cfg.actor_udf_min_ready, 0);
+
+            unsafe {
+                std::env::remove_var(DaftExecutionConfig::ENV_DAFT_ACTOR_UDF_MIN_READY);
             }
         }
 

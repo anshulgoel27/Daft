@@ -237,6 +237,7 @@ def set_execution_config(
     scantask_max_parallel: int | None = None,
     native_parquet_writer: bool | None = None,
     actor_udf_ready_timeout: int | None = None,
+    actor_udf_min_ready: int | None = None,
     maintain_order: bool | None = None,
     enable_dynamic_batching: bool | None = None,
     dynamic_batching_strategy: str | None = None,
@@ -285,6 +286,10 @@ def set_execution_config(
         scantask_max_parallel: Set the max parallelism for running scan tasks simultaneously. Currently, this only works for Native Runner. If set to 0, all available CPUs will be used. Defaults to 8.
         native_parquet_writer: Whether to use the native parquet writer vs the pyarrow parquet writer. Defaults to `True`.
         actor_udf_ready_timeout: Timeout for UDF actors to be ready. Defaults to 120 seconds.
+        actor_udf_min_ready: Makes UDF actor pools elastic on the Ray runner. Execution starts once this many
+            actors are ready (or the timeout passes with at least one ready), and the remaining actors join the
+            pool as Ray schedules them, so later work uses a larger pool. Defaults to 0, which keeps a fixed pool
+            of the actors that are ready within `actor_udf_ready_timeout`.
         maintain_order: Whether to maintain order during execution. Defaults to True. Some blocking sink operators (e.g. write_parquet) won't respect this flag and will always keep maintain_order as false, and propagate to child operators. It's useful to set this to False for running df.collect() when no ordering is required.
         enable_dynamic_batching: Whether to enable dynamic batching. Defaults to False.
         dynamic_batching_strategy: The strategy to use for dynamic batching. Defaults to 'auto'.
@@ -326,6 +331,7 @@ def set_execution_config(
             scantask_max_parallel=scantask_max_parallel,
             native_parquet_writer=native_parquet_writer,
             actor_udf_ready_timeout=actor_udf_ready_timeout,
+            actor_udf_min_ready=actor_udf_min_ready,
             maintain_order=maintain_order,
             enable_dynamic_batching=enable_dynamic_batching,
             dynamic_batching_strategy=dynamic_batching_strategy,
