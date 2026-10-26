@@ -55,7 +55,7 @@ without a base column.
 
 ## 3. Daft has NO accessor namespaces
 
-`Expression` exposes 247 **flat** methods. There is no `.str`, `.dt`, or `.list`
+`Expression` exposes 248 **flat** methods. There is no `.str`, `.dt`, or `.list`
 accessor. Habits from Polars/PySpark raise `AttributeError`:
 
 | Habit from | Wrong | Right |

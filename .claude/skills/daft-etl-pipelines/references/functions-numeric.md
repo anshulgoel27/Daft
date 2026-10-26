@@ -72,7 +72,7 @@ The elementwise inverse hyperbolic tangent of a numeric expression.
 ## between
 
 ```python
-between(expr: Expression, lower: Expression | int | float, upper: Expression | int | float) -> Expression
+between(expr: Expression, lower: Expression | float, upper: Expression | float) -> Expression
 ```
 
 Checks if values in the Expression are between lower and upper, inclusive.
@@ -278,7 +278,7 @@ The elementwise natural log of a numeric expression.
 ## log
 
 ```python
-log(expr: Expression, base: int | float=math.e) -> Expression
+log(expr: Expression, base: float=math.e) -> Expression
 ```
 
 The elementwise log with given base, of a numeric expression.
@@ -444,3 +444,14 @@ tanh(expr: Expression) -> Expression
 ```
 
 The elementwise hyperbolic tangent of a numeric expression.
+
+## try_divide
+
+```python
+try_divide(dividend: Expression, divisor: Expression) -> Expression
+```
+
+Divides two numbers, returning NULL where the divisor is 0.
+
+Equivalent to ``dividend / divisor`` (true division), except rows whose
+divisor is 0 produce NULL instead of infinity or NaN.

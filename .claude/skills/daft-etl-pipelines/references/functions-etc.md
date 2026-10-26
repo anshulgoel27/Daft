@@ -319,38 +319,6 @@ Args:
 Returns:
     Expression (Float64 Expression): the Jaccard similarity between the two vectors.
 
-## llm_generate
-
-```python
-llm_generate(text: Expression, model: str='facebook/opt-125m', provider: Literal['vllm', 'openai']='vllm', concurrency: int=1, batch_size: int | None=None, num_cpus: int | None=None, num_gpus: int | None=None, **generation_config: dict[str, Any]) -> Expression
-```
-
-A UDF for running LLM inference over an input column of strings.
-
-This UDF provides a flexible interface for text generation using various LLM providers.
-By default, it uses vLLM for efficient local inference.
-
-Args:
-    text (String Expression):
-        The input text column to generate from
-    model (str, default="facebook/opt-125m"):
-        The model identifier to use for generation
-    provider (str, default="vllm"):
-        The LLM provider to use for generation. Supported values: "vllm", "openai"
-    concurrency (int, default=1):
-        The number of concurrent instances of the model to run
-    batch_size (int, default=None):
-        The batch size for the UDF. If None, the batch size will be determined by defaults based on the provider.
-    num_cpus (int, default=None):
-        The number of CPUs to use for the UDF
-    num_gpus (int, default=None):
-        The number of GPUs to use for the UDF
-    generation_config (dict, default={}):
-        Configuration parameters for text generation (e.g., temperature, max_tokens)
-
-Returns:
-    Expression (String Expression): The generated text column
-
 ## named_struct
 
 ```python
@@ -471,7 +439,7 @@ Returns:
 ## run_process
 
 ```python
-run_process(args: Expression | list[Expression | Any], *, shell: bool=False, on_error: Literal['raise', 'ignore', 'log']='log', return_dtype: DataTypeLike=DataType.string()) -> Expression
+run_process(args: Expression | list[Expression | Any], *, shell: bool=False, on_error: Literal['raise', 'ignore', 'log']='log', return_dtype: DataTypeLike=DataType.string) -> Expression
 ```
 
 Returns an expression that runs an external process (optionally via a shell) and exposes its stdout as a column.

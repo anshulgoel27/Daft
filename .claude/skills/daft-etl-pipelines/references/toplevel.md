@@ -3,7 +3,7 @@
 ## attach
 
 ```python
-attach(object: Catalog | Provider | Table | UDF | DataFrame, alias: str | None=None) -> None
+attach(object: Catalog | Provider | Table | Func[Any, Any, Any] | DataFrame, alias: str | None=None) -> None
 ```
 
 Attaches a known attachable object like a Catalog or Table.
@@ -19,7 +19,7 @@ Attaches an external catalog to the current session.
 ## attach_function
 
 ```python
-attach_function(function: UDF, alias: str | None=None) -> None
+attach_function(function: Func[Any, Any, Any], alias: str | None=None) -> None
 ```
 
 Attaches a Python function as a UDF in the current session.
@@ -911,7 +911,7 @@ _(no docstring)_
 ## IOConfig
 
 ```python
-IOConfig(s3: S3Config | None=None, azure: AzureConfig | None=None, gcs: GCSConfig | None=None, http: HTTPConfig | None=None, unity: UnityConfig | None=None, hf: HuggingFaceConfig | None=None, disable_suffix_range: bool | None=None, tos: TosConfig | None=None, gravitino: GravitinoConfig | None=None, cos: CosConfig | None=None, goosefs: GooseFSConfig | None=None, opendal_backends: dict[str, dict[str, str]] | None=None, protocol_aliases: dict[str, str] | None=None)
+IOConfig(s3: S3Config | None=None, azure: AzureConfig | None=None, gcs: GCSConfig | None=None, http: HTTPConfig | None=None, unity: UnityConfig | None=None, hf: HuggingFaceConfig | None=None, disable_suffix_range: bool | None=None, tos: TosConfig | None=None, gravitino: GravitinoConfig | None=None, cos: CosConfig | None=None, goosefs: GooseFSConfig | None=None, hdfs: HdfsConfig | None=None, opendal_backends: dict[str, dict[str, str]] | None=None, protocol_aliases: dict[str, str] | None=None)
 ```
 
 Configuration for the native I/O layer, e.g. credentials for accessing cloud storage systems.
@@ -1029,7 +1029,7 @@ _(no docstring)_
 ## open_file
 
 ```python
-open_file(url: str, mode: Literal['r', 'rt', 'rb']='r', buffering: int=-1, encoding: str | None=None, io_config: IOConfig | None=None) -> io.IOBase
+open_file(url: str, mode: Literal['r', 'rt', 'rb']='r', buffering: int=-1, encoding: str | None=None, io_config: IOConfig | None=None) -> IO[str] | IO[bytes]
 ```
 
 Open a file from a URL, potentially from a remote filesystem using Daft's IO backend.
@@ -1078,6 +1078,62 @@ Args:
     end (int, optional): The end of the range. If not provided, the start is 0 and the end is `start`.
     step (int, optional): The step size of the range. Defaults to 1.
     partitions (int, optional): The number of partitions to split the range into. Defaults to 1.
+
+## read_avro
+
+```python
+read_avro(path: str | list[str], infer_schema: bool=True, schema: dict[str, DataType] | None=None, io_config: IOConfig | None=None, file_path_column: str | None=None, hive_partitioning: bool=False, checkpoint: 'CheckpointConfig | None'=None) -> DataFrame
+```
+
+Creates a DataFrame from Avro file(s).
+
+Args:
+    path (str): Path to Avro files (allows for wildcards; supports remote URLs to object stores such as ``s3://`` or ``gs://``)
+    infer_schema (bool): Whether to infer the schema of the Avro files, defaults to True.
+    schema (dict[str, DataType]): A schema that is used as the definitive schema for the Avro files if infer_schema is False, otherwise it is used as a schema hint that is applied after the schema is inferred (overriding the types of inferred columns, and appending any new columns not found during inference).
+    io_config (IOConfig): Config to be used with the native downloader
+    file_path_column: Include the source path(s) as a column with this name. Defaults to None.
+    hive_partitioning: Whether to infer hive_style partitions from file paths and include them as columns in the Dataframe. Defaults to False.
+    checkpoint: Optional :class:`daft.CheckpointConfig` for progress tracking across runs. Bundles the
+        checkpoint store, the source key column (``on=``), and optional anti-join tuning. Rows whose key
+        already exists in the store are skipped on re-run. Requires the Ray runner.
+
+Returns:
+    DataFrame: parsed DataFrame
+
+## read_blob
+
+```python
+read_blob(path: str | list[str], *, max_connections: int=32, on_error: Literal['raise', 'null']='raise', io_config: IOConfig | None=None) -> DataFrame
+```
+
+Creates a DataFrame from the contents of file(s), where each file is read as a single row of raw bytes.
+
+This is similar to DuckDB's `read_blob` function, and is useful for reading files that are not stored
+in a tabular format, such as images, audio files, or other binary data.
+
+This method supports wildcards:
+
+1. `*` matches any number of any characters including none
+2. `?` matches any single character
+3. `[...]` matches any single character in the brackets
+4. `**` recursively matches any number of layers of directories
+
+The returned DataFrame will have the following columns:
+
+1. path: the path to the file
+2. size: size of the file in bytes
+3. content: the raw bytes contents of the file
+
+Args:
+    path (str|list): Path to file(s) on disk or remote object stores such as ``s3://`` or ``gs://`` (allows wildcards).
+    max_connections: The maximum number of connections to use per thread to use for downloading file contents. Defaults to 32.
+    on_error: Behavior when a file download error is encountered - "raise" to raise the error immediately or "null" to log
+        the error but fallback to a Null value. Defaults to "raise".
+    io_config (IOConfig): Configuration to use when running IO with remote services
+
+Returns:
+    DataFrame: DataFrame with one row per file, containing the path, size and raw bytes contents of each file.
 
 ## read_csv
 
@@ -1154,22 +1210,24 @@ Args:
 Returns:
     DataFrame: A DataFrame with the schema converted from the specified Hudi table.
 
-Note:
-    This function requires the use of Apache Hudi. To ensure that this is installed with Daft, you may install: ``pip install -U daft[hudi]``
-
 ## read_huggingface
 
 ```python
-read_huggingface(repo: str, io_config: IOConfig | None=None) -> DataFrame
+read_huggingface(repo: str, io_config: IOConfig | None=None, format: Literal['parquet', 'webdataset'] | None=None) -> DataFrame
 ```
 
 Create a DataFrame from a Hugging Face dataset.
 
-Currently supports all public datasets and all private Parquet datasets. See [the Hugging Face docs](https://huggingface.co/docs/dataset-viewer/en/parquet) for more details.
+Currently supports all public datasets, private Parquet datasets, and
+repositories stored as WebDataset TAR shards. See the
+[Hugging Face dataset docs](https://huggingface.co/docs/hub/en/datasets-overview)
+for more details.
 
 Args:
     repo (str): repository to read in the form `username/dataset_name`
     io_config (IOConfig): Config to use when reading data
+    format: Dataset storage format. If ``None``, currently defaults to
+        ``"parquet"``. Use ``"webdataset"`` to read uncompressed TAR shards.
 
 ## read_iceberg
 
@@ -1282,14 +1340,20 @@ Returns:
 ## read_lance
 
 ```python
-read_lance(uri: str | os.PathLike[str], io_config: Any=None, version: Any=None, asof: Any=None, block_size: Any=None, commit_lock: Any=None, index_cache_size: Any=None, default_scan_options: Any=None, metadata_cache_size_bytes: Any=None, fragment_group_size: Any=None, include_fragment_id: Any=None, checkpoint: Any=None) -> Any
+read_lance(uri: str | os.PathLike[str] | None=None, io_config: Any=None, version: Any=None, asof: Any=None, block_size: Any=None, commit_lock: Any=None, index_cache_size: Any=None, default_scan_options: Any=None, metadata_cache_size_bytes: Any=None, fragment_group_size: Any=None, include_fragment_id: Any=None, checkpoint: Any=None, *, table_id: list[str] | None=None, namespace_impl: str | None=None, namespace_properties: dict[str, str] | None=None) -> Any
 ```
 
 Create a DataFrame from a LanceDB table.
 
 Args:
     uri: The URI of the Lance table to read from. Accepts a local path or an
-        object-store URI like "s3://bucket/path".
+        object-store URI like "s3://bucket/path". Mutually exclusive with
+        the namespace parameters.
+    table_id: Table identifier within a Lance Namespace, e.g.
+        ``["catalog", "schema", "table"]``.
+    namespace_impl: Lance Namespace implementation, such as ``"dir"`` or
+        ``"rest"``.
+    namespace_properties: Properties for connecting to the namespace.
     io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
     version : optional, int | str
         If specified, load a specific version of the Lance dataset. Else, loads the
@@ -1349,28 +1413,74 @@ Returns:
 ## read_mcap
 
 ```python
-read_mcap(path: str, io_config: IOConfig | None=None, start_time: int | None=None, end_time: int | None=None, topics: list[str] | None=None, batch_size: int=1000, topic_start_time_resolver: TopicStartTimeResolver | None=None) -> DataFrame
+read_mcap(path: str, io_config: IOConfig | None=None, start_time: int | None=None, end_time: int | None=None, topics: list[str] | None=None, batch_size: int=1000, topic_start_time_resolver: Callable[[str], dict[str, int]] | None=None, output_format: Literal['raw', 'raw_legacy']='raw', _multithreaded_io: bool | None=None) -> DataFrame
 ```
 
-Read mcap file.
+Read raw messages from one or more MCAP files.
 
 Args:
-    path: mcap file path
-    start_time: Start time to filter messages (same unit as MCAP message.log_time, typically nanoseconds).
-    end_time: End time to filter messages (same unit as MCAP message.log_time, typically nanoseconds).
-    topics: List of topics to filter messages.
-    batch_size: Number of messages to read in each batch.
-    topic_start_time_resolver: Optional callable to compute per-file, per-topic start times.
-        The callable is invoked once per MCAP file with the resolved file path and must return
-        a mapping where:
-        - key: topic name (str)
-        - value: start time (int, same unit as MCAP message.log_time)
+    path: MCAP file or directory path.
+    io_config: Configuration for storage credentials and native I/O.
+    start_time: Inclusive non-negative lower bound for `message.log_time`.
+    end_time: Exclusive non-negative upper bound for `message.log_time`.
+    topics: Topic names to include.
+    batch_size: Number of messages decoded per native record batch.
+    topic_start_time_resolver: Optional per-file callback
+        returning non-negative topic start times. Each result fans out into
+        one native task per topic, using `max(start_time, resolved_start_time)`.
+    output_format: Column types to emit. The `"raw_legacy"` choice is deprecated
+        and will be removed in v0.9.0. Use `"raw"` instead.
+        - `"raw"` (default): The default output types.
+        - `"raw_legacy"`: `log_time` and `publish_time` are int64,
+          `sequence` is int32, and `data` is string.
 
-        will create one scan task per (file, topic) and set the task's start_time to:
-        max(start_time, topic_start_time_resolver(file)[topic]).
+Warning:
+    Times returned by `topic_start_time_resolver` must be between 0 and
+    `2**64 - 1` to match the internal MCAP timestamp format. Negative time values raise `OverflowError`.
 
 Returns:
-    DataFrame: DataFrame with the schema converted from the specified MCAP file.
+    A DataFrame with columns:
+    - `source_path` (str): The path to the MCAP file
+    - `topic` (str): The topic of the message
+    - `log_time` (uint64, or int64 when `output_format="raw_legacy"`): Message log time
+    - `publish_time` (uint64, or int64 when `output_format="raw_legacy"`): Message publish time
+    - `sequence` (uint32, or int32 when `output_format="raw_legacy"`): Message sequence number
+    - `data` (binary, or string when `output_format="raw_legacy"`): Message payload
+
+## read_orc
+
+```python
+read_orc(path: str | list[str], io_config: IOConfig | None=None, batch_size: int=128 * 1024) -> DataFrame
+```
+
+Creates a DataFrame from ORC file(s).
+
+Args:
+    path: Path to an ORC file, directory, glob, or list of paths. Directories
+        are searched recursively for ``*.orc`` files. Supports remote URLs
+        to object stores such as ``s3://`` or ``gs://``. Uses native glob
+        syntax; glob metacharacters in literal filenames must be escaped.
+    io_config: Configuration for the native file I/O backend. Defaults to
+        the planning context's default I/O configuration.
+    batch_size: Maximum number of rows yielded per record batch. Defaults
+        to 131072. This does not impose a fixed memory limit.
+
+Returns:
+    DataFrame: parsed DataFrame.
+
+Note:
+    The schema is inferred from the first matched file. Later files are
+    aligned to that schema: missing fields become nulls and extra fields
+    are excluded. Conversions follow Daft's rules, as with Parquet reads:
+    unsupported conversions raise an error, while some invalid values
+    (such as invalid numeric strings) become nulls. An empty ORC file with a valid
+    schema is supported.
+    Each file is read by one task; stripes are not split into separate
+    distributed tasks. Filters and limits use Daft's existing execution
+    operators, without ORC-native predicate pruning.
+    A limit does not guarantee early termination of file reads. The shared
+    Python source bridge can continue reading and buffering batches after
+    the returned-row limit is reached.
 
 ## read_paimon
 
@@ -1576,6 +1686,39 @@ Returns:
         metadata column ("WARC-Identified-Payload-Type"), one column "warc_content" with the raw byte content of the WARC record,
         and one column "warc_headers" with the remaining headers of the WARC record stored as a JSON string.
 
+## read_webdataset
+
+```python
+read_webdataset(path: str | list[str], io_config: IOConfig | None=None, batch_size: int=1000) -> DataFrame
+```
+
+Read one or more WebDataset TAR shards.
+
+Consecutive TAR members with the same filename prefix are grouped into one row.
+The member suffix becomes the column name, following the WebDataset convention.
+Image, audio, video, and other binary members are represented by lazy
+:class:`daft.File` references into the TAR archive. JSON, text, and class/index
+sidecars are decoded eagerly.
+
+Args:
+    path: An uncompressed TAR file, directory, glob, or list of paths. Directories
+        are searched recursively for ``*.tar`` files.
+    io_config: Configuration for local or remote storage.
+    batch_size: Maximum number of samples yielded per record batch.
+
+Returns:
+    A DataFrame containing ``__key__``, ``__url__``, and one column per member
+    suffix discovered during schema inference.
+
+Note:
+    Compressed TAR archives are not supported because member byte offsets cannot
+    be used for lazy range-backed file references.
+    Sparse TAR members are not supported because their logical contents are not
+    stored as contiguous byte ranges.
+    Member suffixes and JSON shapes must be consistent across shards. The schema
+    is inferred from the first five samples of the first shard, and later
+    incompatibilities raise an error instead of discarding data.
+
 ## refresh_logger
 
 ```python
@@ -1649,7 +1792,7 @@ Set the given catalog as current_catalog for the current session or raises an if
 ## set_execution_config
 
 ```python
-set_execution_config(config: PyDaftExecutionConfig | None=None, enable_scan_task_split_and_merge: bool | None=None, scan_tasks_min_size_bytes: int | None=None, scan_tasks_max_size_bytes: int | None=None, max_sources_per_scan_task: int | None=None, broadcast_join_size_bytes_threshold: int | None=None, parquet_split_row_groups_max_files: int | None=None, hash_join_partition_size_leniency: float | None=None, sample_size_for_sort: int | None=None, num_preview_rows: int | None=None, parquet_target_filesize: int | None=None, parquet_target_row_group_size: int | None=None, parquet_inflation_factor: float | None=None, csv_target_filesize: int | None=None, csv_inflation_factor: float | None=None, json_target_filesize: int | None=None, json_inflation_factor: float | None=None, text_inflation_factor: float | None=None, shuffle_aggregation_default_partitions: int | None=None, partial_aggregation_threshold: int | None=None, high_cardinality_aggregation_threshold: float | None=None, read_sql_partition_size_bytes: int | None=None, default_morsel_size: int | None=None, shuffle_algorithm: str | None=None, pre_shuffle_merge_threshold: int | None=None, pre_shuffle_merge_partition_threshold: int | None=None, scantask_max_parallel: int | None=None, native_parquet_writer: bool | None=None, min_cpu_per_task: float | None=None, actor_udf_ready_timeout: int | None=None, maintain_order: bool | None=None, enable_dynamic_batching: bool | None=None, dynamic_batching_strategy: str | None=None, flight_shuffle_dirs: list[str] | None=None, flight_shuffle_compression: str | None=None, enable_multi_glob_path_tasks: bool | None=None) -> DaftContext
+set_execution_config(config: PyDaftExecutionConfig | None=None, enable_scan_task_split_and_merge: bool | None=None, scan_tasks_min_size_bytes: int | None=None, scan_tasks_max_size_bytes: int | None=None, max_sources_per_scan_task: int | None=None, broadcast_join_size_bytes_threshold: int | None=None, parquet_split_row_groups_max_files: int | None=None, hash_join_partition_size_leniency: float | None=None, sample_size_for_sort: int | None=None, num_preview_rows: int | None=None, parquet_target_filesize: int | None=None, parquet_target_row_group_size: int | None=None, parquet_inflation_factor: float | None=None, csv_target_filesize: int | None=None, csv_inflation_factor: float | None=None, json_target_filesize: int | None=None, json_inflation_factor: float | None=None, text_inflation_factor: float | None=None, shuffle_aggregation_default_partitions: int | None=None, partial_aggregation_threshold: int | None=None, high_cardinality_aggregation_threshold: float | None=None, read_sql_partition_size_bytes: int | None=None, default_morsel_size: int | None=None, shuffle_algorithm: str | None=None, pre_shuffle_merge_threshold: int | None=None, pre_shuffle_merge_partition_threshold: int | None=None, scantask_max_parallel: int | None=None, native_parquet_writer: bool | None=None, actor_udf_ready_timeout: int | None=None, actor_udf_min_ready: int | None=None, maintain_order: bool | None=None, enable_dynamic_batching: bool | None=None, dynamic_batching_strategy: str | None=None, flight_shuffle_dirs: list[str] | None=None, flight_shuffle_compression: str | None=None, enable_multi_glob_path_tasks: bool | None=None) -> DaftContext
 ```
 
 Globally sets various configuration parameters which control various aspects of Daft execution.
@@ -1687,14 +1830,16 @@ Args:
     high_cardinality_aggregation_threshold: Threshold selectivity for performing high cardinality aggregations on the Native Runner. Defaults to 0.8.
     read_sql_partition_size_bytes: Target size of partition when reading from SQL databases. Defaults to 512MB
     default_morsel_size: Default size of morsels used for the new local executor. Defaults to 131072 rows.
-    shuffle_algorithm: The shuffle algorithm to use. Defaults to "auto", which will let Daft determine the algorithm. Options are "map_reduce", "pre_shuffle_merge", and "flight_shuffle".
+    shuffle_algorithm: The shuffle algorithm to use. Defaults to "auto", which will let Daft determine the algorithm, switching to "flight_shuffle" for large shuffles (>= 10GiB input or >= 500k input x output partitions). Options are "map_reduce", "pre_shuffle_merge", and "flight_shuffle".
     pre_shuffle_merge_threshold: Memory threshold in bytes for pre-shuffle merge. Defaults to 1GB
     pre_shuffle_merge_partition_threshold: Number of partitions threshold to enable pre-shuffle merge when shuffle_algorithm is "auto". Defaults to 200.
     scantask_max_parallel: Set the max parallelism for running scan tasks simultaneously. Currently, this only works for Native Runner. If set to 0, all available CPUs will be used. Defaults to 8.
     native_parquet_writer: Whether to use the native parquet writer vs the pyarrow parquet writer. Defaults to `True`.
-    min_cpu_per_task: Deprecated. This was used by the old Ray runner and has no effect on
-        distributed scheduling. It will be removed in v0.8.0.
     actor_udf_ready_timeout: Timeout for UDF actors to be ready. Defaults to 120 seconds.
+    actor_udf_min_ready: Makes UDF actor pools elastic on the Ray runner. Execution starts once this many
+        actors are ready (or the timeout passes with at least one ready), and the remaining actors join the
+        pool as Ray schedules them, so later work uses a larger pool. Defaults to 0, which keeps a fixed pool
+        of the actors that are ready within `actor_udf_ready_timeout`.
     maintain_order: Whether to maintain order during execution. Defaults to True. Some blocking sink operators (e.g. write_parquet) won't respect this flag and will always keep maintain_order as false, and propagate to child operators. It's useful to set this to False for running df.collect() when no ordering is required.
     enable_dynamic_batching: Whether to enable dynamic batching. Defaults to False.
     dynamic_batching_strategy: The strategy to use for dynamic batching. Defaults to 'auto'.
@@ -1761,7 +1906,7 @@ Note:
 ## set_runner_ray
 
 ```python
-set_runner_ray(address: str | None=None, noop_if_initialized: bool=False, force_client_mode: bool=False, *, downscale_enabled: bool | None=None, downscale_idle_seconds: int | None=None, min_survivor_workers: int | None=None, pending_release_exclude_seconds: int | None=None, worker_startup_timeout: int | None=None) -> Runner[PartitionT]
+set_runner_ray(address: str | None=None, noop_if_initialized: bool=False, force_client_mode: bool=False, *, downscale_enabled: bool | None=None, downscale_idle_seconds: int | None=None, min_survivor_workers: int | None=None, pending_release_exclude_seconds: int | None=None, worker_startup_timeout: int | None=None, autoscale_strategy: str | None=None, autoscale_bisect_timeout_secs: int | None=None) -> Runner[PartitionT]
 ```
 
 Configure Daft to execute dataframes using the Ray distributed computing framework.
@@ -1782,6 +1927,12 @@ Args:
         provided, falls back to ``DAFT_AUTOSCALING_PENDING_RELEASE_EXCLUDE_SECONDS`` (default: 120).
     worker_startup_timeout: Timeout in seconds for Ray worker actors to report their addresses during startup.
         Can also be configured via the ``DAFT_RAY_WORKER_STARTUP_TIMEOUT`` environment variable.
+    autoscale_strategy: Strategy used when requesting additional workers from Ray's autoscaler.
+        One of "gradual" (default; ramp up demand one bundle at a time) or "bisect"
+        (request all demand upfront and halve on rejection for faster convergence).
+    autoscale_bisect_timeout_secs: Seconds to wait for the cluster to grow before the "bisect"
+        strategy halves its resource request. Only used when autoscale_strategy is "bisect".
+        Must be greater than zero. Defaults to 30.
 
 Returns:
     Runner[PartitionT]: A runner object with the Ray runner's configurations.
@@ -1894,45 +2045,6 @@ Args:
     state: The intermediate state type(s). Either a single DataType for
         simple accumulators, or a dict of ``{name: DataType}`` for
         multi-field state.
-
-## udf
-
-```python
-udf(*, return_dtype: DataTypeLike, num_cpus: float | None=None, num_gpus: float | None=None, memory_bytes: int | None=None, ray_options: dict[str, Any] | None=None, batch_size: int | None=None, concurrency: int | None=None, use_process: bool | None=None) -> Callable[[UserDefinedPyFuncLike], UDF]
-```
-
-(DEPRECATED) `@udf` Decorator to convert a Python function/class into a `UDF`.
-
-UDFs allow users to run arbitrary Python code on the outputs of Expressions.
-
-Args:
-    return_dtype (DataType): Returned type of the UDF
-    num_cpus: Number of CPUs to allocate each running instance of your UDF. Note that this is purely used for placement (e.g. if your
-        machine has 8 CPUs and you specify num_cpus=4, then Daft can run at most 2 instances of your UDF at a time). The default `None`
-        indicates that Daft is free to allocate as many instances of the UDF as it wants to.
-    num_gpus: Number of GPUs to allocate each running instance of your UDF. This is used for placement and also for allocating
-        the appropriate GPU to each UDF using `CUDA_VISIBLE_DEVICES`.
-    memory_bytes: Amount of memory to allocate each running instance of your UDF in bytes. If your UDF is experiencing out-of-memory errors,
-        this parameter can help hint Daft that each UDF requires a certain amount of heap memory for execution.
-    ray_options: Extra Ray options, e.g. {"label_selector": {...}}. see more https://docs.ray.io/en/latest/ray-core/api/doc/ray.actor.ActorClass.options.html#ray.actor.ActorClass.options
-    batch_size: Enables batching of the input into batches of at most this size. Results between batches are concatenated.
-    concurrency: Spin up `N` number of persistent replicas of the UDF to process all partitions. Defaults to `None` which will spin up one
-        UDF per partition. This is especially useful for expensive initializations that need to be amortized across partitions such as
-        loading model weights for model batch inference.
-    use_process: Run the UDF on a separate process.
-        This is useful for UDFs that run a lot of Python-only code, since it avoids GIL overhead.
-        This is not necessary for UDFs that run C-extension code, like NumPy or PyTorch.
-        Defaults to `None` where Daft will automatically choose based on runtime performance.
-        Note: Users should generally never set this flag manually.
-
-Returns:
-    Callable[[UserDefinedPyFuncLike], UDF]: UDF decorator - converts a user-provided Python function as a UDF that can be called on Expressions
-
-Note:
-    In most cases, UDFs will be slower than a native kernel/expression because of the required Rust and Python overheads. If
-    your computation can be expressed using Daft expressions, you should do so instead of writing a UDF. If your UDF expresses a
-    common use-case that isn't already covered by Daft, you should file a ticket or contribute this functionality back to Daft
-    as a kernel!
 
 ## UnionMode
 

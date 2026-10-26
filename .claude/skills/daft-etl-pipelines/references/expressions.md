@@ -185,7 +185,7 @@ Alias for `Expression.mean()`. Check [`Expression.mean`](https://docs.daft.ai/en
 ## between
 
 ```python
-between(lower: int | builtins.float, upper: int | builtins.float) -> Expression
+between(lower: builtins.float, upper: builtins.float) -> Expression
 ```
 
 Checks if values in the Expression are between lower and upper, inclusive.
@@ -1422,7 +1422,7 @@ Tip: See Also
 ## log
 
 ```python
-log(base: int | builtins.float=math.e) -> Expression
+log(base: builtins.float=math.e) -> Expression
 ```
 
 The elementwise log with given base, of a numeric expression.
@@ -1495,6 +1495,17 @@ Strip whitespace from the left side of a UTF-8 string.
 
 Tip: See Also
     [`daft.functions.lstrip`](https://docs.daft.ai/en/stable/api/functions/lstrip/)
+
+## map_extract
+
+```python
+map_extract(key: Expression) -> Expression
+```
+
+Alias for `Expression.map_get()` to mirror SQL naming.
+
+Tip: See Also
+    [`daft.functions.map_extract`](https://docs.daft.ai/en/stable/api/functions/map_get/)
 
 ## map_get
 
@@ -2153,6 +2164,17 @@ Splits each string on the given string, into a list of strings.
 Tip: See Also
     [`daft.functions.split`](https://docs.daft.ai/en/stable/api/functions/split/)
 
+## split_part
+
+```python
+split_part(delim: builtins.str | Expression, part: builtins.int | Expression) -> Expression
+```
+
+Splits the string on occurrences of the delimiter and returns the requested part (1-based).
+
+Tip: See Also
+    [`daft.functions.split_part`](https://docs.daft.ai/en/stable/api/functions/split_part/)
+
 ## sqrt
 
 ```python
@@ -2586,14 +2608,6 @@ Encode or null if unsuccessful.
 
 Tip: See Also
     [`daft.functions.try_encode`](https://docs.daft.ai/en/stable/api/functions/try_encode/)
-
-## udf
-
-```python
-udf(name: builtins.str, inner: UninitializedUdf, bound_args: BoundUDFArgs, expressions: builtins.list[Expression], return_dtype: DataType, init_args: InitArgsType, resource_request: ResourceRequest | None, batch_size: int | None, concurrency: int | None, use_process: bool | None, ray_options: dict[builtins.str, builtins.str] | None=None) -> Expression
-```
-
-_(no docstring)_
 
 ## unix_date
 

@@ -319,6 +319,7 @@ FUNCTIONS_FILE_BY_MODULE = {
     "file_.py": "functions-media.md",
     "hdf5.py": "functions-media.md",
     "__init__.py": "functions-ai.md",  # daft/functions/ai/__init__.py
+    "jev_.py": "functions-ai.md",
     "binary.py": "functions-etc.md",
     "bitwise.py": "functions-etc.md",
     "columnar.py": "functions-etc.md",

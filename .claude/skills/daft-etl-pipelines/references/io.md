@@ -40,7 +40,8 @@ Interface for writing data to a sink that is not built-in.
 
 When a DataFrame is written using the `.write_sink()` method, the following sequence occurs:
 
-1. The sink's `.start()` method is called once at the beginning of the write process.
+1. The sink's `.start()` method is called once on the driver at the beginning of
+   the write process, before the sink is serialized to worker tasks.
 2. The DataFrame is executed, and its output is split into micropartitions.
 3. The sink's `.write()` method is invoked on each micropartition, potentially in parallel
    and distributed across multiple tasks or workers.
@@ -118,6 +119,18 @@ GravitinoConfig(endpoint: str | None, metalake_name: str | None, auth_type: str 
 ```
 
 I/O configuration for Gravitino filesets.
+
+## HdfsConfig
+
+```python
+HdfsConfig(name_node: str | None=None, root: str | None=None)
+```
+
+I/O configuration for accessing HDFS (Hadoop Distributed File System) via the OpenDAL services-hdfs backend.
+
+Args:
+    name_node (str, optional): HDFS name node address in ``scheme://host:port`` format, e.g. ``"hdfs://namenode:9000"``. Defaults to None (uses the URL authority).
+    root (str, optional): Root path inside HDFS. All operations happen under this root. Defaults to None ("/").
 
 ## HTTPConfig
 

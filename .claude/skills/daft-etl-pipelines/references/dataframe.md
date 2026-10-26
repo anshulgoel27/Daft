@@ -656,7 +656,7 @@ Returns:
 ## melt
 
 ```python
-melt(ids: ManyColumnsInputType, values: ManyColumnsInputType=[], variable_name: str='variable', value_name: str='value') -> DataFrame
+melt(ids: ManyColumnsInputType, values: ManyColumnsInputType=(), variable_name: str='variable', value_name: str='value') -> DataFrame
 ```
 
 Alias for unpivot.
@@ -1425,7 +1425,7 @@ Returns:
 ## unpivot
 
 ```python
-unpivot(ids: ManyColumnsInputType, values: ManyColumnsInputType=[], variable_name: str='variable', value_name: str='value') -> DataFrame
+unpivot(ids: ManyColumnsInputType, values: ManyColumnsInputType=(), variable_name: str='variable', value_name: str='value') -> DataFrame
 ```
 
 Unpivots a DataFrame from wide to long format.
@@ -1558,6 +1558,30 @@ Args:
 
 Returns:
     DataFrame: DataFrame with four new Float64 columns (``rtree_min_x`` … ``rtree_max_y``).
+
+## write_avro
+
+```python
+write_avro(root_dir: str | pathlib.Path, compression: str='null', write_mode: Literal['append', 'overwrite', 'overwrite-partitions']='append', write_success_file: bool=False, partition_cols: list[ColumnInputType] | None=None, io_config: IOConfig | None=None) -> DataFrame
+```
+
+Writes the DataFrame as Avro files, returning a new DataFrame with paths to the files that were written.
+
+Files will be written to ``<root_dir>/*`` with randomly generated UUIDs as the file names.
+
+Args:
+    root_dir (str): root file path to write Avro files to.
+    compression (str, optional): compression algorithm. "null" (default) or "deflate". Defaults to "null".
+    write_mode (str, optional): Operation mode of the write. ``append`` will add new data, ``overwrite`` will replace the contents of the root directory with new data. ``overwrite-partitions`` will replace only the contents in the partitions that are being written to. Defaults to "append".
+    write_success_file (bool, optional): Whether to write a ``_SUCCESS`` file upon successful completion. Defaults to False.
+    partition_cols (Optional[List[ColumnInputType]], optional): How to subpartition each partition further. Defaults to None.
+    io_config (Optional[IOConfig], optional): configurations to use when interacting with remote storage.
+
+Returns:
+    DataFrame: The filenames that were written out as strings.
+
+Note:
+    This call is **blocking** and will execute the DataFrame when called
 
 ## write_bigtable
 
@@ -1732,12 +1756,14 @@ Args:
 ## write_iceberg
 
 ```python
-write_iceberg(table: 'pyiceberg.table.Table', mode: str='append', io_config: IOConfig | None=None, snapshot_properties: dict[str, str] | None=None, checkpoint: 'IdempotentCommit | None'=None) -> DataFrame
+write_iceberg(table: 'pyiceberg.table.Table', mode: str='append', io_config: IOConfig | None=None, snapshot_properties: dict[str, str] | None=None, checkpoint: 'IdempotentCommit | None'=None, overwrite_filter: 'str | Expression | None'=None, validate_overwrite_filter: bool=True) -> DataFrame
 ```
 
 Writes the DataFrame to an [Iceberg](https://iceberg.apache.org/docs/nightly/) table, returning a new DataFrame with the operations that occurred.
 
 Can be run in either `append` or `overwrite` mode which will either appends the rows in the DataFrame or will delete the existing rows and then append the DataFrame rows respectively.
+
+In `overwrite` mode, `overwrite_filter` restricts the delete to the rows matching a predicate, which is how a static partition overwrite is expressed: pass a predicate over the partition columns (e.g. `"dt = '2024-01-01'"`) to replace only the matching partitions.
 
 ``write_iceberg`` supports checkpointing via the ``checkpoint=`` parameter. For the conceptual overview, see the [Checkpointing guide](../use-case/checkpointing.md).
 
@@ -1747,12 +1773,35 @@ Args:
     io_config (IOConfig, optional): A custom IOConfig to use when accessing Iceberg object storage data. If provided, configurations set in `table` are ignored.
     snapshot_properties (dict[str, str], optional): Optional snapshot properties to set while writing to the table. Keys with prefix ``daft.idempotence-`` are reserved.
     checkpoint (IdempotentCommit, optional): Bundled checkpoint store + idempotence key for an idempotent commit. When provided, the snapshot summary is tagged with ``daft.idempotence-key`` and retries with the same key recognize the prior attempt without producing a duplicate snapshot. Only ``mode='append'`` is supported. Requires the Ray runner.
+    overwrite_filter (str | Expression, optional): Only valid with ``mode='overwrite'``. Restricts the delete to the rows matching the predicate instead of replacing the whole table. Accepts a Daft expression (e.g. ``col("dt") == "2024-01-01"``) or an Iceberg predicate string (e.g. ``"dt = '2024-01-01'"``). Requires pyiceberg>=0.7.0. Defaults to None.
+    validate_overwrite_filter (bool, optional): Only used alongside ``overwrite_filter``. When True, the write fails if any data file it produces may hold rows outside the filter. Defaults to True.
 
 Returns:
     DataFrame: The operations that occurred with this write.
 
 Note:
     This call is **blocking** and will execute the DataFrame when called.
+
+    ``overwrite_filter`` behavior:
+
+    - The filter selects which rows are deleted. By default the rows being
+      written must match it as well, so an overwrite cannot leave behind rows
+      its delete did not cover. Pass ``validate_overwrite_filter=False`` to skip
+      that check, matching PyIceberg's ``Table.overwrite``.
+    - The check reads the written files' partition values and column statistics,
+      not the rows. Statistics only ever widen, so it may reject a write it
+      cannot prove but never accepts an unmatched row. Equality over a
+      non-partition column whose values exceed the bounds truncation length
+      (16 bytes by default), or over a column with statistics disabled, is not
+      provable.
+    - The check runs before the commit, so a rejected write leaves the table
+      unchanged. The staged data files stay at the warehouse location.
+    - A filter aligned with partition boundaries is a metadata-only delete.
+      Anything finer makes PyIceberg fall back to copy-on-write and rewrite the
+      partially matched data files.
+    - ``DELETE`` rows in the returned DataFrame are the data files overlapping
+      the filter in the pre-write snapshot. A partially matched file is
+      rewritten rather than removed.
 
     When ``checkpoint`` is provided and ``write_iceberg`` raises
     *after* the catalog commit landed (e.g. a transient failure during
@@ -1816,19 +1865,23 @@ string is invalid, an error will be raised.
 ## write_lance
 
 ```python
-write_lance(uri: str | pathlib.Path, mode: Literal['create', 'append', 'overwrite', 'merge']='create', io_config: IOConfig | None=None, schema: Union[Schema, 'pyarrow.Schema'] | None=None, left_on: str | None=None, right_on: str | None=None, **kwargs: Any) -> DataFrame
+write_lance(uri: str | pathlib.Path | None=None, mode: Literal['create', 'append', 'overwrite', 'insert_overwrite', 'merge']='create', io_config: IOConfig | None=None, schema: Union[Schema, 'pyarrow.Schema'] | None=None, left_on: str | None=None, right_on: str | None=None, *, overwrite_where: str | None=None, table_id: list[str] | None=None, namespace_impl: str | None=None, namespace_properties: dict[str, str] | None=None, **kwargs: Any) -> DataFrame
 ```
 
 Writes the DataFrame to a Lance table.
 
 Args:
   uri: The URI of the Lance table to write to. Accepts a local path or an
-    object-store URI like "s3://bucket/path".
-  mode: The write mode. One of "create", "append", "overwrite", or "merge".
+    object-store URI like "s3://bucket/path". Mutually exclusive with
+    the namespace parameters.
+  mode: The write mode. One of "create", "append", "overwrite", or
+    "insert_overwrite". ``"merge"`` is deprecated in v0.8.0 and will
+    be removed in v0.9.0.
   - "create" will create the dataset if it does not exist, otherwise raise an error.
   - "append" will append to the existing dataset if it exists, otherwise raise an error.
   - "overwrite" will overwrite the existing dataset if it exists, otherwise raise an error.
-  - "merge" will add new columns to the existing dataset.
+  - "insert_overwrite" atomically removes rows matching ``overwrite_where``
+    and appends this DataFrame's rows. The table must already exist.
   io_config (IOConfig, optional): configurations to use when interacting with remote storage.
   schema (Schema | pyarrow.Schema, optional): Desired schema to enforce during write.
     - If omitted, Daft will use the DataFrame's current schema.
@@ -1837,11 +1890,18 @@ Args:
       on the pyarrow schema is preserved during create/overwrite.
     - If the target Lance dataset already exists, the data will be cast to the existing table schema
       to ensure compatibility unless ``mode="overwrite"``.
-  left_on/right_on (Optional[str]): Only supported in ``mode="merge"``. Specify the join key for aligning rows when merging new columns.
-      - If omitted, defaults to ``"_rowaddr"``.
-      - If ``right_on`` is omitted, it defaults to the value of ``left_on``.
-      - The DataFrame passed to ``write_lance(mode="merge")`` must contain ``fragment_id`` and the join key column specified by ``right_on`` (or ``_rowaddr`` by default).
-  **kwargs: Additional keyword arguments to pass to the Lance writer.
+  left_on/right_on: Deprecated with ``mode="merge"``. Pass them to
+    ``daft_lance.merge_columns_df`` instead.
+  overwrite_where: SQL predicate selecting rows to replace. Required only
+    for ``mode="insert_overwrite"``.
+  table_id: Table identifier within a Lance Namespace, e.g.
+    ``["catalog", "schema", "table"]``. Namespace targets do not
+    support ``mode="merge"`` through this Daft facade.
+  namespace_impl: Lance Namespace implementation, such as ``"dir"`` or
+    ``"rest"``.
+  namespace_properties: Properties for connecting to the namespace.
+  **kwargs: Additional keyword arguments to pass to the Lance writer. daft-lance
+    validates these against a fixed set; an unrecognized argument raises ``TypeError``.
 
 Returns:
     DataFrame: A DataFrame containing metadata about the written Lance table, such as number of fragments, number of deleted rows, number of small files, and version.

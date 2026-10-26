@@ -17,18 +17,18 @@ def test_resolves_full_public_api():
     assert unresolved == [], f"unresolved: {unresolved}"
 
     # Class method counts match the class bodies.
-    assert len(by_ns["DataFrame"]) == 98
-    assert len(by_ns["Expression"]) == 247
+    assert len(by_ns["DataFrame"]) == 99
+    assert len(by_ns["Expression"]) == 248
 
     # The three __all__ lists resolved fully (io=37: private _range excluded).
-    assert len(by_ns["daft"]) == 133
-    assert len(by_ns["daft.functions"]) == 358
-    assert len(by_ns["daft.io"]) == 37
+    assert len(by_ns["daft"]) == 136
+    assert len(by_ns["daft.functions"]) == 366
+    assert len(by_ns["daft.io"]) == 42
 
     # Total (namespace, name) records — each list keeps its own namespace, so
-    # the 23 names shared by daft and daft.io are two records here (collapsed
-    # only at render time). 133 + 358 + 37 + 98 + 247 = 873.
-    assert len({(s.namespace, s.name) for s in symbols}) == 873
+    # the 27 names shared by daft and daft.io are two records here (collapsed
+    # only at render time). 136 + 366 + 42 + 99 + 248 = 891.
+    assert len({(s.namespace, s.name) for s in symbols}) == 891
 
     # The ai subpackage resolved.
     assert "embed_text" in by_ns["daft.functions"]
@@ -118,11 +118,11 @@ def test_first_sentence_does_not_clip_at_abbreviation():
 def test_name_imported_callables_resolve_as_defs_not_submodules():
     # Regression for the resolution-ordering bug in _locate: a name-import of
     # a symbol from a subpackage (e.g. `from daft.sql import sql, sql_expr`,
-    # `from daft.udf import udf, udaf, ...`) must win over the sibling-module
+    # `from daft.udf import udaf, ...`) must win over the sibling-module
     # probe, since the imported name shadows any coincidentally-named sibling
     # package/module (daft/sql/, daft/udf/). Import-map resolution must run
     # BEFORE the submodule probe in _locate, and recursively at every hop.
-    for name in ("sql", "udf", "udaf"):
+    for name in ("sql", "udaf"):
         sym = _sym(name, "daft")
         assert sym.kind == "def", f"{name} resolved as {sym.kind}, expected def"
         assert gen.extract_signature(sym) != "", f"{name} has no signature"
@@ -146,12 +146,12 @@ def test_name_imported_callables_resolve_as_defs_not_submodules():
     by_ns = {}
     for s in symbols:
         by_ns.setdefault(s.namespace, set()).add(s.name)
-    assert len(by_ns["daft"]) == 133
-    assert len(by_ns["daft.functions"]) == 358
-    assert len(by_ns["daft.io"]) == 37
-    assert len(by_ns["DataFrame"]) == 98
-    assert len(by_ns["Expression"]) == 247
-    assert len({(s.namespace, s.name) for s in symbols}) == 873
+    assert len(by_ns["daft"]) == 136
+    assert len(by_ns["daft.functions"]) == 366
+    assert len(by_ns["daft.io"]) == 42
+    assert len(by_ns["DataFrame"]) == 99
+    assert len(by_ns["Expression"]) == 248
+    assert len({(s.namespace, s.name) for s in symbols}) == 891
     _, unresolved = gen.resolve_public_api(REPO_ROOT)
     assert unresolved == []
 
@@ -165,15 +165,15 @@ def test_assign_file_buckets():
     assert gen.assign_file(_sym("S3Config", "daft.io")) == "io.md"
 
 
-def test_functions_buckets_sum_to_358():
+def test_functions_buckets_sum_to_366():
     symbols, _ = gen.resolve_public_api(REPO_ROOT)
     counts = {}
     for s in symbols:
         if s.namespace == "daft.functions":
             counts[gen.assign_file(s)] = counts.get(gen.assign_file(s), 0) + 1
-    assert sum(counts.values()) == 358
-    assert counts["functions-str.md"] == 59
-    assert counts["functions-ai.md"] == 5
+    assert sum(counts.values()) == 366
+    assert counts["functions-str.md"] == 60
+    assert counts["functions-ai.md"] == 9
 
 
 def test_render_reference_has_anchor_headings():
@@ -266,9 +266,9 @@ def test_coverage_counts():
     # Spec test 1, over on-disk files.
     index = (REF_DIR / "INDEX.md").read_text()
     rows = [l for l in index.splitlines() if " | " in l and not l.startswith("`")]
-    # 873 records minus the 23 io names collapsed into toplevel = 850 rows.
-    assert len(rows) == 850
+    # 891 records minus the 27 io names collapsed into toplevel = 864 rows.
+    assert len(rows) == 864
     df = (REF_DIR / "dataframe.md").read_text().count("\n## ")
     ex = (REF_DIR / "expressions.md").read_text().count("\n## ")
-    assert df == 98
-    assert ex == 247
+    assert df == 99
+    assert ex == 248
