@@ -68,12 +68,8 @@ impl ShuffleContext {
     pub(crate) fn register_cleanup(&self, plan_context: &mut PlanExecutionContext) {
         match &self.backend {
             ShuffleBackend::Ray => {}
-            ShuffleBackend::Flight {
-                shuffle_id,
-                shuffle_dirs,
-                ..
-            } => {
-                flight::register_cleanup(*shuffle_id, shuffle_dirs, plan_context);
+            ShuffleBackend::Flight { shuffle_dirs, .. } => {
+                flight::register_cleanup(shuffle_dirs, plan_context);
             }
         }
     }

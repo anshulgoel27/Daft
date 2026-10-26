@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use common_daft_config::DaftExecutionConfig;
-use common_error::DaftResult;
+use common_error::{DaftError, DaftResult};
 use common_metrics::QueryID;
 use common_runtime::{JoinSet, create_join_set};
 use futures::{Stream, StreamExt};
@@ -89,7 +89,11 @@ impl PlanExecutionContext {
 
     /// Register shuffle directories for cleanup when the plan completes
     pub fn register_shuffle_dirs(&mut self, dirs: Vec<String>) {
-        self.shuffle_dirs.extend(dirs);
+        for dir in dirs {
+            if !self.shuffle_dirs.contains(&dir) {
+                self.shuffle_dirs.push(dir);
+            }
+        }
     }
 }
 
@@ -98,6 +102,7 @@ pub(crate) struct PlanConfig {
     pub query_idx: QueryIdx,
     pub query_id: QueryID,
     pub config: Arc<DaftExecutionConfig>,
+    shuffle_namespace: u64,
 }
 
 impl From<&DistributedPhysicalPlan> for PlanConfig {
@@ -106,17 +111,52 @@ impl From<&DistributedPhysicalPlan> for PlanConfig {
             query_idx: plan.idx(),
             query_id: plan.query_id(),
             config: plan.execution_config().clone(),
+            shuffle_namespace: plan.shuffle_namespace(),
         }
     }
 }
 
 impl PlanConfig {
+    #[cfg(test)]
     pub fn new(query_idx: QueryIdx, query_id: QueryID, config: Arc<DaftExecutionConfig>) -> Self {
         Self {
             query_idx,
             query_id,
             config,
+            shuffle_namespace: rand::random(),
         }
+    }
+
+    pub fn uses_flight_shuffle(&self) -> bool {
+        self.config.shuffle_algorithm == "flight_shuffle"
+    }
+
+    /// Whether any shuffle in this plan may use flight shuffle: explicitly, or via `"auto"`
+    /// picking it for a large shuffle.
+    pub fn may_use_flight_shuffle(&self) -> bool {
+        matches!(
+            self.config.shuffle_algorithm.as_str(),
+            "flight_shuffle" | "auto"
+        )
+    }
+
+    /// This plan's own flight shuffle roots, regardless of the shuffle algorithm.
+    pub fn namespaced_flight_shuffle_dirs(&self) -> Vec<String> {
+        self.config
+            .flight_shuffle_dirs
+            .iter()
+            .map(|dir| format!("{dir}/daft_shuffle/{:016x}", self.shuffle_namespace))
+            .collect()
+    }
+
+    /// Flight shuffle roots to clean up if the plan fails; empty unless the plan may use flight
+    /// shuffle. Dirs of a plan that never ended up using flight don't exist, so cleaning them is
+    /// a no-op.
+    pub fn flight_shuffle_dirs(&self) -> Vec<String> {
+        if !self.may_use_flight_shuffle() {
+            return Vec::new();
+        }
+        self.namespaced_flight_shuffle_dirs()
     }
 }
 
@@ -204,18 +244,25 @@ impl<W: Worker<Task = SwordfishTask>> PlanRunner<W> {
         let running_stage = RunningPlan::new(running_node, plan_context);
 
         let mut materialized_result_stream = running_stage.materialize(scheduler_handle);
-        while let Some(result) = materialized_result_stream.next().await {
-            if sender.send(result?).await.is_err() {
-                break;
+        let result = async {
+            while let Some(result) = materialized_result_stream.next().await {
+                if sender.send(result?).await.is_err() {
+                    break;
+                }
             }
+            Ok::<(), DaftError>(())
         }
+        .await;
+        drop(materialized_result_stream);
 
+        // Clean up on failure too: this plan's shuffle namespace is never reused, so nothing
+        // else would delete it.
         if !shuffle_dirs.is_empty()
             && let Err(e) = self.worker_manager.cleanup_shuffle_dirs(shuffle_dirs).await
         {
             tracing::warn!("Failed to clear flight shuffle directories: {}", e);
         }
 
-        Ok(())
+        result
     }
 }

@@ -35,6 +35,8 @@ pub(crate) type QueryIdx = u16;
 pub(crate) struct DistributedPhysicalPlan {
     query_idx: QueryIdx,
     query_id: QueryID,
+    // Random, not query_idx: query_idx restarts per driver, but shuffle roots are cluster-wide.
+    shuffle_namespace: u64,
     logical_plan: Arc<LogicalPlan>,
     config: Arc<DaftExecutionConfig>,
 }
@@ -50,6 +52,7 @@ impl DistributedPhysicalPlan {
         Ok(Self {
             query_idx: QUERY_IDX_COUNTER.fetch_add(1, Ordering::Relaxed),
             query_id,
+            shuffle_namespace: rand::random(),
             logical_plan,
             config,
         })
@@ -61,6 +64,10 @@ impl DistributedPhysicalPlan {
 
     pub fn query_id(&self) -> QueryID {
         self.query_id.clone()
+    }
+
+    pub fn shuffle_namespace(&self) -> u64 {
+        self.shuffle_namespace
     }
 
     pub fn logical_plan(&self) -> &daft_logical_plan::LogicalPlanRef {

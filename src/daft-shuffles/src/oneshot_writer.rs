@@ -65,7 +65,7 @@ pub async fn write_partitions_one_shot(
 ) -> DaftResult<Vec<PartitionCache>> {
     let num_partitions = partitions.len();
     let dir_idx = (input_id as usize) % shuffle_dirs.len();
-    let shuffle_dir = format!("{}/daft_shuffle/{}", shuffle_dirs[dir_idx], shuffle_id);
+    let shuffle_dir = format!("{}/{}", shuffle_dirs[dir_idx], shuffle_id);
 
     // IPC encode + disk write all run on a single spawn_blocking thread.
     // Previously we fanned out per-partition `tokio::spawn` calls, but at
