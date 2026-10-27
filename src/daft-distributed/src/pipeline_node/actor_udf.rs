@@ -258,6 +258,7 @@ impl ActorUDF {
                 actors.clone(),
                 self.udf_properties.batch_size,
                 memory_request,
+                self.actor_min_ready > 0,
                 self.config.schema.clone(),
                 self.passthrough_columns.clone(),
                 self.required_columns.clone(),

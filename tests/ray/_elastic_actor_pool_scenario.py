@@ -6,10 +6,10 @@ Daft's runner can be set only once per process, so each scenario runs in its own
 
 It prints one line, ``RESULT <json list of the distinct Ray actor ids that processed the data>``.
 
-The cluster is shaped like production: the head runs the tasks, and the UDF actors live on separate
-nodes that advertise no CPU. One such node (2 `slot`s) exists up front and a second one is added
-mid-query. The actors must not share a node with the tasks: workers prefer actors on their own node,
-which would hide actors that joined the pool elsewhere.
+The head runs the tasks and has room for 2 of the 4 UDF actors (2 `slot`s). A node with 2 more slots and
+no CPU is added mid-query, so the actors that join the pool are on another node than the tasks. A fixed
+pool sends work only to actors on the worker's own node when it has any; an elastic pool must use the
+remote actors too.
 """
 
 from __future__ import annotations
@@ -45,8 +45,7 @@ class WhoAmI:
 def main(mode: str) -> None:
     from ray.cluster_utils import Cluster
 
-    cluster = Cluster(initialize_head=True, head_node_args={"num_cpus": 4})
-    cluster.add_node(num_cpus=0, resources={"slot": 2})
+    cluster = Cluster(initialize_head=True, head_node_args={"num_cpus": 4, "resources": {"slot": 2}})
     daft.set_runner_ray(address=cluster.address)
 
     if mode == "elastic":

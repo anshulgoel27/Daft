@@ -16,6 +16,15 @@ from daft.execution import ray_actor_pool_udf as pool_udf
 SLOT = {"slot": 1}  # every test actor needs one custom "slot"; nodes advertise how many they have
 
 
+@ray.remote
+class _FirstActorFailsToStart:
+    """Stands in for UDFActor: the actor of rank 0 raises in __init__, like a UDF whose setup fails."""
+
+    def __init__(self, projection) -> None:
+        if ray.get_runtime_context().get_actor_name().endswith("-0"):
+            raise RuntimeError("UDF setup failed")
+
+
 @pytest.fixture
 def cluster():
     """A local Ray cluster whose head has 2 slots; tests add nodes to free up more."""
@@ -28,7 +37,14 @@ def cluster():
     c.shutdown()
 
 
-def _start(num_actors: int, *, min_ready: int, timeout: int = 30, resources: dict | None = None):
+def _start(
+    num_actors: int,
+    *,
+    min_ready: int,
+    timeout: int = 30,
+    resources: dict | None = None,
+    actor_name: str | None = None,
+):
     return asyncio.run(
         pool_udf.start_udf_actors_elastic(
             daft.col("x")._expr,
@@ -38,7 +54,7 @@ def _start(num_actors: int, *, min_ready: int, timeout: int = 30, resources: dic
             0,  # memory
             {"resources": resources or SLOT},
             timeout,
-            None,
+            actor_name,
             min_ready,
         )
     )
@@ -46,8 +62,12 @@ def _start(num_actors: int, *, min_ready: int, timeout: int = 30, resources: dic
 
 def _up_ids(handles) -> set[str]:
     """Actors a worker would use right now: what get_ready_actors_by_location keeps."""
-    local, remote = pool_udf.get_ready_actors_by_location(handles)
+    local, remote, _ = pool_udf.get_ready_actors_by_location(handles)
     return {h.actor_id() for h in local + remote}
+
+
+def _num_pending(handles) -> int:
+    return pool_udf.get_ready_actors_by_location(handles)[2]
 
 
 def _wait_until_up(handles, n: int, within: float = 60.0) -> set[str]:
@@ -60,6 +80,15 @@ def _wait_until_up(handles, n: int, within: float = 60.0) -> set[str]:
     raise AssertionError(f"never reached {n} usable actors (has {len(_up_ids(handles))})")
 
 
+def _wait_until_usable(handles, expected: set[str], within: float = 60.0) -> None:
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        if _up_ids(handles) == expected:
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"usable actors never became {expected} (has {_up_ids(handles)})")
+
+
 def _teardown(handles) -> None:
     for h in handles:
         h.teardown()
@@ -70,6 +99,7 @@ def test_returns_every_actor_but_only_the_ready_ones_are_usable(cluster):
     try:
         assert len(handles) == 4  # pending actors are kept, not dropped
         assert len(_up_ids(handles)) == 2  # only the 2 that fit are usable
+        assert _num_pending(handles) == 2
     finally:
         _teardown(handles)
 
@@ -84,6 +114,7 @@ def test_pending_actors_become_usable_when_capacity_appears(cluster):
 
         grown = _wait_until_up(handles, 4)
         assert first < grown  # the original actors are still there; two more joined
+        assert _num_pending(handles) == 0
     finally:
         _teardown(handles)
 
@@ -118,8 +149,31 @@ def test_when_no_actor_is_up_yet_all_are_kept(cluster):
     actors = [pool_udf.UDFActor.options(resources={"never_available": 1}, num_cpus=0).remote(None) for _ in range(2)]
     handles = [pool_udf.UDFActorHandle(a) for a in actors]
     try:
-        local, remote = pool_udf.get_ready_actors_by_location(handles)
+        local, remote, num_pending = pool_udf.get_ready_actors_by_location(handles)
         assert len(local) + len(remote) == 2
+        assert num_pending == 2
+    finally:
+        _teardown(handles)
+
+
+def test_actor_that_fails_to_start_is_left_out(cluster, monkeypatch):
+    # A dead actor left in the pool would fail every batch sent to it.
+    monkeypatch.setattr(pool_udf, "UDFActor", _FirstActorFailsToStart)
+    handles = _start(2, min_ready=2, actor_name="flaky")
+    try:
+        assert len(handles) == 1
+        assert len(_up_ids(handles)) == 1
+    finally:
+        _teardown(handles)
+
+
+def test_dead_actors_are_left_out(cluster):
+    # An actor that dies after the pool started (e.g. it ran out of restarts) must stop taking work.
+    handles = _start(2, min_ready=2)
+    try:
+        ray.kill(handles[0].actor)
+        _wait_until_usable(handles, {handles[1].actor_id()})
+        assert _num_pending(handles) == 0
     finally:
         _teardown(handles)
 

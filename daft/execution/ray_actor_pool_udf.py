@@ -62,31 +62,37 @@ class UDFActorHandle:
 
 def get_ready_actors_by_location(
     actor_handles: list[UDFActorHandle],
-) -> tuple[list[UDFActorHandle], list[UDFActorHandle]]:
+) -> tuple[list[UDFActorHandle], list[UDFActorHandle], int]:
+    """Split the actors that can take work into those on this node and those on other nodes.
+
+    Also returns how many actors are not up yet. Only an elastic pool (see ``start_udf_actors_elastic``) has
+    such actors; they join the pool when a later call finds them up. Dead actors are left out. If no actor is
+    up, the pending ones (or, if there are none, all of them) are returned as remote, so calls queue on them
+    instead of the caller getting an empty pool.
+    """
     from ray._private.state import actors
 
     current_node_id = ray.get_runtime_context().get_node_id()
 
-    # An elastic pool (see start_udf_actors_elastic) includes actors Ray has not scheduled yet. Only the
-    # ones that are up can take work; the rest join the pool for tasks that start after they come up.
-    # If none are up yet, keep them all so calls queue on the actors instead of leaving no actors at all.
-    up_actor_handles = [
-        h for h in actor_handles if (actors(h.actor_id()) or {}).get("State") not in _ACTOR_STATES_NOT_YET_UP
-    ]
-    if up_actor_handles:
-        actor_handles = up_actor_handles
-
     local_actors = []
     remote_actors = []
+    pending_actors = []
     for actor_handle in actor_handles:
-        actor_id = actor_handle.actor_id()
-        actor_state = actors(actor_id)
-        if actor_state["Address"]["NodeID"] == current_node_id:
+        actor_state = actors(actor_handle.actor_id()) or {}
+        state = actor_state.get("State")
+        if state in _ACTOR_STATES_NOT_YET_UP:
+            pending_actors.append(actor_handle)
+        elif state is None or state == "DEAD":
+            continue
+        elif actor_state["Address"]["NodeID"] == current_node_id:
             local_actors.append(actor_handle)
         else:
             remote_actors.append(actor_handle)
 
-    return local_actors, remote_actors
+    if not local_actors and not remote_actors:
+        remote_actors = pending_actors or list(actor_handles)
+
+    return local_actors, remote_actors, len(pending_actors)
 
 
 def _create_udf_actors(
@@ -185,7 +191,7 @@ async def start_udf_actors_elastic(
     later tasks use a larger pool as the pending actors come up.
 
     If fewer than ``min_ready`` are ready after ``timeout`` seconds, it proceeds with the ones that are;
-    if none are ready, it kills them all and raises.
+    if none are ready, it kills them all and raises. Actors that fail to start are killed and left out.
     """
     needed = min(max(min_ready, 1), num_actors)
     actors = _create_udf_actors(
@@ -198,7 +204,8 @@ async def start_udf_actors_elastic(
         timeout,
         actor_name,
     )
-    pending = {actor.__ray_ready__.remote(): actor for actor in actors}
+    pending = {actor.__ray_ready__.remote(): i for i, actor in enumerate(actors)}
+    failed: set[int] = set()
     num_ready = 0
 
     def _teardown() -> None:
@@ -213,12 +220,18 @@ async def start_udf_actors_elastic(
         if pending:
             done, _ = ray.wait(list(pending), num_returns=len(pending), timeout=0)
             for ref in done:
-                pending.pop(ref)
+                i = pending.pop(ref)
                 try:
                     ray.get(ref)
                     num_ready += 1
                 except ray.exceptions.RayError as e:
+                    # Drop it: a dead actor left in the pool would fail every batch sent to it.
                     logger.warning("UDF actor failed to start: %s", e)
+                    failed.add(i)
+                    try:
+                        ray.kill(actors[i])
+                    except (ValueError, ray.exceptions.RayError):
+                        pass
         if num_ready >= needed:
             break
         if not pending:
@@ -244,7 +257,7 @@ async def start_udf_actors_elastic(
             )
         await asyncio.sleep(0.2)
 
-    return [UDFActorHandle(actor) for actor in actors]
+    return [UDFActorHandle(actor) for i, actor in enumerate(actors) if i not in failed]
 
 
 async def start_udf_actors(

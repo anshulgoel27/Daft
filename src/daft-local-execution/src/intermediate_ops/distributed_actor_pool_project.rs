@@ -34,7 +34,10 @@ pub(crate) struct ActorHandle {
 }
 
 impl ActorHandle {
-    fn get_actors_on_current_node(actor_handles: Vec<Self>) -> DaftResult<(Vec<Self>, Vec<Self>)> {
+    /// Returns the actors that are up on this node, those up on other nodes, and how many are not up yet.
+    fn get_actors_on_current_node(
+        actor_handles: Vec<Self>,
+    ) -> DaftResult<(Vec<Self>, Vec<Self>, usize)> {
         #[cfg(feature = "python")]
         {
             let actor_handles = actor_handles
@@ -42,20 +45,20 @@ impl ActorHandle {
                 .map(|e| e.inner)
                 .collect::<Vec<_>>();
 
-            let (local_actors, remote_actors) = Python::attach(|py| {
+            let (local_actors, remote_actors, num_pending) = Python::attach(|py| {
                 let actor_handles = actor_handles
                     .into_iter()
                     .map(|e| e.as_ref().clone_ref(py))
                     .collect::<Vec<_>>();
                 let ray_actor_pool_udf_module =
                     py.import(pyo3::intern!(py, "daft.execution.ray_actor_pool_udf"))?;
-                let (local_actors, remote_actors) = ray_actor_pool_udf_module
+                let (local_actors, remote_actors, num_pending) = ray_actor_pool_udf_module
                     .call_method1(
                         pyo3::intern!(py, "get_ready_actors_by_location"),
                         (actor_handles,),
                     )?
-                    .extract::<(Vec<Py<PyAny>>, Vec<Py<PyAny>>)>()?;
-                DaftResult::Ok((local_actors, remote_actors))
+                    .extract::<(Vec<Py<PyAny>>, Vec<Py<PyAny>>, usize)>()?;
+                DaftResult::Ok((local_actors, remote_actors, num_pending))
             })?;
 
             let local_actors = local_actors
@@ -66,7 +69,7 @@ impl ActorHandle {
                 .into_iter()
                 .map(|e| Self { inner: Arc::new(e) })
                 .collect::<Vec<_>>();
-            Ok((local_actors, remote_actors))
+            Ok((local_actors, remote_actors, num_pending))
         }
         #[cfg(not(feature = "python"))]
         {
@@ -104,6 +107,19 @@ impl From<common_py_serde::PyObjectWrapper> for ActorHandle {
 /// How often an elastic pool re-checks which of its actors are up.
 const ACTOR_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The actors a pool sends work to. A fixed pool prefers the actors on this node and falls back to remote
+/// ones. An elastic pool uses every actor that is up, wherever it is: its actors come up on whichever nodes
+/// gain capacity, and preferring local ones would leave the actors on other nodes unused.
+fn usable_actors<T>(local: Vec<T>, remote: Vec<T>, elastic: bool) -> Vec<T> {
+    if elastic {
+        local.into_iter().chain(remote).collect()
+    } else if local.is_empty() {
+        remote
+    } else {
+        local
+    }
+}
+
 /// The actors of an elastic pool (`actor_udf_min_ready`): some were not up when the operator was built,
 /// and Ray keeps scheduling them. The operator is built once per worker and shared by every task of the
 /// plan, so the usable set is refreshed here, and the actor is picked per batch instead of being fixed
@@ -111,7 +127,7 @@ const ACTOR_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 struct DynamicActorPool {
     all: Vec<ActorHandle>,
     usable: RwLock<Vec<ActorHandle>>,
-    /// When to next refresh; `None` once every actor is up.
+    /// When to next refresh; `None` once no actor is pending.
     next_refresh: Mutex<Option<Instant>>,
     counter: AtomicUsize,
 }
@@ -144,13 +160,12 @@ impl DynamicActorPool {
             _ => return,
         }
         match ActorHandle::get_actors_on_current_node(self.all.clone()) {
-            Ok((local, remote)) => {
-                let usable = if local.is_empty() { remote } else { local };
-                let all_up = usable.len() == self.all.len();
+            Ok((local, remote, num_pending)) => {
+                let usable = usable_actors(local, remote, true);
                 if !usable.is_empty() {
                     *self.usable.write().expect("actor list lock poisoned") = usable;
                 }
-                *next_refresh = if all_up {
+                *next_refresh = if num_pending == 0 {
                     None
                 } else {
                     Some(Instant::now() + ACTOR_REFRESH_INTERVAL)
@@ -174,7 +189,7 @@ pub(crate) struct DistributedActorPoolProjectOperator {
     actor_handles: Vec<ActorHandle>,
     /// Number of actors in the pool, including ones that are not up yet.
     total_actors: usize,
-    /// Set only for an elastic pool that had actors pending at build time.
+    /// Set only for an elastic pool that had actors pending when the operator was built.
     dynamic: Option<Arc<DynamicActorPool>>,
     batch_size: Option<usize>,
     memory_request: u64,
@@ -189,6 +204,7 @@ impl DistributedActorPoolProjectOperator {
         actor_handles: Vec<impl Into<ActorHandle>>,
         batch_size: Option<usize>,
         memory_request: u64,
+        elastic: bool,
         passthrough_columns: Vec<BoundExpr>,
         required_columns: Vec<usize>,
         schema: SchemaRef,
@@ -196,22 +212,18 @@ impl DistributedActorPoolProjectOperator {
         let all_actor_handles: Vec<ActorHandle> =
             actor_handles.into_iter().map(|e| e.into()).collect();
         let total_actors = all_actor_handles.len();
-        let (local_actor_handles, remote_actor_handles) =
+        let (local_actor_handles, remote_actor_handles, num_pending) =
             ActorHandle::get_actors_on_current_node(all_actor_handles.clone())?;
 
-        let actor_handles = match local_actor_handles.len() {
-            0 => remote_actor_handles,
-            _ => local_actor_handles,
-        };
+        let actor_handles = usable_actors(local_actor_handles, remote_actor_handles, elastic);
 
-        // The pool lists actors that are not up yet (an elastic pool): keep watching for them.
-        let dynamic =
-            (!actor_handles.is_empty() && actor_handles.len() < total_actors).then(|| {
-                Arc::new(DynamicActorPool::new(
-                    all_actor_handles,
-                    actor_handles.clone(),
-                ))
-            });
+        // An elastic pool with actors that are not up yet keeps watching for them.
+        let dynamic = (elastic && num_pending > 0).then(|| {
+            Arc::new(DynamicActorPool::new(
+                all_actor_handles,
+                actor_handles.clone(),
+            ))
+        });
 
         let init_counter = if actor_handles.is_empty() {
             0
@@ -374,6 +386,8 @@ impl IntermediateOperator for DistributedActorPoolProjectOperator {
         match &self.dynamic {
             // An elastic pool counts actors that are not up yet too: concurrency is fixed when the
             // pipeline starts, and batches simply queue on the actors that are up until the rest join.
+            // Each queued batch holds its memory request, so a pool that starts far below its size
+            // reserves memory for up to `total_actors * 2` batches.
             Some(_) => self.total_actors * 2,
             None => self.actor_handles.len() * 2,
         }
@@ -388,5 +402,25 @@ impl IntermediateOperator for DistributedActorPoolProjectOperator {
         Ok(crate::dynamic_batching::StaticBatchingStrategy::new(
             self.morsel_size_requirement().unwrap_or_default(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::usable_actors;
+
+    #[test]
+    fn fixed_pool_prefers_local_actors() {
+        assert_eq!(usable_actors(vec![1, 2], vec![3, 4], false), vec![1, 2]);
+    }
+
+    #[test]
+    fn fixed_pool_falls_back_to_remote_actors() {
+        assert_eq!(usable_actors(vec![], vec![3, 4], false), vec![3, 4]);
+    }
+
+    #[test]
+    fn elastic_pool_uses_local_and_remote_actors() {
+        assert_eq!(usable_actors(vec![1, 2], vec![3, 4], true), vec![1, 2, 3, 4]);
     }
 }

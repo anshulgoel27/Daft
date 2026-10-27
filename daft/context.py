@@ -288,8 +288,11 @@ def set_execution_config(
         actor_udf_ready_timeout: Timeout for UDF actors to be ready. Defaults to 120 seconds.
         actor_udf_min_ready: Makes UDF actor pools elastic on the Ray runner. Execution starts once this many
             actors are ready (or the timeout passes with at least one ready), and the remaining actors join the
-            pool as Ray schedules them, so later work uses a larger pool. Defaults to 0, which keeps a fixed pool
-            of the actors that are ready within `actor_udf_ready_timeout`.
+            pool as Ray schedules them, so later work uses a larger pool. Unlike a fixed pool, an elastic pool
+            sends work to actors on every node instead of preferring the worker's own node, and each worker
+            queues up to twice the full pool size in batches (each holding its memory request) while actors
+            are still coming up. Defaults to 0, which keeps a fixed pool of the actors that are ready within
+            `actor_udf_ready_timeout`.
         maintain_order: Whether to maintain order during execution. Defaults to True. Some blocking sink operators (e.g. write_parquet) won't respect this flag and will always keep maintain_order as false, and propagate to child operators. It's useful to set this to False for running df.collect() when no ordering is required.
         enable_dynamic_batching: Whether to enable dynamic batching. Defaults to False.
         dynamic_batching_strategy: The strategy to use for dynamic batching. Defaults to 'auto'.
