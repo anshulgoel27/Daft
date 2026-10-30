@@ -223,3 +223,45 @@ def test_start_ray_workers_refresh_total_failure_is_non_fatal(monkeypatch):
 
     assert workers == []
     assert captured["killed"] == [0]
+
+
+def test_flotilla_runner_defaults_to_head_node_affinity(monkeypatch):
+    monkeypatch.delenv(flotilla.FLOTILLA_RUNNER_RESOURCE_ENV, raising=False)
+    head = _hex_node_id(1)
+
+    placement = flotilla._flotilla_runner_placement(head)
+
+    assert "resources" not in placement
+    strategy = placement["scheduling_strategy"]
+    assert strategy.node_id == head
+    assert strategy.soft is False
+
+
+def test_flotilla_runner_without_head_node_has_no_strategy(monkeypatch):
+    monkeypatch.delenv(flotilla.FLOTILLA_RUNNER_RESOURCE_ENV, raising=False)
+
+    assert flotilla._flotilla_runner_placement(None) == {"scheduling_strategy": None}
+
+
+def test_flotilla_runner_uses_custom_resource_when_cluster_advertises_it(monkeypatch):
+    monkeypatch.setenv(flotilla.FLOTILLA_RUNNER_RESOURCE_ENV, "daft_runner")
+    monkeypatch.setattr(flotilla.ray, "cluster_resources", lambda: {"CPU": 8.0, "daft_runner": 1000.0})
+
+    placement = flotilla._flotilla_runner_placement(_hex_node_id(1))
+
+    # Not pinned to the head: the custom resource alone decides placement.
+    assert placement == {"resources": {"daft_runner": 1}}
+
+
+@pytest.mark.parametrize("cluster", [{"CPU": 8.0}, {"CPU": 8.0, "daft_runner": 0.5}])
+def test_flotilla_runner_falls_back_to_head_when_resource_missing(monkeypatch, caplog, cluster):
+    monkeypatch.setenv(flotilla.FLOTILLA_RUNNER_RESOURCE_ENV, "daft_runner")
+    monkeypatch.setattr(flotilla.ray, "cluster_resources", lambda: cluster)
+    head = _hex_node_id(1)
+
+    with caplog.at_level("WARNING", logger=flotilla.logger.name):
+        placement = flotilla._flotilla_runner_placement(head)
+
+    assert "resources" not in placement
+    assert placement["scheduling_strategy"].node_id == head
+    assert "daft_runner" in caplog.text
