@@ -309,33 +309,56 @@ def st_covered_by(geom_a: Expression, geom_b: Expression) -> Expression:
 
 
 def st_union(geom_a: Expression, geom_b: Expression) -> Expression:
-    """Return the geometric union of two polygon geometries.
+    """Return the geometric union of two geometries.
 
-    Both operands must be Polygon or MultiPolygon; other types (e.g. Point,
-    LineString) return null.
+    Points and lines covered by a polygon of the result are absorbed into it.
+
+    Works for any geometry types (points, lines, polygons and collections), as
+    PostGIS does. Vertices that come from the inputs are preserved exactly.
 
     Args:
-        geom_a: First geometry column (Geometry or Binary WKB).
+        geom_a: First geometry column (Geometry or Binary WKB). Either side may be a literal.
         geom_b: Second geometry column (Geometry or Binary WKB).
 
     Returns:
-        Geometry column (MultiPolygon). Returns null for non-polygon inputs
-        or if the underlying boolean operation raises an error.
+        Geometry column. A single polygon is a ``POLYGON``, several a
+        ``MULTIPOLYGON`` (an empty areal result is ``MULTIPOLYGON EMPTY``);
+        mixed-dimension results are a ``GEOMETRYCOLLECTION`` (an empty
+        non-areal result is ``GEOMETRYCOLLECTION EMPTY``). Null if the
+        geometry engine fails on degenerate input.
+
+    Lines are noded against each other as in GEOS: shared parts are found
+    exactly, and line results are split where the inputs cross or where a
+    shared part begins or ends.
     """
     return Expression._call_builtin_scalar_fn("st_union", geom_a, geom_b)
 
 
 def st_intersection(geom_a: Expression, geom_b: Expression) -> Expression:
-    """Return the geometric intersection of two polygon geometries.
+    """Return the geometric intersection of two geometries.
 
-    Both operands must be Polygon or MultiPolygon; other types return null.
+    Lines are clipped by polygons, points are kept where they intersect the other
+    geometry, and two lines yield their crossing points and shared parts. Two
+    polygons that only touch give an empty result (GEOS would return the shared
+    boundary).
+
+    Works for any geometry types (points, lines, polygons and collections), as
+    PostGIS does. Vertices that come from the inputs are preserved exactly.
 
     Args:
-        geom_a: First geometry column (Geometry or Binary WKB).
+        geom_a: First geometry column (Geometry or Binary WKB). Either side may be a literal.
         geom_b: Second geometry column (Geometry or Binary WKB).
 
     Returns:
-        Geometry column (MultiPolygon). Returns null for non-polygon inputs.
+        Geometry column. A single polygon is a ``POLYGON``, several a
+        ``MULTIPOLYGON`` (an empty areal result is ``MULTIPOLYGON EMPTY``);
+        mixed-dimension results are a ``GEOMETRYCOLLECTION`` (an empty
+        non-areal result is ``GEOMETRYCOLLECTION EMPTY``). Null if the
+        geometry engine fails on degenerate input.
+
+    Lines are noded against each other as in GEOS: shared parts are found
+    exactly, and line results are split where the inputs cross or where a
+    shared part begins or ends.
     """
     return Expression._call_builtin_scalar_fn("st_intersection", geom_a, geom_b)
 
@@ -343,30 +366,52 @@ def st_intersection(geom_a: Expression, geom_b: Expression) -> Expression:
 def st_difference(geom_a: Expression, geom_b: Expression) -> Expression:
     """Return the part of geometry A that does not intersect geometry B.
 
-    Both operands must be Polygon or MultiPolygon; other types return null.
+    Subtracting a lower-dimensional geometry (e.g. a line from a polygon) leaves A
+    unchanged, as in PostGIS.
+
+    Works for any geometry types (points, lines, polygons and collections), as
+    PostGIS does. Vertices that come from the inputs are preserved exactly.
 
     Args:
-        geom_a: First geometry column (Geometry or Binary WKB).
+        geom_a: First geometry column (Geometry or Binary WKB). Either side may be a literal.
         geom_b: Second geometry column (Geometry or Binary WKB).
 
     Returns:
-        Geometry column (MultiPolygon). Returns null for non-polygon inputs.
+        Geometry column. A single polygon is a ``POLYGON``, several a
+        ``MULTIPOLYGON`` (an empty areal result is ``MULTIPOLYGON EMPTY``);
+        mixed-dimension results are a ``GEOMETRYCOLLECTION`` (an empty
+        non-areal result is ``GEOMETRYCOLLECTION EMPTY``). Null if the
+        geometry engine fails on degenerate input.
+
+    Lines are noded against each other as in GEOS: shared parts are found
+    exactly, and line results are split where the inputs cross or where a
+    shared part begins or ends.
     """
     return Expression._call_builtin_scalar_fn("st_difference", geom_a, geom_b)
 
 
 def st_symdifference(geom_a: Expression, geom_b: Expression) -> Expression:
-    """Return the symmetric difference (XOR) of two polygon geometries.
+    """Return the symmetric difference (XOR) of two geometries.
 
-    Returns the regions in either geometry but not in both.
-    Both operands must be Polygon or MultiPolygon; other types return null.
+    Returns the parts in either geometry but not in both.
+
+    Works for any geometry types (points, lines, polygons and collections), as
+    PostGIS does. Vertices that come from the inputs are preserved exactly.
 
     Args:
-        geom_a: First geometry column (Geometry or Binary WKB).
+        geom_a: First geometry column (Geometry or Binary WKB). Either side may be a literal.
         geom_b: Second geometry column (Geometry or Binary WKB).
 
     Returns:
-        Geometry column (MultiPolygon). Returns null for non-polygon inputs.
+        Geometry column. A single polygon is a ``POLYGON``, several a
+        ``MULTIPOLYGON`` (an empty areal result is ``MULTIPOLYGON EMPTY``);
+        mixed-dimension results are a ``GEOMETRYCOLLECTION`` (an empty
+        non-areal result is ``GEOMETRYCOLLECTION EMPTY``). Null if the
+        geometry engine fails on degenerate input.
+
+    Lines are noded against each other as in GEOS: shared parts are found
+    exactly, and line results are split where the inputs cross or where a
+    shared part begins or ends.
     """
     return Expression._call_builtin_scalar_fn("st_symdifference", geom_a, geom_b)
 

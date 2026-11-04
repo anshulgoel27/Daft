@@ -7,15 +7,14 @@ use daft_dsl::{
     ExprRef,
     functions::{FunctionArgs, ScalarUDF, scalar::ScalarFn},
 };
-use geo::{BooleanOps, Geometry};
+use geo::Geometry;
 use serde::{Deserialize, Serialize};
 
-use crate::utils::{as_multipolygon, binary_geom_to_geom, validate_geometry_field};
+use crate::overlay::{OverlayOp, Prepared, overlay};
+use crate::utils::{binary_prepared_to_geom, validate_geometry_field};
 
-fn op_difference(a: &Geometry, b: &Geometry) -> Option<Geometry> {
-    let (amp, bmp) = (as_multipolygon(a)?, as_multipolygon(b)?);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| amp.difference(&bmp)));
-    result.ok().map(Geometry::MultiPolygon)
+fn op_difference(a: &Prepared, b: &Prepared) -> Option<Geometry> {
+    overlay(a, b, OverlayOp::Difference)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -32,10 +31,11 @@ impl ScalarUDF for StDifference {
         inputs: FunctionArgs<Series>,
         _ctx: &daft_dsl::functions::scalar::EvalContext,
     ) -> DaftResult<Series> {
-        binary_geom_to_geom(
+        binary_prepared_to_geom(
             inputs.required(0)?,
             inputs.required(1)?,
             self.name(),
+            Prepared::new,
             op_difference,
         )
     }
@@ -51,7 +51,10 @@ impl ScalarUDF for StDifference {
     }
 
     fn docstring(&self) -> &'static str {
-        "Returns the part of geometry A that does not intersect geometry B. Non-polygon inputs return null."
+        "Returns the difference of two geometries of any type (points, lines, polygons, collections). \
+         A single polygon is returned as a POLYGON, several as a MULTIPOLYGON (empty areal result: \
+         MULTIPOLYGON EMPTY); mixed-dimension results are a GEOMETRYCOLLECTION. Vertices taken from \
+         the inputs are preserved exactly."
     }
 }
 

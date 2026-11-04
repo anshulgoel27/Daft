@@ -10,7 +10,7 @@ use daft_core::{
     series::Series,
 };
 use daft_dsl::{functions::FunctionArgs, ExprRef};
-use geo::{Geometry, MultiPolygon};
+use geo::Geometry;
 use geo_traits::{to_geo::ToGeoGeometry, GeometryTrait};
 
 /// Rewrite the geo-only variants WKB has no type for (`Rect`, `Triangle`, `Line`)
@@ -111,20 +111,6 @@ pub fn read_f64_arg_expr(
         .ok_or_else(|| {
             DaftError::ValueError(format!("{fn_name}: {name} must be a numeric literal"))
         })
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Shared overlay operation helper
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Convert a Geometry to a MultiPolygon if it is a Polygon or MultiPolygon.
-/// Returns None for non-polygon geometries.
-pub(crate) fn as_multipolygon(g: &Geometry) -> Option<MultiPolygon> {
-    match g {
-        Geometry::Polygon(p) => Some(MultiPolygon(vec![p.clone()])),
-        Geometry::MultiPolygon(mp) => Some(mp.clone()),
-        _ => None,
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

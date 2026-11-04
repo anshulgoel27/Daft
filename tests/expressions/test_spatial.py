@@ -910,13 +910,13 @@ def test_difference_symdifference_area():
     assert abs(df["sd"][0] - 6.0) < 1e-6, f"symdifference area: {df['sd'][0]}"
 
 
-def test_overlay_non_polygon_yields_null():
-    """Non-polygon geometries (Point) return null for overlay ops."""
-    from daft.functions import st_union
+def test_overlay_point_union_is_multipoint():
+    """Overlays accept non-polygon inputs, as PostGIS does: two points union to a MultiPoint."""
+    from daft.functions import st_union, st_astext
     df = daft.from_pydict({"a": ["POINT(0 0)"], "b": ["POINT(1 1)"]}).select(
-        st_union(st_geomfromtext(daft.col("a")), st_geomfromtext(daft.col("b"))).alias("u"),
+        st_astext(st_union(st_geomfromtext(daft.col("a")), st_geomfromtext(daft.col("b")))).alias("u"),
     ).to_pydict()
-    assert df["u"][0] is None, f"Expected null for point union, got {df['u'][0]}"
+    assert df["u"] == ["MULTIPOINT((0 0),(1 1))"]
 
 
 def test_overlay_sql_parity():
