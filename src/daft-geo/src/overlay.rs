@@ -20,13 +20,14 @@
 //! Inputs are wrapped in [`Prepared`], so a broadcast literal (e.g. clipping
 //! every row by one region) is decomposed and indexed once, not per row.
 //!
-//! Known gap versus GEOS: two polygons that only touch intersect in an empty
-//! geometry here, not in their shared boundary line/point.
+//! Polygons that touch intersect in their shared boundary edges and touch
+//! points (alongside any areal part), as in GEOS.
 
 use geo::{
     BooleanOps, BoundingRect, Coord, CoordsIter, Geometry, GeometryCollection, Intersects, Line,
-    LineString, MapCoords, MultiLineString, MultiPoint, MultiPolygon, Point, Rect, unary_union,
+    LineString, MapCoords, MultiLineString, MultiPoint, MultiPolygon, Point, Rect,
     line_intersection::{LineIntersection, line_intersection},
+    unary_union,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +55,13 @@ pub(crate) struct Prepared {
     /// The input's vertices sorted by x, for snapping output vertices back.
     coords: Vec<Coord>,
     areal: bool,
+    /// R-tree of the polygon rings, for large polygonal operands only (built
+    /// once per broadcast literal); enables the disjoint/contained fast path.
+    rings: Option<Segs>,
 }
+
+/// Polygonal operands with more ring segments than this get a ring index.
+const RING_INDEX_MIN_SEGMENTS: usize = 64;
 
 impl Prepared {
     pub(crate) fn new(geom: Geometry) -> Self {
@@ -71,7 +78,17 @@ impl Prepared {
             parts.areas = snap.snap(unary_union(parts.areas.0.iter()));
         }
         let areal = is_areal_type(&geom);
-        Self { geom, parts, rect, coords, areal }
+        let only_areas = parts.points.is_empty() && parts.lines.is_empty();
+        let rings = (only_areas && coords.len() > RING_INDEX_MIN_SEGMENTS)
+            .then(|| segments(&boundary_lines(&parts.areas)));
+        Self {
+            geom,
+            parts,
+            rect,
+            coords,
+            areal,
+            rings,
+        }
     }
 }
 
@@ -100,7 +117,11 @@ struct Parts {
 
 impl Parts {
     fn empty() -> Self {
-        Self { points: vec![], lines: vec![], areas: MultiPolygon::empty() }
+        Self {
+            points: vec![],
+            lines: vec![],
+            areas: MultiPolygon::empty(),
+        }
     }
 
     fn of(g: &Geometry) -> Self {
@@ -124,7 +145,8 @@ impl Parts {
                 }
             }
             Geometry::MultiLineString(m) => {
-                self.lines.extend(m.iter().filter(|ls| ls.0.len() >= 2).cloned());
+                self.lines
+                    .extend(m.iter().filter(|ls| ls.0.len() >= 2).cloned());
             }
             Geometry::Polygon(p) => {
                 if !p.exterior().0.is_empty() {
@@ -132,7 +154,9 @@ impl Parts {
                 }
             }
             Geometry::MultiPolygon(mp) => {
-                self.areas.0.extend(mp.iter().filter(|p| !p.exterior().0.is_empty()).cloned());
+                self.areas
+                    .0
+                    .extend(mp.iter().filter(|p| !p.exterior().0.is_empty()).cloned());
             }
             Geometry::Rect(r) => self.areas.0.push(r.to_polygon()),
             Geometry::Triangle(t) => self.areas.0.push(t.to_polygon()),
@@ -165,7 +189,79 @@ impl Parts {
     }
 }
 
+/// Where an operand lies relative to a large polygonal one whose rings do not
+/// come near it: entirely inside, or entirely outside.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    Inside,
+    Outside,
+}
+
+/// If `big`'s rings do not meet `small`'s bbox, `small` (polygons only) lies in
+/// one face of `big`; one point-in-polygon test says which.
+fn placement(big: &Prepared, small: &Prepared) -> Option<Placement> {
+    use geo::coordinate_position::{CoordPos, CoordinatePosition};
+    let rings = big.rings.as_ref()?;
+    let rect = small.rect?;
+    if !small.parts.points.is_empty()
+        || !small.parts.lines.is_empty()
+        || small.parts.areas.0.is_empty()
+    {
+        return None;
+    }
+    if rings.near(rect).next().is_some() {
+        return None;
+    }
+    let probe = *small.parts.areas.0[0].exterior().0.first()?;
+    match big.parts.areas.coordinate_position(&probe) {
+        CoordPos::Inside => Some(Placement::Inside),
+        CoordPos::Outside => Some(Placement::Outside),
+        CoordPos::OnBoundary => None,
+    }
+}
+
+/// Overlay of two polygon sets when one lies wholly inside or outside the
+/// other: no boolean op is needed, and every vertex stays exact. Returns `None`
+/// when the case needs a real overlay (e.g. cutting a hole).
+fn overlay_fast_path(a: &Prepared, b: &Prepared, op: OverlayOp) -> Option<Geometry> {
+    if !(a.areal && b.areal) {
+        return None;
+    }
+    let both = |x: &MultiPolygon, y: &MultiPolygon| {
+        MultiPolygon::new(x.0.iter().chain(&y.0).cloned().collect())
+    };
+    let (ma, mb) = (&a.parts.areas, &b.parts.areas);
+    let empty = MultiPolygon::empty;
+    let out = if let Some(place) = placement(a, b) {
+        // b is inside or outside a.
+        match (op, place) {
+            (OverlayOp::Intersection, Placement::Inside) => mb.clone(),
+            (OverlayOp::Intersection, Placement::Outside) => empty(),
+            (OverlayOp::Union, Placement::Inside) => ma.clone(),
+            (OverlayOp::Union | OverlayOp::SymDifference, Placement::Outside) => both(ma, mb),
+            (OverlayOp::Difference, Placement::Outside) => ma.clone(),
+            _ => return None,
+        }
+    } else {
+        // a is inside or outside b.
+        let place = placement(b, a)?;
+        match (op, place) {
+            (OverlayOp::Intersection, Placement::Inside) => ma.clone(),
+            (OverlayOp::Intersection, Placement::Outside) => empty(),
+            (OverlayOp::Difference, Placement::Inside) => empty(),
+            (OverlayOp::Difference, Placement::Outside) => ma.clone(),
+            (OverlayOp::Union, Placement::Inside) => mb.clone(),
+            (OverlayOp::Union | OverlayOp::SymDifference, Placement::Outside) => both(ma, mb),
+            _ => return None,
+        }
+    };
+    Some(areal_geometry(out))
+}
+
 fn overlay_inner(a: &Prepared, b: &Prepared, op: OverlayOp) -> Geometry {
+    if let Some(fast) = overlay_fast_path(a, b, op) {
+        return fast;
+    }
     let (pa, pb) = (&a.parts, &b.parts);
     let snap = Snapper::new(a.rect, b.rect, &a.coords, &b.coords);
     let areal_inputs = a.areal && b.areal;
@@ -185,8 +281,12 @@ fn overlay_inner(a: &Prepared, b: &Prepared, op: OverlayOp) -> Geometry {
             return if invert { lines } else { vec![] };
         }
         let clipped = areas.clip(&MultiLineString::new(lines), invert);
-        let clipped: Vec<LineString> =
-            snap.snap(clipped).0.into_iter().filter(|ls| ls.0.len() >= 2).collect();
+        let clipped: Vec<LineString> = snap
+            .snap(clipped)
+            .0
+            .into_iter()
+            .filter(|ls| ls.0.len() >= 2)
+            .collect();
         // Split where the lines touch the polygon boundary, as GEOS does.
         chain(&node(&clipped, &segments(&boundary_lines(areas))), |_| true)
     };
@@ -202,16 +302,26 @@ fn overlay_inner(a: &Prepared, b: &Prepared, op: OverlayOp) -> Geometry {
             };
             // Shared parts of the two line sets, then their isolated crossings.
             let mut lines = chain(&noded_a, |piece| piece.shared);
-            let mut points = crossing_points(&sa, &sb);
+            let mut points = crossing_points(&sa.lines, &sb);
             for (l, other) in [(&pa.lines, &pb.areas), (&pb.lines, &pa.areas)] {
                 lines.extend(clip(l.clone(), other, false));
                 // A line touching a polygon only at isolated points: those points.
-                points.extend(crossing_points(&segments(l), &segments(&boundary_lines(other))));
+                points.extend(crossing_points(
+                    &segment_list(l),
+                    &segments(&boundary_lines(other)),
+                ));
             }
             points.extend(pa.points.iter().filter(|p| b.geom.intersects(*p)).copied());
             points.extend(pb.points.iter().filter(|p| a.geom.intersects(*p)).copied());
+            // Polygons that touch: their shared boundary edges and touch points, as
+            // GEOS returns them. Parts on the areal result's boundary are absorbed below.
+            if !pa.areas.0.is_empty() && !pb.areas.0.is_empty() {
+                let (touch_lines, touch_points) = boundary_touches(&pa.areas, &pb.areas);
+                lines.extend(touch_lines);
+                points.extend(touch_points);
+            }
             // Lower-dimensional parts covered by a higher-dimensional part are absorbed.
-            absorb(points, lines, areas, &clip)
+            absorb(points, lines, areas, &clip, snap.tolerance)
         }
         OverlayOp::Difference => {
             let areas = if pb.areas.0.is_empty() || pa.areas.0.is_empty() {
@@ -221,8 +331,17 @@ fn overlay_inner(a: &Prepared, b: &Prepared, op: OverlayOp) -> Geometry {
             };
             let lines = chain(&noded_a, |piece| !piece.shared);
             let lines = clip(lines, &pb.areas, true);
-            let points = pa.points.iter().filter(|p| !b.geom.intersects(*p)).copied().collect();
-            Parts { points, lines, areas }
+            let points = pa
+                .points
+                .iter()
+                .filter(|p| !b.geom.intersects(*p))
+                .copied()
+                .collect();
+            Parts {
+                points,
+                lines,
+                areas,
+            }
         }
         OverlayOp::Union => {
             let areas = match (pa.areas.0.is_empty(), pb.areas.0.is_empty()) {
@@ -233,7 +352,7 @@ fn overlay_inner(a: &Prepared, b: &Prepared, op: OverlayOp) -> Geometry {
             let mut lines = chain(&noded_a, |_| true);
             lines.extend(chain(&noded_b, |piece| !piece.shared));
             let points = pa.points.iter().chain(&pb.points).copied().collect();
-            absorb(points, lines, areas, &clip)
+            absorb(points, lines, areas, &clip, snap.tolerance)
         }
         OverlayOp::SymDifference => {
             let areas = match (pa.areas.0.is_empty(), pb.areas.0.is_empty()) {
@@ -242,30 +361,170 @@ fn overlay_inner(a: &Prepared, b: &Prepared, op: OverlayOp) -> Geometry {
                 _ => bool_op(&pa.areas, &pb.areas),
             };
             let mut lines = clip(chain(&noded_a, |piece| !piece.shared), &pb.areas, true);
-            lines.extend(clip(chain(&noded_b, |piece| !piece.shared), &pa.areas, true));
-            let mut points: Vec<Point> =
-                pa.points.iter().filter(|p| !b.geom.intersects(*p)).copied().collect();
+            lines.extend(clip(
+                chain(&noded_b, |piece| !piece.shared),
+                &pa.areas,
+                true,
+            ));
+            let mut points: Vec<Point> = pa
+                .points
+                .iter()
+                .filter(|p| !b.geom.intersects(*p))
+                .copied()
+                .collect();
             points.extend(pb.points.iter().filter(|p| !a.geom.intersects(*p)));
-            absorb(points, lines, areas, &clip)
+            absorb(points, lines, areas, &clip, snap.tolerance)
         }
     };
     out.into_geometry(areal_inputs)
 }
 
-/// Absorption: drop line parts inside `areas`, and points covered by `areas`
-/// or by the remaining lines.
 /// Clips lines by polygons: `(lines, areas, invert)` → the parts outside
 /// (`invert`) or inside `areas`.
 type ClipFn<'a> = dyn Fn(Vec<LineString>, &MultiPolygon, bool) -> Vec<LineString> + 'a;
 
-fn absorb(points: Vec<Point>, lines: Vec<LineString>, areas: MultiPolygon, clip: &ClipFn<'_>) -> Parts {
+/// Absorption: drop line parts inside or on `areas`, and points covered by
+/// `areas` or by the remaining lines.
+///
+/// `areas`' vertices sit on i_overlay's grid (only input vertices are snapped
+/// back exactly), so a part lying on its boundary — e.g. a crossing point of the
+/// two inputs' boundaries — may miss it by up to `tol`; "on the boundary" is
+/// therefore tested within `tol`, against an R-tree of the boundary segments.
+fn absorb(
+    points: Vec<Point>,
+    lines: Vec<LineString>,
+    areas: MultiPolygon,
+    clip: &ClipFn<'_>,
+    tol: f64,
+) -> Parts {
+    use geo::{Distance, Euclidean};
     let lines = clip(lines, &areas, true);
-    let lines_geom = MultiLineString::new(lines.clone());
+    if lines.is_empty() && points.is_empty() {
+        return Parts {
+            points,
+            lines,
+            areas,
+        };
+    }
+    // Few candidates (the usual case: a couple of boundary crossings) are tested
+    // by a linear scan; many (e.g. a long shared edge) through an R-tree.
+    let ring_segs = segment_list(&boundary_lines(&areas));
+    let candidates = points.len() + lines.iter().map(|l| l.0.len()).sum::<usize>();
+    let boundary = (candidates.saturating_mul(ring_segs.len()) > 200_000)
+        .then(|| Segs::new(ring_segs.clone()));
+    let on_boundary = |c: Coord| {
+        let Some(boundary) = &boundary else {
+            return ring_segs
+                .iter()
+                .any(|l| Euclidean.distance(&Point::from(c), l) <= tol);
+        };
+        let probe = Rect::new(
+            Coord {
+                x: c.x - tol,
+                y: c.y - tol,
+            },
+            Coord {
+                x: c.x + tol,
+                y: c.y + tol,
+            },
+        );
+        boundary
+            .near(probe)
+            .any(|l| Euclidean.distance(&Point::from(c), l) <= tol)
+    };
+    let midpoint = |l: Line| Coord {
+        x: f64::midpoint(l.start.x, l.end.x),
+        y: f64::midpoint(l.start.y, l.end.y),
+    };
+    let lines: Vec<LineString> = lines
+        .into_iter()
+        .filter(|ls| !ls.lines().all(|l| on_boundary(midpoint(l))))
+        .collect();
+    let line_segs = segments(&lines);
     let points = points
         .into_iter()
-        .filter(|p| !areas.intersects(p) && !lines_geom.intersects(p))
+        .filter(|p| !on_boundary(p.0) && !is_on(p.0, &line_segs) && !areas.intersects(p))
         .collect();
-    Parts { points, lines, areas }
+    Parts {
+        points,
+        lines,
+        areas,
+    }
+}
+
+/// Where two polygon sets' boundaries touch: their shared edges (split at
+/// nodes, as GEOS does) and isolated touch/crossing points. One R-tree query
+/// per boundary segment of `a`; pieces are only built near `b`'s boundary.
+fn boundary_touches(a: &MultiPolygon, b: &MultiPolygon) -> (Vec<LineString>, Vec<Point>) {
+    let (Some(ra), Some(rb)) = (a.bounding_rect(), b.bounding_rect()) else {
+        return (vec![], vec![]);
+    };
+    // Only segments inside the other side's bbox can touch it. This keeps the
+    // common "small feature vs. large region" case proportional to the feature.
+    let rings = |m: &MultiPolygon| -> Vec<Line> {
+        m.iter()
+            .flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()))
+            .flat_map(|r| r.lines())
+            .filter(|l| l.start != l.end)
+            .collect()
+    };
+    let sb = Segs::new(
+        rings(b)
+            .into_iter()
+            .filter(|l| l.bounding_rect().intersects(&ra))
+            .collect(),
+    );
+    if sb.lines.is_empty() {
+        return (vec![], vec![]);
+    }
+    let (mut lines, mut points, mut shared_runs) = (vec![], vec![], vec![]);
+    for seg in rings(a)
+        .into_iter()
+        .filter(|l| l.bounding_rect().intersects(&rb))
+    {
+        let near: Vec<&Line> = sb.near(seg.bounding_rect()).collect();
+        if near.is_empty() {
+            continue;
+        }
+        let mut cuts: Vec<(f64, Coord)> = vec![];
+        for o in near {
+            match line_intersection(seg, *o) {
+                Some(LineIntersection::SinglePoint { intersection, .. }) => {
+                    points.push(Point::from(intersection));
+                    cuts.push((param(seg, intersection), intersection));
+                }
+                Some(LineIntersection::Collinear { intersection }) => {
+                    shared_runs.push(intersection);
+                    cuts.push((param(seg, intersection.start), intersection.start));
+                    cuts.push((param(seg, intersection.end), intersection.end));
+                }
+                None => {}
+            }
+        }
+        cuts.retain(|(t, c)| *t > 0.0 && *t < 1.0 && *c != seg.start && *c != seg.end);
+        cuts.sort_by(|x, y| x.0.total_cmp(&y.0));
+        cuts.dedup_by(|x, y| x.1 == y.1);
+        let mut start = seg.start;
+        for c in cuts
+            .into_iter()
+            .map(|(_, c)| c)
+            .chain(std::iter::once(seg.end))
+        {
+            let piece = Line::new(start, c);
+            // Every vertex of a shared run lies on `b`, so it is a node: each
+            // shared piece is its own line (GEOS splits there too).
+            if is_shared(piece, &sb) {
+                lines.push(LineString::new(vec![piece.start, piece.end]));
+            }
+            start = c;
+        }
+    }
+    // A touch point lying on a shared edge is part of that edge.
+    if !shared_runs.is_empty() {
+        let shared = Segs::new(shared_runs);
+        points.retain(|p| !is_on(p.0, &shared));
+    }
+    (lines, points)
 }
 
 /// The rings of `areas` as lines.
@@ -277,26 +536,75 @@ fn boundary_lines(areas: &MultiPolygon) -> Vec<LineString> {
         .collect()
 }
 
-/// Every non-degenerate segment of `lines`, with its bounding box.
-fn segments(lines: &[LineString]) -> Vec<(Line, Rect)> {
+type SegTree =
+    rstar::RTree<rstar::primitives::GeomWithData<rstar::primitives::Rectangle<[f64; 2]>, usize>>;
+
+/// The non-degenerate segments of a set of lines, R-tree indexed so that
+/// noding two polygon boundaries is ~O((n + m) log n), not O(n·m).
+struct Segs {
+    lines: Vec<Line>,
+    tree: SegTree,
+}
+
+impl Segs {
+    fn near(&self, r: Rect) -> impl Iterator<Item = &Line> + '_ {
+        let env = rstar::AABB::from_corners([r.min().x, r.min().y], [r.max().x, r.max().y]);
+        self.tree
+            .locate_in_envelope_intersecting(env)
+            .map(|item| &self.lines[item.data])
+    }
+}
+
+/// Every non-degenerate segment of `lines`, unindexed.
+fn segment_list(lines: &[LineString]) -> Vec<Line> {
     lines
         .iter()
         .flat_map(|ls| ls.lines())
         .filter(|l| l.start != l.end)
-        .map(|l| (l, l.bounding_rect()))
         .collect()
+}
+
+/// Every non-degenerate segment of `lines`.
+fn segments(lines: &[LineString]) -> Segs {
+    Segs::new(
+        lines
+            .iter()
+            .flat_map(|ls| ls.lines())
+            .filter(|l| l.start != l.end)
+            .collect(),
+    )
+}
+
+impl Segs {
+    fn new(lines: Vec<Line>) -> Self {
+        let items = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let r = l.bounding_rect();
+                rstar::primitives::GeomWithData::new(
+                    rstar::primitives::Rectangle::from_corners(
+                        [r.min().x, r.min().y],
+                        [r.max().x, r.max().y],
+                    ),
+                    i,
+                )
+            })
+            .collect();
+        Self {
+            lines,
+            tree: rstar::RTree::bulk_load(items),
+        }
+    }
 }
 
 /// Isolated crossing/touching points between two segment sets (not points
 /// that lie on a shared segment).
-fn crossing_points(a: &[(Line, Rect)], b: &[(Line, Rect)]) -> Vec<Point> {
+fn crossing_points(a: &[Line], b: &Segs) -> Vec<Point> {
     let mut points = vec![];
     let mut shared = vec![];
-    for (la, ra) in a {
-        for (lb, rb) in b {
-            if !ra.intersects(rb) {
-                continue;
-            }
+    for la in a {
+        for lb in b.near(la.bounding_rect()) {
             match line_intersection(*la, *lb) {
                 Some(LineIntersection::SinglePoint { intersection, .. }) => {
                     points.push(Point::from(intersection));
@@ -307,10 +615,8 @@ fn crossing_points(a: &[(Line, Rect)], b: &[(Line, Rect)]) -> Vec<Point> {
         }
     }
     if !shared.is_empty() {
-        let shared = MultiLineString::new(
-            shared.into_iter().map(|l| LineString::new(vec![l.start, l.end])).collect(),
-        );
-        points.retain(|p| !shared.intersects(p));
+        let shared = Segs::new(shared);
+        points.retain(|p| !is_on(p.0, &shared));
     }
     points
 }
@@ -335,19 +641,24 @@ struct Noded {
 /// (crossings, touches, and the ends of collinear overlaps), and mark each
 /// piece as shared or not. After noding, a piece is either entirely on one of
 /// `other`'s segments or shares at most points with it.
-fn node(lines: &[LineString], other: &[(Line, Rect)]) -> Noded {
+fn node(lines: &[LineString], other: &Segs) -> Noded {
     let mut nodes = std::collections::HashSet::new();
     let lines = lines
         .iter()
         .map(|ls| {
             let mut pieces = vec![];
             for seg in ls.lines().filter(|l| l.start != l.end) {
-                let rect = seg.bounding_rect();
+                let near: Vec<&Line> = other.near(seg.bounding_rect()).collect();
+                if near.is_empty() {
+                    // Nothing of `other` near this segment: one unshared piece, no node.
+                    pieces.push(Piece {
+                        line: seg,
+                        shared: false,
+                    });
+                    continue;
+                }
                 let mut cuts: Vec<(f64, Coord)> = vec![];
-                for (o, ro) in other {
-                    if !rect.intersects(ro) {
-                        continue;
-                    }
+                for o in near {
                     match line_intersection(seg, *o) {
                         Some(LineIntersection::SinglePoint { intersection, .. }) => {
                             cuts.push((param(seg, intersection), intersection));
@@ -367,9 +678,16 @@ fn node(lines: &[LineString], other: &[(Line, Rect)]) -> Noded {
                     nodes.insert(bits(seg.start));
                 }
                 let mut start = seg.start;
-                for c in cuts.into_iter().map(|(_, c)| c).chain(std::iter::once(seg.end)) {
+                for c in cuts
+                    .into_iter()
+                    .map(|(_, c)| c)
+                    .chain(std::iter::once(seg.end))
+                {
                     let line = Line::new(start, c);
-                    pieces.push(Piece { line, shared: is_shared(line, other) });
+                    pieces.push(Piece {
+                        line,
+                        shared: is_shared(line, other),
+                    });
                     start = c;
                 }
             }
@@ -380,9 +698,9 @@ fn node(lines: &[LineString], other: &[(Line, Rect)]) -> Noded {
 }
 
 /// True when `c` lies on one of `other`'s segments.
-fn is_on(c: Coord, other: &[(Line, Rect)]) -> bool {
+fn is_on(c: Coord, other: &Segs) -> bool {
     let p = Point::from(c);
-    other.iter().any(|(o, r)| r.intersects(&p) && o.intersects(&p))
+    other.near(Rect::new(c, c)).any(|o| o.intersects(&p))
 }
 
 fn bits(c: Coord) -> (u64, u64) {
@@ -400,16 +718,14 @@ fn param(seg: Line, c: Coord) -> f64 {
 }
 
 /// True when `line` lies on one of `other`'s segments.
-fn is_shared(line: Line, other: &[(Line, Rect)]) -> bool {
-    let rect = line.bounding_rect();
-    other.iter().any(|(o, ro)| {
-        ro.intersects(&rect)
-            && matches!(
-                line_intersection(line, *o),
-                Some(LineIntersection::Collinear { intersection })
-                    if (intersection.start == line.start && intersection.end == line.end)
-                        || (intersection.start == line.end && intersection.end == line.start)
-            )
+fn is_shared(line: Line, other: &Segs) -> bool {
+    other.near(line.bounding_rect()).any(|o| {
+        matches!(
+            line_intersection(line, *o),
+            Some(LineIntersection::Collinear { intersection })
+                if (intersection.start == line.start && intersection.end == line.end)
+                    || (intersection.start == line.end && intersection.end == line.start)
+        )
     })
 }
 
@@ -457,7 +773,10 @@ fn chain(noded: &Noded, keep: impl Fn(&Piece) -> bool) -> Vec<LineString> {
 fn dedupe_lines(lines: &mut Vec<LineString>) {
     let mut seen: std::collections::HashSet<Vec<(u64, u64)>> = std::collections::HashSet::new();
     lines.retain(|ls| {
-        let fwd: Vec<(u64, u64)> = ls.0.iter().map(|c| (c.x.to_bits(), c.y.to_bits())).collect();
+        let fwd: Vec<(u64, u64)> =
+            ls.0.iter()
+                .map(|c| (c.x.to_bits(), c.y.to_bits()))
+                .collect();
         let mut rev = fwd.clone();
         rev.reverse();
         seen.insert(fwd.min(rev))
@@ -489,8 +808,14 @@ impl<'a> Snapper<'a> {
     fn new(ra: Option<Rect>, rb: Option<Rect>, a: &'a [Coord], b: &'a [Coord]) -> Self {
         let rect = match (ra, rb) {
             (Some(ra), Some(rb)) => Some(Rect::new(
-                Coord { x: ra.min().x.min(rb.min().x), y: ra.min().y.min(rb.min().y) },
-                Coord { x: ra.max().x.max(rb.max().x), y: ra.max().y.max(rb.max().y) },
+                Coord {
+                    x: ra.min().x.min(rb.min().x),
+                    y: ra.min().y.min(rb.min().y),
+                },
+                Coord {
+                    x: ra.max().x.max(rb.max().x),
+                    y: ra.max().y.max(rb.max().y),
+                },
             )),
             (r, None) | (None, r) => r,
         };
@@ -548,8 +873,9 @@ impl<'a> Snapper<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use geo::{Area, Polygon, polygon, wkt};
+
+    use super::*;
 
     fn run(a: Geometry, b: Geometry, op: OverlayOp) -> Geometry {
         overlay(&Prepared::new(a), &Prepared::new(b), op).unwrap()
@@ -569,7 +895,9 @@ mod tests {
             Geometry::Polygon(region),
             OverlayOp::Intersection,
         );
-        let Geometry::Polygon(p) = out else { panic!("expected a single Polygon") };
+        let Geometry::Polygon(p) = out else {
+            panic!("expected a single Polygon")
+        };
         let mut got: Vec<_> = p.exterior().0.iter().map(|c| (c.x, c.y)).collect();
         let mut want: Vec<_> = parcel.exterior().0.iter().map(|c| (c.x, c.y)).collect();
         got.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -607,7 +935,10 @@ mod tests {
             lines(run(a.clone(), crossing, OverlayOp::Difference)),
             vec![vec![(0., 0.), (5., 0.)], vec![(5., 0.), (10., 0.)]]
         );
-        assert_eq!(lines(run(a.clone(), a, OverlayOp::SymDifference)), Vec::<Vec<(f64, f64)>>::new());
+        assert_eq!(
+            lines(run(a.clone(), a, OverlayOp::SymDifference)),
+            Vec::<Vec<(f64, f64)>>::new()
+        );
     }
 
     #[test]
@@ -618,6 +949,75 @@ mod tests {
             lines(run(a, b, OverlayOp::Intersection)),
             vec![vec![(1., 0.), (5., 0.)], vec![(5., 0.), (9., 0.)]]
         );
+    }
+
+    #[test]
+    fn fast_path_matches_full_overlay() {
+        use geo::Area;
+        // A 200-gon (indexed) with a square hole, and small squares inside it,
+        // outside it, and inside its hole.
+        let ring: Vec<Coord> = (0..=200)
+            .map(|i| {
+                let t = std::f64::consts::TAU * f64::from(i % 200) / 200.0;
+                Coord {
+                    x: 10.0 * t.cos(),
+                    y: 10.0 * t.sin(),
+                }
+            })
+            .collect();
+        let hole: LineString = wkt! { LINESTRING(-2. -2.,2. -2.,2. 2.,-2. 2.,-2. -2.) };
+        let big = Geometry::Polygon(Polygon::new(LineString::new(ring), vec![hole]));
+        let squares: [Geometry; 3] = [
+            wkt! { POLYGON((5. 0.,6. 0.,6. 1.,5. 1.,5. 0.)) }.into(),
+            wkt! { POLYGON((20. 0.,21. 0.,21. 1.,20. 1.,20. 0.)) }.into(),
+            wkt! { POLYGON((0. 0.,1. 0.,1. 1.,0. 1.,0. 0.)) }.into(),
+        ];
+        let ops = [
+            OverlayOp::Union,
+            OverlayOp::Intersection,
+            OverlayOp::Difference,
+            OverlayOp::SymDifference,
+        ];
+        for small in squares {
+            for (x, y) in [(big.clone(), small.clone()), (small.clone(), big.clone())] {
+                for op in ops {
+                    let (px, py) = (Prepared::new(x.clone()), Prepared::new(y.clone()));
+                    assert!(placement(&px, &py).or(placement(&py, &px)).is_some());
+                    let fast = overlay(&px, &py, op).unwrap();
+                    let (mut sx, mut sy) = (Prepared::new(x.clone()), Prepared::new(y.clone()));
+                    sx.rings = None;
+                    sy.rings = None;
+                    let slow = overlay(&sx, &sy, op).unwrap();
+                    assert!(
+                        (fast.unsigned_area() - slow.unsigned_area()).abs() < 1e-9,
+                        "{op:?}: fast {} vs full {}",
+                        fast.unsigned_area(),
+                        slow.unsigned_area()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn touching_polygons_intersect_in_shared_boundary() {
+        let a: Geometry = wkt! { POLYGON((0. 0.,1. 0.,1. 1.,0. 1.,0. 0.)) }.into();
+        let edge: Geometry = wkt! { POLYGON((1. 0.,2. 0.,2. 1.,1. 1.,1. 0.)) }.into();
+        assert_eq!(
+            lines(run(a.clone(), edge, OverlayOp::Intersection)),
+            vec![vec![(1., 0.), (1., 1.)]]
+        );
+        let corner: Geometry = wkt! { POLYGON((1. 1.,2. 1.,2. 2.,1. 2.,1. 1.)) }.into();
+        assert_eq!(
+            run(a.clone(), corner, OverlayOp::Intersection),
+            Geometry::Point(Point::new(1., 1.))
+        );
+        // Overlapping polygons: boundary crossings are absorbed into the area.
+        let overlap: Geometry = wkt! { POLYGON((0.5 0.5,2. 0.5,2. 2.,0.5 2.,0.5 0.5)) }.into();
+        assert!(matches!(
+            run(a, overlap, OverlayOp::Intersection),
+            Geometry::Polygon(_)
+        ));
     }
 
     #[test]
@@ -633,6 +1033,9 @@ mod tests {
                 vec![(5., 0.), (10., 0.)],
             ]
         );
-        assert_eq!(lines(run(a.clone(), a, OverlayOp::Union)), vec![vec![(0., 0.), (10., 0.)]]);
+        assert_eq!(
+            lines(run(a.clone(), a, OverlayOp::Union)),
+            vec![vec![(0., 0.), (10., 0.)]]
+        );
     }
 }

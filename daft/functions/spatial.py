@@ -340,9 +340,9 @@ def st_intersection(geom_a: Expression, geom_b: Expression) -> Expression:
     """Return the geometric intersection of two geometries.
 
     Lines are clipped by polygons, points are kept where they intersect the other
-    geometry, and two lines yield their crossing points and shared parts. Two
-    polygons that only touch give an empty result (GEOS would return the shared
-    boundary).
+    geometry, and two lines yield their crossing points and shared parts. Polygons
+    that touch intersect in their shared edges and touch points, as in GEOS (for
+    example two adjacent parcels give their common ``LINESTRING``).
 
     Works for any geometry types (points, lines, polygons and collections), as
     PostGIS does. Vertices that come from the inputs are preserved exactly.

@@ -486,3 +486,56 @@ def test_overlay_with_literal_region_over_many_rows():
     assert out["a"][:25] == [pytest.approx(3.6e-9, rel=1e-6)] * 25
     assert out["a"][25:] == [0.0] * 25
     assert out["inside"] == [True] * 25 + [False] * 25
+
+
+# ── Touching polygons intersect in their shared boundary (as GEOS 3.14) ──────
+
+
+@pytest.mark.parametrize(
+    "a,b,expected",
+    [
+        pytest.param(SQUARE, "POLYGON((1 0,2 0,2 1,1 1,1 0))", "LINESTRING(1 0,1 1)", id="shared_edge"),
+        pytest.param(SQUARE, "POLYGON((1 0.5,2 0.5,2 2,1 2,1 0.5))", "LINESTRING(1 0.5,1 1)", id="partial_edge"),
+        pytest.param(SQUARE, "POLYGON((1 1,2 1,2 2,1 2,1 1))", "POINT(1 1)", id="corner"),
+        pytest.param(
+            SQUARE,
+            "MULTIPOLYGON(((1 0,2 0,2 1,1 1,1 0)),((-1 1,0 1,0 2,-1 2,-1 1)))",
+            "GEOMETRYCOLLECTION(LINESTRING(1 0,1 1),POINT(0 1))",
+            id="edge_and_corner",
+        ),
+        pytest.param(
+            "MULTIPOLYGON(((0 0,1 0,1 1,0 1,0 0)),((3 3,4 3,4 4,3 4,3 3)))",
+            "POLYGON((0.5 0,2 0,2 1,3 3,0.5 1,0.5 0))",
+            "GEOMETRYCOLLECTION(POLYGON((0.5 0,0.5 1,1 1,1 0,0.5 0)),POINT(3 3))",
+            id="overlap_and_corner",
+        ),
+        pytest.param(
+            "POLYGON((0 0,4 0,4 4,0 4,0 0),(1 1,3 1,3 3,1 3,1 1))",
+            "POLYGON((1 1,3 1,3 3,1 3,1 1))",
+            "MULTILINESTRING((1 1,3 1),(3 1,3 3),(3 3,1 3),(1 3,1 1))",
+            id="fills_hole",
+        ),
+        pytest.param(
+            _rect(6e-5, 6e-5),
+            _rect(6e-5, 6e-5, -77.02994, 38.90),
+            f"LINESTRING(-77.02994 38.9,-77.02994 {38.90 + 6e-5})",
+            id="adjacent_lonlat_parcels",
+        ),
+    ],
+)
+def test_touching_polygons_intersect_in_shared_boundary(a, b, expected):
+    df = daft.from_pydict({"a": [a], "b": [b], "e": [expected]})
+    out = df.select(
+        st_equals(st_intersection(_g("a"), _g("b")), _g("e")).alias("eq"),
+        st_geometrytype(st_intersection(_g("a"), _g("b"))).alias("t"),
+        st_geometrytype(_g("e")).alias("te"),
+    ).to_pydict()
+    assert out["t"] == out["te"]
+    assert out["eq"] == [True]
+
+
+def test_overlapping_polygons_have_no_spurious_boundary_parts():
+    """Boundary crossings of overlapping polygons lie on the areal result and are absorbed."""
+    df = daft.from_pydict({"a": [_rect(1e-4, 1e-4)], "b": [_rect(1e-4, 1e-4, -77.02995, 38.90003)]})
+    out = df.select(st_geometrytype(st_intersection(_g("a"), _g("b"))).alias("t")).to_pydict()
+    assert out["t"] == ["Polygon"]
