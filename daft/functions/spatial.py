@@ -98,6 +98,8 @@ def st_geometrytype(geom: Expression) -> Expression:
 
     Returns:
         Utf8 column with values like ``'Point'``, ``'LineString'``, ``'Polygon'``, etc.
+        Note that PostGIS ``ST_GeometryType`` returns ``'ST_Polygon'`` and
+        ``GeometryType`` returns ``'POLYGON'``; Daft returns ``'Polygon'``.
     """
     return Expression._call_builtin_scalar_fn("st_geometrytype", geom)
 
@@ -422,6 +424,9 @@ def st_symdifference(geom_a: Expression, geom_b: Expression) -> Expression:
 def st_envelope(geom: Expression) -> Expression:
     """Return the minimum bounding rectangle of a geometry as a Polygon.
 
+    As in PostGIS, a degenerate envelope has a lower dimension: a zero-size box
+    is a ``POINT`` and a zero-width or zero-height box is a ``LINESTRING``.
+
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
 
@@ -434,6 +439,9 @@ def st_envelope(geom: Expression) -> Expression:
 
 def st_convexhull(geom: Expression) -> Expression:
     """Return the convex hull of a geometry as a Polygon.
+
+    As in PostGIS, a degenerate hull has a lower dimension: a single point gives a
+    ``POINT`` and collinear input gives a ``LINESTRING`` between its extreme points.
 
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
@@ -448,8 +456,10 @@ def st_convexhull(geom: Expression) -> Expression:
 def st_simplify(geom: Expression, tolerance: float) -> Expression:
     """Simplify a geometry using the Ramer–Douglas–Peucker algorithm.
 
-    Applies to LineString, MultiLineString, Polygon, and MultiPolygon.
-    Other geometry types (Point, MultiPoint, etc.) are returned unchanged.
+    Applies to lines, polygons and collections of them; points are returned
+    unchanged. As in PostGIS ``ST_Simplify``, a polygon ring that collapses is
+    dropped: a collapsed hole is removed, a ``MULTIPOLYGON`` loses a part whose
+    shell collapses, and the result is null when the whole geometry collapses.
 
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
@@ -637,6 +647,13 @@ def st_makevalid(geom: Expression) -> Expression:
     LineString, ...) are returned unchanged, since the pure-Rust engine only
     repairs areal geometries (unlike PostGIS/GEOS, which handles all types).
 
+    Valid polygonal input is returned unchanged, as in PostGIS. A repaired
+    geometry with one part is a ``POLYGON``, otherwise a ``MULTIPOLYGON``.
+    Zero-area (e.g. collinear) rings have no areal repair and are dropped, so
+    such input becomes an empty ``MultiPolygon``. Overlapping parts
+    of a ``MultiPolygon`` are resolved with even-odd parity (the overlap is
+    removed), matching PostGIS's default ``method=linework``.
+
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
 
@@ -659,13 +676,6 @@ def st_normalize(geom: Expression) -> Expression:
     This is useful as a pre-step to hashing (e.g. ``st_astext`` + a hash
     function) so that spatially-identical geometries with different vertex
     ordering don't produce false-positive change detections.
-
-    Valid polygonal input is returned unchanged, as in PostGIS. A repaired
-    geometry with one part is a ``POLYGON``, otherwise a ``MULTIPOLYGON``.
-    Zero-area (e.g. collinear) rings have no areal repair and are dropped, so
-    such input becomes an empty ``MultiPolygon``. Overlapping parts
-    of a ``MultiPolygon`` are resolved with even-odd parity (the overlap is
-    removed), matching PostGIS's default ``method=linework``.
 
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).

@@ -11,7 +11,11 @@ use wkt::ToWkt;
 use crate::utils::{unary_geom_to_utf8, validate_geometry_field};
 
 fn geom_to_wkt(g: &Geometry) -> String {
-    g.to_wkt().to_string()
+    match g {
+        // WKB encodes an empty point as a Point with NaN coordinates.
+        Geometry::Point(p) if p.x().is_nan() && p.y().is_nan() => "POINT EMPTY".to_string(),
+        _ => g.to_wkt().to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

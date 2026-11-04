@@ -202,7 +202,13 @@ pub fn parse_wkb(bytes: &[u8]) -> DaftResult<Geometry> {
     let stripped = strip_ewkb_srid(bytes);
     let wkb = wkb::reader::read_wkb(stripped.as_ref())
         .map_err(|e| DaftError::ComputeError(format!("WKB parse error: {e:?}")))?;
+    // geo has no empty Point; WKB `POINT EMPTY` (NaN coordinates) becomes a NaN Point,
+    // which `st_astext` prints as `POINT EMPTY` again.
     wkb.try_to_geometry()
+        .or_else(|| {
+            crate::st_geohash_covers::wkb_is_point(stripped.as_ref())
+                .then(|| Geometry::Point(geo::Point::new(f64::NAN, f64::NAN)))
+        })
         .ok_or_else(|| DaftError::ComputeError("WKB parse error: empty geometry".to_string()))
 }
 
@@ -252,9 +258,10 @@ pub fn unary_geom_to_f64(
     let mut validity = NullBufferBuilder::new(len);
 
     for opt in binary.into_iter() {
-        match opt.and_then(|b| parse_wkb(b).ok()) {
-            Some(geom) => {
-                values.push(f(&geom));
+        // NaN means "undefined" (e.g. st_x of a non-point): emit null.
+        match opt.and_then(|b| parse_wkb(b).ok()).map(|g| f(&g)).filter(|v| !v.is_nan()) {
+            Some(v) => {
+                values.push(v);
                 validity.append_non_null();
             }
             None => {

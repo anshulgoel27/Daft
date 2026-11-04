@@ -7,7 +7,7 @@ use daft_dsl::{
 };
 use geo::{
     Coord, Geometry, GeometryCollection, LineString, MultiLineString, MultiPoint, MultiPolygon,
-    Point, Polygon,
+    Point, Polygon, Winding,
     orient::{Direction, Orient},
 };
 use serde::{Deserialize, Serialize};
@@ -92,6 +92,28 @@ fn normalize_polygon(poly: &Polygon<f64>) -> Polygon<f64> {
     Polygon::new(exterior, interiors)
 }
 
+/// Canonicalize a LineString's direction, as GEOS `normalize` does. An open line is
+/// reversed when its reversed coordinate sequence is lexicographically smaller, so
+/// `LINESTRING(1 1,0 0)` and `LINESTRING(0 0,1 1)` normalize identically. A closed
+/// line is wound clockwise (like a polygon shell) and rotated to its smallest vertex.
+fn normalize_linestring(ls: &LineString<f64>) -> LineString<f64> {
+    let closed = ls.0.len() >= 4 && ls.0.first() == ls.0.last();
+    if closed {
+        let mut ring = ls.clone();
+        if ring.is_ccw() {
+            ring.0.reverse();
+        }
+        return rotate_ring_to_min_vertex(&ring);
+    }
+    let mut reversed = ls.0.clone();
+    reversed.reverse();
+    if coords_cmp(&reversed, &ls.0) == std::cmp::Ordering::Less {
+        LineString::new(reversed)
+    } else {
+        ls.clone()
+    }
+}
+
 /// Compare two normalized polygons by exterior ring first, falling through to a
 /// pairwise comparison of (already deterministically-ordered) interior rings, then hole
 /// count, so polygons that share an exterior but differ only in their holes don't tie.
@@ -121,8 +143,9 @@ fn normalize_geometry(geom: &Geometry<f64>) -> Option<Geometry<f64>> {
             polys.sort_by(compare_polygons);
             Some(Geometry::MultiPolygon(MultiPolygon(polys)))
         }
+        Geometry::LineString(ls) => Some(Geometry::LineString(normalize_linestring(ls))),
         Geometry::MultiLineString(mls) => {
-            let mut lines: Vec<LineString<f64>> = mls.iter().cloned().collect();
+            let mut lines: Vec<LineString<f64>> = mls.iter().map(normalize_linestring).collect();
             lines.sort_by(|a, b| coords_cmp(&a.0, &b.0));
             Some(Geometry::MultiLineString(MultiLineString::new(lines)))
         }
@@ -149,7 +172,7 @@ fn normalize_geometry(geom: &Geometry<f64>) -> Option<Geometry<f64>> {
                 members,
             )))
         }
-        // Point and LineString have no non-semantic ordering to canonicalize; other
+        // Point has no non-semantic ordering to canonicalize; other
         // variants (Line, Rect, Triangle) are not producible from WKB/WKT input.
         other => Some(other.clone()),
     }

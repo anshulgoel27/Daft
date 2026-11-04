@@ -39,7 +39,8 @@ impl ScalarUDF for StGeometryType {
     }
 
     fn docstring(&self) -> &'static str {
-        "Returns the type name of the geometry as a string (e.g. 'Point', 'LineString', 'Polygon')."
+        "Returns the type name of the geometry as a string (e.g. 'Point', 'LineString', 'Polygon'). \
+         Unlike PostGIS ST_GeometryType there is no 'ST_' prefix."
     }
 }
 
