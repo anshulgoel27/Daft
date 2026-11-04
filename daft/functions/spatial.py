@@ -654,6 +654,13 @@ def st_normalize(geom: Expression) -> Expression:
     function) so that spatially-identical geometries with different vertex
     ordering don't produce false-positive change detections.
 
+    Valid polygonal input is returned unchanged, as in PostGIS. A repaired
+    geometry with one part is a ``POLYGON``, otherwise a ``MULTIPOLYGON``.
+    Zero-area (e.g. collinear) rings have no areal repair and are dropped, so
+    such input becomes an empty ``MultiPolygon``. Overlapping parts
+    of a ``MultiPolygon`` are resolved with even-odd parity (the overlap is
+    removed), matching PostGIS's default ``method=linework``.
+
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
 
