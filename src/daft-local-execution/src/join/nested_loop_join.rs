@@ -527,12 +527,10 @@ fn direct_verify(
 
     let eval = |a: &Geometry, b: &Geometry| -> bool {
         match kind {
-            SpatialPredKind::Relate(pred) => daft_geo::relate_pred(a, b, pred),
-            // Mirrors StDwithin::call exactly: finite distance <= d.
-            SpatialPredKind::DWithin(d) => {
-                let dist = daft_geo::geom_distance(a, b);
-                dist.is_finite() && dist <= d
-            }
+            // A null predicate (engine panic) is not a match, as in a filter.
+            SpatialPredKind::Relate(pred) => daft_geo::relate_pred(a, b, pred).unwrap_or(false),
+            // Mirrors StDwithin::call exactly: defined distance <= d.
+            SpatialPredKind::DWithin(d) => daft_geo::geom_distance(a, b).is_some_and(|dist| dist <= d),
         }
     };
 

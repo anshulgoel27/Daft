@@ -72,10 +72,10 @@ fn point_fast_path(a: &Geometry, b: &Geometry, pred: RelatePred) -> Option<bool>
 /// Evaluate a DE-9IM predicate between two geometries. Correct for all geometry-type pairs.
 ///
 /// Wrapped in `catch_unwind` so that a panic on degenerate input (e.g. a self-intersecting
-/// ring triggering a bug in the `geo` relate implementation) yields `false` rather than
-/// unwinding the compute thread — consistent with the catch_unwind convention used by
-/// buffer, BooleanOps, convexhull, and simplify in this crate.
-pub fn relate_pred(a: &Geometry, b: &Geometry, pred: RelatePred) -> bool {
+/// ring triggering a bug in the `geo` relate implementation) does not unwind the compute
+/// thread. A panic yields `None` (a null result), never a guessed `false` — otherwise
+/// `st_intersects` and `st_disjoint` could both be false for the same pair.
+pub fn relate_pred(a: &Geometry, b: &Geometry, pred: RelatePred) -> Option<bool> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(fast) = point_fast_path(a, b, pred) {
             return fast;
@@ -94,7 +94,7 @@ pub fn relate_pred(a: &Geometry, b: &Geometry, pred: RelatePred) -> bool {
             RelatePred::CoveredBy => m.is_coveredby(),
         }
     }))
-    .unwrap_or(false)
+    .ok()
 }
 
 #[cfg(test)]
@@ -102,6 +102,10 @@ mod tests {
     use super::*;
     use geo::relate::Relate;
     use geo::{Geometry, MultiPolygon, Point, Polygon, LineString, Coord};
+
+    fn rp(a: &Geometry, b: &Geometry, pred: RelatePred) -> bool {
+        relate_pred(a, b, pred).expect("relate should not panic on these inputs")
+    }
 
     fn square() -> Geometry {
         // unit square (0,0)-(2,2)
@@ -262,14 +266,14 @@ mod tests {
         let poly = square();
         let boundary = Geometry::Point(Point::new(0.0, 1.0));
         let inside = Geometry::Point(Point::new(1.0, 1.0));
-        assert!(!relate_pred(&poly, &boundary, RelatePred::Contains));
-        assert!(relate_pred(&poly, &boundary, RelatePred::Covers));
-        assert!(relate_pred(&poly, &boundary, RelatePred::Intersects));
-        assert!(!relate_pred(&poly, &boundary, RelatePred::Disjoint));
-        assert!(relate_pred(&poly, &inside, RelatePred::Contains));
-        assert!(relate_pred(&inside, &poly, RelatePred::Within));
-        assert!(!relate_pred(&boundary, &poly, RelatePred::Within));
-        assert!(relate_pred(&boundary, &poly, RelatePred::CoveredBy));
+        assert!(!rp(&poly, &boundary, RelatePred::Contains));
+        assert!(rp(&poly, &boundary, RelatePred::Covers));
+        assert!(rp(&poly, &boundary, RelatePred::Intersects));
+        assert!(!rp(&poly, &boundary, RelatePred::Disjoint));
+        assert!(rp(&poly, &inside, RelatePred::Contains));
+        assert!(rp(&inside, &poly, RelatePred::Within));
+        assert!(!rp(&boundary, &poly, RelatePred::Within));
+        assert!(rp(&boundary, &poly, RelatePred::CoveredBy));
     }
 
     #[test]
@@ -278,17 +282,17 @@ mod tests {
         let inside = Geometry::Point(Point::new(1.0, 1.0));
         // previously st_contains returned false for Polygon/Point only via hand-coding;
         // relate must handle it and within is the mirror.
-        assert!(relate_pred(&poly, &inside, RelatePred::Contains));
-        assert!(relate_pred(&inside, &poly, RelatePred::Within));
-        assert!(!relate_pred(&inside, &poly, RelatePred::Contains));
+        assert!(rp(&poly, &inside, RelatePred::Contains));
+        assert!(rp(&inside, &poly, RelatePred::Within));
+        assert!(!rp(&inside, &poly, RelatePred::Contains));
     }
 
     #[test]
     fn test_disjoint_is_not_intersects() {
         let poly = square();
         let far = Geometry::Point(Point::new(100.0, 100.0));
-        assert!(relate_pred(&poly, &far, RelatePred::Disjoint));
-        assert!(!relate_pred(&poly, &far, RelatePred::Intersects));
+        assert!(rp(&poly, &far, RelatePred::Disjoint));
+        assert!(!rp(&poly, &far, RelatePred::Intersects));
     }
 
     #[test]
@@ -298,7 +302,7 @@ mod tests {
         let line = Geometry::LineString(LineString(vec![
             Coord { x: -1.0, y: 1.0 }, Coord { x: 3.0, y: 1.0 },
         ]));
-        assert!(relate_pred(&poly, &line, RelatePred::Intersects));
+        assert!(rp(&poly, &line, RelatePred::Intersects));
     }
 
     #[test]
@@ -306,11 +310,11 @@ mod tests {
         let poly = square(); // (0,0)-(2,2)
         // Boundary point: contained-by-covers but NOT contains (interior only).
         let boundary = Geometry::Point(Point::new(0.0, 1.0));
-        assert!(relate_pred(&poly, &boundary, RelatePred::Covers));
-        assert!(relate_pred(&boundary, &poly, RelatePred::CoveredBy));
-        assert!(!relate_pred(&poly, &boundary, RelatePred::Contains)); // interior-only
+        assert!(rp(&poly, &boundary, RelatePred::Covers));
+        assert!(rp(&boundary, &poly, RelatePred::CoveredBy));
+        assert!(!rp(&poly, &boundary, RelatePred::Contains)); // interior-only
         // A far point is neither covered nor covering.
         let far = Geometry::Point(Point::new(100.0, 100.0));
-        assert!(!relate_pred(&poly, &far, RelatePred::Covers));
+        assert!(!rp(&poly, &far, RelatePred::Covers));
     }
 }

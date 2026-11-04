@@ -223,8 +223,11 @@ def st_distance(geom_a: Expression, geom_b: Expression, use_spheroid: bool = Fal
             inputs assumed). Default False uses planar Euclidean distance (coordinate units).
 
     Returns:
-        Float64 column. Planar by default; WGS84 geodesic meters when use_spheroid=True
-        (point inputs only; other geometry pairs return NaN in geodesic mode).
+        Float64 column, for any pair of geometry types. Planar by default; WGS84
+        geodesic meters when use_spheroid=True. Point/Point is exact; for other pairs
+        the closest points are found in a local equirectangular frame and measured
+        geodesically, which is accurate for features up to a few hundred km apart.
+        Null when either geometry is empty.
     """
     if use_spheroid:
         return Expression._call_builtin_scalar_fn("st_distance", geom_a, geom_b, use_spheroid)
@@ -234,7 +237,8 @@ def st_distance(geom_a: Expression, geom_b: Expression, use_spheroid: bool = Fal
 def st_dwithin(geom_a: Expression, geom_b: Expression, distance: float) -> Expression:
     """Returns true if the planar distance between two geometries is <= ``distance`` (coordinate units).
 
-    ``distance`` must be a numeric literal.
+    Works for any pair of geometry types. ``distance`` must be a numeric literal.
+    Null when either geometry is empty.
     """
     return Expression._call_builtin_scalar_fn("st_dwithin", geom_a, geom_b, distance)
 
