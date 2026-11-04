@@ -15,17 +15,30 @@ use crate::LogicalPlan;
 
 /// Optimizer rule for automatic geohash-based partition pruning.
 ///
-/// When a spatial predicate (`st_intersects`, `st_contains`, `st_within`, `st_distance`)
-/// is applied on a geometry column `col`, and the schema also contains a string column
-/// named `{col}_geohash`, this rule rewrites the filter to add a geohash pre-filter:
+/// When a spatial predicate (`st_intersects`, `st_contains`, `st_covers`, `st_within`,
+/// `st_covered_by`) is applied on a geometry column `col`, and the schema also contains a
+/// string column named `{col}_geohash`, this rule rewrites the filter to add a geohash
+/// pre-filter:
 ///
 /// ```sql
 /// -- Original
 /// WHERE st_intersects(geom, @query)
 ///
 /// -- Rewritten
-/// WHERE st_geohash_covers(geom_geohash, @precision, @cells) AND st_intersects(geom, @query)
+/// WHERE st_geohash_covers(geom_geohash, geom, @precision, @cells) AND st_intersects(geom, @query)
 /// ```
+///
+/// Soundness: `{col}_geohash` is the geohash of each row's centroid. For `st_within` /
+/// `st_covered_by` the row lies inside the query, so its centroid is inside the query's
+/// bounding box and pruning is exact for every geometry type. For the other predicates
+/// only a Point's centroid is bounded, so `geom` is passed along and non-Point rows are
+/// never pruned (only the 5-byte WKB header is read to decide).
+///
+/// Trade-off: because the pre-filter for those predicates also reads `geom`, it is a
+/// row-level filter only. A table *partitioned* by `{col}_geohash` no longer gets
+/// partition pruning for `st_intersects` / `st_contains` / `st_covers` (push-down turns a
+/// filter into a partition filter only when it reads partition columns alone);
+/// `st_within` / `st_covered_by` still do.
 ///
 /// The geohash pre-filter is much cheaper to evaluate because it operates on short strings
 /// rather than parsing WKB bytes and doing spatial computations.
@@ -86,7 +99,19 @@ impl GeohashPruning {
 
 // ── Expression walking ──────────────────────────────────────────────────────
 
-const SPATIAL_PRED_FNS: &[&str] = &["st_intersects", "st_contains", "st_within", "st_distance"];
+const SPATIAL_PRED_FNS: &[&str] = &[
+    "st_intersects",
+    "st_contains",
+    "st_covers",
+    "st_within",
+    "st_covered_by",
+];
+
+/// Predicates where `pred(row, Q)` being true implies the row's centroid lies
+/// in Q's bounding box, for any row geometry type: the row is inside Q, so its
+/// centroid is inside Q's convex hull. For the other predicates only a Point
+/// row's centroid is bounded, so non-Point rows must not be pruned.
+const CENTROID_BOUNDED_FNS: &[&str] = &["st_within", "st_covered_by"];
 const DEFAULT_GEOHASH_PRECISION: u8 = 5;
 
 fn collect_geohash_preds(
@@ -163,7 +188,11 @@ fn maybe_geohash_pred_for_spatial_fn(
             precision: DEFAULT_GEOHASH_PRECISION,
             covering_cells,
         },
-        vec![geohash_expr],
+        if CENTROID_BOUNDED_FNS.contains(&sf.name()) {
+            vec![geohash_expr]
+        } else {
+            vec![geohash_expr, daft_dsl::resolved_col(col_name)]
+        },
     );
     Some(builtin.into())
 }
