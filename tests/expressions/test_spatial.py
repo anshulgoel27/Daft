@@ -838,12 +838,12 @@ def test_st_makeline_sql():
 
 
 def test_st_buffer_point_area_approx_pi():
-    """Buffer of radius-1 around a point should have area ≈ π (64-gon circle)."""
+    """Buffer of radius-1 around a point is a 32-segment circle, as PostGIS (quad_segs=8)."""
     df = daft.from_pydict({"w": ["POINT(0 0)"]})
     geom = st_geomfromtext(daft.col("w"))
     result = df.select(st_area(st_buffer(geom, 1.0)).alias("a")).to_pydict()
     area = result["a"][0]
-    assert abs(area - math.pi) < 0.01, f"Expected area ≈ π, got {area}"
+    assert area == pytest.approx(16 * math.sin(2 * math.pi / 32), abs=1e-3)
 
 
 def test_st_buffer_point_area_approx_pi_sql():
@@ -853,7 +853,7 @@ def test_st_buffer_point_area_approx_pi_sql():
         "SELECT st_area(st_buffer(st_geomfromtext(w), 1.0)) AS a FROM df"
     ).to_pydict()
     area = result["a"][0]
-    assert abs(area - math.pi) < 0.01, f"SQL: expected area ≈ π, got {area}"
+    assert area == pytest.approx(16 * math.sin(2 * math.pi / 32), abs=1e-3)
 
 
 def test_st_buffer_polygon_expands():

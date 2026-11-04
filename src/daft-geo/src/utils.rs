@@ -47,7 +47,8 @@ pub(crate) fn is_empty_geom(g: &Geometry) -> bool {
 /// Encode a `geo::Geometry` into standard (ISO) little-endian WKB bytes.
 pub fn geom_to_wkb(geom: &Geometry) -> DaftResult<Vec<u8>> {
     let mut buf = Vec::new();
-    wkb::writer::write_geometry(&mut buf, geom, &wkb::writer::WriteOptions::default())
+    let geom = wkb_compatible(geom);
+    wkb::writer::write_geometry(&mut buf, geom.as_ref(), &wkb::writer::WriteOptions::default())
         .map_err(|e| DaftError::ComputeError(format!("WKB write error: {e:?}")))?;
     Ok(buf)
 }

@@ -487,13 +487,19 @@ def st_geojsonfromgeom(geom: Expression) -> Expression:
 
 
 def st_buffer(geom: Expression, distance: float) -> Expression:
-    """Return a geometry that is the given distance from the input geometry (planar Cartesian).
+    """Return a geometry covering every point within ``distance`` of the input (planar Cartesian).
 
-    - **Point**: returns a 64-vertex circular polygon approximation (radius = distance).
-    - **Polygon / MultiPolygon**: computes a real planar offset via straight-skeleton;
-      falls back to bounding-box envelope expansion if the offset returns an empty result.
-    - **LineString and all other types**: falls back to expanding the bounding-box envelope
-      by ``distance`` in each direction (geo-buffer 0.2 has no line-buffering support).
+    Uses round joins and round end caps with ~32 segments per full circle, like
+    PostGIS's default ``quad_segs=8``, for every geometry type:
+
+    - **Point / MultiPoint**: a circle around each point.
+    - **LineString / MultiLineString**: a corridor around the line.
+    - **Polygon / MultiPolygon**: an outward offset, or an inward one for negative
+      ``distance``.
+
+    Points and lines buffered by ``distance <= 0``, and polygons fully eroded by a
+    negative distance, give ``MULTIPOLYGON EMPTY``. A single-part result is a
+    ``POLYGON``, several parts a ``MULTIPOLYGON``.
 
     All buffer operations are planar (Cartesian). For geodesic buffers, project your
     coordinates to a local metric CRS before calling this function.
