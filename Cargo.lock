@@ -4521,7 +4521,7 @@ dependencies = [
 [[package]]
 name = "geo"
 version = "0.33.1"
-source = "git+https://github.com/anshulgoel27/geo?rev=b50628d75346fe3aafd87bddeff22a26882db070#b50628d75346fe3aafd87bddeff22a26882db070"
+source = "git+https://github.com/anshulgoel27/geo?rev=cd2889a28b967b2ebc7491465709cbdc7abda428#cd2889a28b967b2ebc7491465709cbdc7abda428"
 dependencies = [
  "earcut",
  "float_next_after",

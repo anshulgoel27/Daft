@@ -29,8 +29,8 @@ from daft.functions import (
     st_envelope,
     st_equals,
     st_geohash,
-    st_geomfromtext,
     st_geometrytype,
+    st_geomfromtext,
     st_intersection,
     st_intersects,
     st_isvalid,
@@ -183,7 +183,9 @@ def test_buffer_scaled_geometry_scales_area():
 
 def test_buffer_linestring_is_a_corridor():
     df = daft.from_pydict({"g": ["LINESTRING(0 0,10 0)"]})
-    out = df.select(st_area(st_buffer(_g(), 1.0)).alias("a"), st_geometrytype(st_buffer(_g(), 1.0)).alias("t")).to_pydict()
+    out = df.select(
+        st_area(st_buffer(_g(), 1.0)).alias("a"), st_geometrytype(st_buffer(_g(), 1.0)).alias("t")
+    ).to_pydict()
     assert out["t"] == ["Polygon"]
     assert out["a"][0] == pytest.approx(20.0 + 16 * math.sin(2 * math.pi / 32), rel=1e-3)
 
@@ -365,7 +367,9 @@ def test_simplify_multipolygon_drops_collapsed_part():
 
 def test_normalize_orients_linestrings():
     df = daft.from_pydict({"a": ["LINESTRING(1 1,0 0)"], "b": ["LINESTRING(0 0,1 1)"]})
-    out = df.select(st_astext(st_normalize(_g("a"))).alias("a"), st_astext(st_normalize(_g("b"))).alias("b")).to_pydict()
+    out = df.select(
+        st_astext(st_normalize(_g("a"))).alias("a"), st_astext(st_normalize(_g("b"))).alias("b")
+    ).to_pydict()
     assert out["a"] == out["b"] == ["LINESTRING(0 0,1 1)"]
 
 
@@ -408,8 +412,12 @@ def test_overlay_dissolves_overlapping_collection_polygons():
         # Identical lines are not duplicated.
         (st_union, "LINESTRING(0 0,1 1)", "LINESTRING(1 1,0 0)", "LINESTRING(0 0,1 1)"),
         # Lower-dimensional parts inside the areal intersection are absorbed.
-        (st_intersection, "GEOMETRYCOLLECTION(POLYGON((0 0,4 0,4 4,0 4,0 0)),POINT(1 1))",
-         "POLYGON((0 0,2 0,2 2,0 2,0 0))", "POLYGON((0 0,2 0,2 2,0 2,0 0))"),
+        (
+            st_intersection,
+            "GEOMETRYCOLLECTION(POLYGON((0 0,4 0,4 4,0 4,0 0)),POINT(1 1))",
+            "POLYGON((0 0,2 0,2 2,0 2,0 0))",
+            "POLYGON((0 0,2 0,2 2,0 2,0 0))",
+        ),
     ],
 )
 def test_overlay_review_cases(fn, a, b, expected):
@@ -445,6 +453,27 @@ def test_makevalid_keeps_valid_polygon_with_collinear_vertices():
     assert out["w"] == out["in"]
 
 
+def test_makevalid_t_junction_keeps_even_odd_area():
+    # A vertex lying inside another edge (a T-junction), exactly or a few ulps off it
+    # after rounding. geo left the edge unsplit, dropped the edges meeting at the vertex
+    # from its triangulation, and got the area wrong. Areas from GEOS (even-odd).
+    from daft.functions import st_makevalid
+
+    cell = (6e-5 / 8) ** 2
+    cases = {
+        # (5 3) lies on the edge (7 1)-(4 4).
+        "POLYGON((7 1,4 4,5 6,5 3,8 5,4 2,7 1))": 26 / 7,
+        # POLYGON((3 4,1 0,1 7,3 3,2 2,3 4)) in 7.5e-6 degree cells at -77.03: (2 2) sits
+        # a few ulps off the edge (3 4)-(1 0), and the closing edge overlaps it.
+        "POLYGON((-77.0299775 -77.02997,-77.0299925 -77.03,-77.0299925 -77.0299475,"
+        "-77.0299775 -77.0299775,-77.029985 -77.029985,-77.0299775 -77.02997))": 6.5 * cell,
+    }
+    df = daft.from_pydict({"g": list(cases)})
+    out = df.select(st_area(st_makevalid(_g())).alias("a"), st_isvalid(st_makevalid(_g())).alias("v")).to_pydict()
+    assert out["a"] == pytest.approx(list(cases.values()), rel=1e-6)
+    assert out["v"] == [True, True]
+
+
 # ── Line noding (results checked against GEOS 3.14 via shapely) ──────────────
 
 
@@ -457,7 +486,12 @@ def test_makevalid_keeps_valid_polygon_with_collinear_vertices():
         (st_union, "LINESTRING(0 0,10 0)", "LINESTRING(5 0,15 0)", "MULTILINESTRING((0 0,5 0),(5 0,10 0),(10 0,15 0))"),
         (st_symdifference, "LINESTRING(0 0,10 0)", "LINESTRING(0 0,10 0)", "GEOMETRYCOLLECTION EMPTY"),
         (st_symdifference, "LINESTRING(0 0,10 0)", "LINESTRING(5 0,15 0)", "MULTILINESTRING((0 0,5 0),(10 0,15 0))"),
-        (st_difference, "LINESTRING(-1 3,0 2,1 3)", "POLYGON((0 0,2 0,2 2,0 2,0 0))", "MULTILINESTRING((-1 3,0 2),(0 2,1 3))"),
+        (
+            st_difference,
+            "LINESTRING(-1 3,0 2,1 3)",
+            "POLYGON((0 0,2 0,2 2,0 2,0 0))",
+            "MULTILINESTRING((-1 3,0 2),(0 2,1 3))",
+        ),
     ],
 )
 def test_line_overlays_are_noded_like_geos(fn, a, b, expected):
