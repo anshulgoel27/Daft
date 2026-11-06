@@ -328,7 +328,9 @@ daft-sql = {path = "src/daft-sql"}
 dashmap = "=6.2"
 educe = "^0.8"
 futures = "0.3.30"
-geo = "0.33.1"
+# Fork with the MakeValid snap fix (georust/geo#1640); go back to a crates.io
+# release once it is merged and published.
+geo = {git = "https://github.com/anshulgoel27/geo", rev = "b50628d75346fe3aafd87bddeff22a26882db070"}
 geo-traits = "0.3"
 geohash = "0.13"
 geojson = "1.0"
