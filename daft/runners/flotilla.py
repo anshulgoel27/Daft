@@ -757,6 +757,45 @@ def get_head_node_id() -> str | None:
     return None
 
 
+FLOTILLA_RUNNER_RESOURCE_ENV = "DAFT_FLOTILLA_RUNNER_RESOURCE"
+
+
+def _flotilla_runner_placement(head_node_id: str | None) -> dict[str, object]:
+    """Ray actor options that decide where a job's RemoteFlotillaRunner runs.
+
+    There is one runner per Ray job, and its scheduler loop is CPU- and memory-hungry,
+    so by default pinning every runner to the head node makes the head the bottleneck
+    as concurrent jobs grow. If ``DAFT_FLOTILLA_RUNNER_RESOURCE`` names a Ray custom
+    resource that some node advertises, the runner requires one unit of it instead and
+    can run on that node pool (e.g. a dedicated driver pool). The pool should advertise
+    far more units than it will ever have concurrent jobs, so the resource never limits
+    scheduling.
+
+    If the variable is unset, or no node advertises the resource (for example a local
+    run), the runner stays pinned to the head node, as before.
+    """
+    resource = os.environ.get(FLOTILLA_RUNNER_RESOURCE_ENV)
+    if resource:
+        if ray.cluster_resources().get(resource, 0) >= 1:
+            return {"resources": {resource: 1}}
+        logger.warning(
+            "%s=%r, but no node in the Ray cluster advertises that resource; "
+            "placing the flotilla runner on the head node instead.",
+            FLOTILLA_RUNNER_RESOURCE_ENV,
+            resource,
+        )
+    return {
+        "scheduling_strategy": (
+            ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=head_node_id,
+                soft=False,
+            )
+            if head_node_id
+            else None
+        ),
+    }
+
+
 class FlotillaRunner:
     """FlotillaRunner is a wrapper around FlotillaRunnerCore that provides a Ray actor interface.
 
@@ -800,14 +839,7 @@ class FlotillaRunner:
             # silently ignoring any new runtime_env options (including DAFT_EXTENSION_PATHS).
             # Extensions loaded after the first query will not be propagated to workers.
             "get_if_exists": True,
-            "scheduling_strategy": (
-                ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                    node_id=head_node_id,
-                    soft=False,
-                )
-                if head_node_id
-                else None
-            ),
+            **_flotilla_runner_placement(head_node_id),
         }
         if runner_env_vars:
             flotilla_options["runtime_env"] = {"env_vars": runner_env_vars}
