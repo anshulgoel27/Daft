@@ -98,6 +98,8 @@ def st_geometrytype(geom: Expression) -> Expression:
 
     Returns:
         Utf8 column with values like ``'Point'``, ``'LineString'``, ``'Polygon'``, etc.
+        Note that PostGIS ``ST_GeometryType`` returns ``'ST_Polygon'`` and
+        ``GeometryType`` returns ``'POLYGON'``; Daft returns ``'Polygon'``.
     """
     return Expression._call_builtin_scalar_fn("st_geometrytype", geom)
 
@@ -223,8 +225,11 @@ def st_distance(geom_a: Expression, geom_b: Expression, use_spheroid: bool = Fal
             inputs assumed). Default False uses planar Euclidean distance (coordinate units).
 
     Returns:
-        Float64 column. Planar by default; WGS84 geodesic meters when use_spheroid=True
-        (point inputs only; other geometry pairs return NaN in geodesic mode).
+        Float64 column, for any pair of geometry types. Planar by default; WGS84
+        geodesic meters when use_spheroid=True. Point/Point is exact; for other pairs
+        the closest points are found in a local equirectangular frame and measured
+        geodesically, which is accurate for features up to a few hundred km apart.
+        Null when either geometry is empty.
     """
     if use_spheroid:
         return Expression._call_builtin_scalar_fn("st_distance", geom_a, geom_b, use_spheroid)
@@ -234,7 +239,8 @@ def st_distance(geom_a: Expression, geom_b: Expression, use_spheroid: bool = Fal
 def st_dwithin(geom_a: Expression, geom_b: Expression, distance: float) -> Expression:
     """Returns true if the planar distance between two geometries is <= ``distance`` (coordinate units).
 
-    ``distance`` must be a numeric literal.
+    Works for any pair of geometry types. ``distance`` must be a numeric literal.
+    Null when either geometry is empty.
     """
     return Expression._call_builtin_scalar_fn("st_dwithin", geom_a, geom_b, distance)
 
@@ -305,33 +311,56 @@ def st_covered_by(geom_a: Expression, geom_b: Expression) -> Expression:
 
 
 def st_union(geom_a: Expression, geom_b: Expression) -> Expression:
-    """Return the geometric union of two polygon geometries.
+    """Return the geometric union of two geometries.
 
-    Both operands must be Polygon or MultiPolygon; other types (e.g. Point,
-    LineString) return null.
+    Points and lines covered by a polygon of the result are absorbed into it.
+
+    Works for any geometry types (points, lines, polygons and collections), as
+    PostGIS does. Vertices that come from the inputs are preserved exactly.
 
     Args:
-        geom_a: First geometry column (Geometry or Binary WKB).
+        geom_a: First geometry column (Geometry or Binary WKB). Either side may be a literal.
         geom_b: Second geometry column (Geometry or Binary WKB).
 
     Returns:
-        Geometry column (MultiPolygon). Returns null for non-polygon inputs
-        or if the underlying boolean operation raises an error.
+        Geometry column. A single polygon is a ``POLYGON``, several a
+        ``MULTIPOLYGON`` (an empty areal result is ``MULTIPOLYGON EMPTY``);
+        mixed-dimension results are a ``GEOMETRYCOLLECTION`` (an empty
+        non-areal result is ``GEOMETRYCOLLECTION EMPTY``). Null if the
+        geometry engine fails on degenerate input.
+
+    Lines are noded against each other as in GEOS: shared parts are found
+    exactly, and line results are split where the inputs cross or where a
+    shared part begins or ends.
     """
     return Expression._call_builtin_scalar_fn("st_union", geom_a, geom_b)
 
 
 def st_intersection(geom_a: Expression, geom_b: Expression) -> Expression:
-    """Return the geometric intersection of two polygon geometries.
+    """Return the geometric intersection of two geometries.
 
-    Both operands must be Polygon or MultiPolygon; other types return null.
+    Lines are clipped by polygons, points are kept where they intersect the other
+    geometry, and two lines yield their crossing points and shared parts. Polygons
+    that touch intersect in their shared edges and touch points, as in GEOS (for
+    example two adjacent parcels give their common ``LINESTRING``).
+
+    Works for any geometry types (points, lines, polygons and collections), as
+    PostGIS does. Vertices that come from the inputs are preserved exactly.
 
     Args:
-        geom_a: First geometry column (Geometry or Binary WKB).
+        geom_a: First geometry column (Geometry or Binary WKB). Either side may be a literal.
         geom_b: Second geometry column (Geometry or Binary WKB).
 
     Returns:
-        Geometry column (MultiPolygon). Returns null for non-polygon inputs.
+        Geometry column. A single polygon is a ``POLYGON``, several a
+        ``MULTIPOLYGON`` (an empty areal result is ``MULTIPOLYGON EMPTY``);
+        mixed-dimension results are a ``GEOMETRYCOLLECTION`` (an empty
+        non-areal result is ``GEOMETRYCOLLECTION EMPTY``). Null if the
+        geometry engine fails on degenerate input.
+
+    Lines are noded against each other as in GEOS: shared parts are found
+    exactly, and line results are split where the inputs cross or where a
+    shared part begins or ends.
     """
     return Expression._call_builtin_scalar_fn("st_intersection", geom_a, geom_b)
 
@@ -339,30 +368,52 @@ def st_intersection(geom_a: Expression, geom_b: Expression) -> Expression:
 def st_difference(geom_a: Expression, geom_b: Expression) -> Expression:
     """Return the part of geometry A that does not intersect geometry B.
 
-    Both operands must be Polygon or MultiPolygon; other types return null.
+    Subtracting a lower-dimensional geometry (e.g. a line from a polygon) leaves A
+    unchanged, as in PostGIS.
+
+    Works for any geometry types (points, lines, polygons and collections), as
+    PostGIS does. Vertices that come from the inputs are preserved exactly.
 
     Args:
-        geom_a: First geometry column (Geometry or Binary WKB).
+        geom_a: First geometry column (Geometry or Binary WKB). Either side may be a literal.
         geom_b: Second geometry column (Geometry or Binary WKB).
 
     Returns:
-        Geometry column (MultiPolygon). Returns null for non-polygon inputs.
+        Geometry column. A single polygon is a ``POLYGON``, several a
+        ``MULTIPOLYGON`` (an empty areal result is ``MULTIPOLYGON EMPTY``);
+        mixed-dimension results are a ``GEOMETRYCOLLECTION`` (an empty
+        non-areal result is ``GEOMETRYCOLLECTION EMPTY``). Null if the
+        geometry engine fails on degenerate input.
+
+    Lines are noded against each other as in GEOS: shared parts are found
+    exactly, and line results are split where the inputs cross or where a
+    shared part begins or ends.
     """
     return Expression._call_builtin_scalar_fn("st_difference", geom_a, geom_b)
 
 
 def st_symdifference(geom_a: Expression, geom_b: Expression) -> Expression:
-    """Return the symmetric difference (XOR) of two polygon geometries.
+    """Return the symmetric difference (XOR) of two geometries.
 
-    Returns the regions in either geometry but not in both.
-    Both operands must be Polygon or MultiPolygon; other types return null.
+    Returns the parts in either geometry but not in both.
+
+    Works for any geometry types (points, lines, polygons and collections), as
+    PostGIS does. Vertices that come from the inputs are preserved exactly.
 
     Args:
-        geom_a: First geometry column (Geometry or Binary WKB).
+        geom_a: First geometry column (Geometry or Binary WKB). Either side may be a literal.
         geom_b: Second geometry column (Geometry or Binary WKB).
 
     Returns:
-        Geometry column (MultiPolygon). Returns null for non-polygon inputs.
+        Geometry column. A single polygon is a ``POLYGON``, several a
+        ``MULTIPOLYGON`` (an empty areal result is ``MULTIPOLYGON EMPTY``);
+        mixed-dimension results are a ``GEOMETRYCOLLECTION`` (an empty
+        non-areal result is ``GEOMETRYCOLLECTION EMPTY``). Null if the
+        geometry engine fails on degenerate input.
+
+    Lines are noded against each other as in GEOS: shared parts are found
+    exactly, and line results are split where the inputs cross or where a
+    shared part begins or ends.
     """
     return Expression._call_builtin_scalar_fn("st_symdifference", geom_a, geom_b)
 
@@ -372,6 +423,9 @@ def st_symdifference(geom_a: Expression, geom_b: Expression) -> Expression:
 
 def st_envelope(geom: Expression) -> Expression:
     """Return the minimum bounding rectangle of a geometry as a Polygon.
+
+    As in PostGIS, a degenerate envelope has a lower dimension: a zero-size box
+    is a ``POINT`` and a zero-width or zero-height box is a ``LINESTRING``.
 
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
@@ -386,6 +440,9 @@ def st_envelope(geom: Expression) -> Expression:
 def st_convexhull(geom: Expression) -> Expression:
     """Return the convex hull of a geometry as a Polygon.
 
+    As in PostGIS, a degenerate hull has a lower dimension: a single point gives a
+    ``POINT`` and collinear input gives a ``LINESTRING`` between its extreme points.
+
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
 
@@ -399,8 +456,10 @@ def st_convexhull(geom: Expression) -> Expression:
 def st_simplify(geom: Expression, tolerance: float) -> Expression:
     """Simplify a geometry using the Ramer–Douglas–Peucker algorithm.
 
-    Applies to LineString, MultiLineString, Polygon, and MultiPolygon.
-    Other geometry types (Point, MultiPoint, etc.) are returned unchanged.
+    Applies to lines, polygons and collections of them; points are returned
+    unchanged. As in PostGIS ``ST_Simplify``, a polygon ring that collapses is
+    dropped: a collapsed hole is removed, a ``MULTIPOLYGON`` loses a part whose
+    shell collapses, and the result is null when the whole geometry collapses.
 
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
@@ -438,13 +497,19 @@ def st_geojsonfromgeom(geom: Expression) -> Expression:
 
 
 def st_buffer(geom: Expression, distance: float) -> Expression:
-    """Return a geometry that is the given distance from the input geometry (planar Cartesian).
+    """Return a geometry covering every point within ``distance`` of the input (planar Cartesian).
 
-    - **Point**: returns a 64-vertex circular polygon approximation (radius = distance).
-    - **Polygon / MultiPolygon**: computes a real planar offset via straight-skeleton;
-      falls back to bounding-box envelope expansion if the offset returns an empty result.
-    - **LineString and all other types**: falls back to expanding the bounding-box envelope
-      by ``distance`` in each direction (geo-buffer 0.2 has no line-buffering support).
+    Uses round joins and round end caps with ~32 segments per full circle, like
+    PostGIS's default ``quad_segs=8``, for every geometry type:
+
+    - **Point / MultiPoint**: a circle around each point.
+    - **LineString / MultiLineString**: a corridor around the line.
+    - **Polygon / MultiPolygon**: an outward offset, or an inward one for negative
+      ``distance``.
+
+    Points and lines buffered by ``distance <= 0``, and polygons fully eroded by a
+    negative distance, give ``MULTIPOLYGON EMPTY``. A single-part result is a
+    ``POLYGON``, several parts a ``MULTIPOLYGON``.
 
     All buffer operations are planar (Cartesian). For geodesic buffers, project your
     coordinates to a local metric CRS before calling this function.
@@ -581,6 +646,13 @@ def st_makevalid(geom: Expression) -> Expression:
     and returns a valid ``MultiPolygon``. Non-polygonal geometries (Point,
     LineString, ...) are returned unchanged, since the pure-Rust engine only
     repairs areal geometries (unlike PostGIS/GEOS, which handles all types).
+
+    Valid polygonal input is returned unchanged, as in PostGIS. A repaired
+    geometry with one part is a ``POLYGON``, otherwise a ``MULTIPOLYGON``.
+    Zero-area (e.g. collinear) rings have no areal repair and are dropped, so
+    such input becomes an empty ``MultiPolygon``. Overlapping parts
+    of a ``MultiPolygon`` are resolved with even-odd parity (the overlap is
+    removed), matching PostGIS's default ``method=linework``.
 
     Args:
         geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).

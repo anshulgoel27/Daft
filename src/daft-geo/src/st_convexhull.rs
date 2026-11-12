@@ -16,11 +16,25 @@ use crate::utils::{unary_geom_to_geom, validate_geometry_field};
 /// which includes `Geometry` directly in geo 0.33.  We wrap the call in
 /// `catch_unwind` for defensive robustness (consistent with the buffer/overlay
 /// ops pattern), even though convex-hull is unlikely to panic.
+///
+/// Degenerate hulls follow PostGIS: a single distinct point gives a `Point`,
+/// collinear input gives the `LineString` between its two extreme points.
 fn apply_convexhull(g: &Geometry) -> Option<Geometry> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        g.convex_hull()
-    }));
-    result.ok().map(Geometry::Polygon)
+    if crate::utils::is_empty_geom(g) {
+        return Some(g.clone());
+    }
+    let hull = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.convex_hull())).ok()?;
+    let mut distinct: Vec<geo::Coord> = hull.exterior().0.clone();
+    distinct.dedup();
+    if distinct.len() > 1 && distinct.first() == distinct.last() {
+        distinct.pop();
+    }
+    Some(match distinct.len() {
+        0 => Geometry::Polygon(hull),
+        1 => Geometry::Point(geo::Point::from(distinct[0])),
+        2 => Geometry::LineString(geo::LineString::new(distinct)),
+        _ => Geometry::Polygon(hull),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

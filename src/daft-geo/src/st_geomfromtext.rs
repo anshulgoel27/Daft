@@ -8,13 +8,22 @@ use daft_dsl::{
     functions::{FunctionArgs, ScalarUDF, scalar::ScalarFn},
 };
 use serde::{Deserialize, Serialize};
-use wkt::TryFromWkt;
 
 use crate::utils::geom_to_wkb;
 
 /// Parse a WKT string into WKB bytes.
+///
+/// `POINT EMPTY` cannot be a `geo::Point`, and geo's WKT conversion turns it into
+/// `MULTIPOINT EMPTY`. It is instead written as the standard WKB empty point
+/// (a Point whose coordinates are NaN), which round-trips through `st_astext`.
 fn wkt_to_wkb(s: &str) -> Option<Vec<u8>> {
-    let geom: geo::Geometry<f64> = geo::Geometry::try_from_wkt_str(s).ok()?;
+    let parsed: wkt::Wkt<f64> = s.parse().ok()?;
+    if let wkt::Wkt::Point(p) = &parsed
+        && p.coord().is_none()
+    {
+        return geom_to_wkb(&geo::Geometry::Point(geo::Point::new(f64::NAN, f64::NAN))).ok();
+    }
+    let geom: geo::Geometry<f64> = parsed.try_into().ok()?;
     geom_to_wkb(&geom).ok()
 }
 

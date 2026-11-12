@@ -12,10 +12,23 @@ use crate::utils::{unary_geom_to_geom, validate_geometry_field};
 
 /// Return the bounding-box envelope of a geometry as a Polygon.
 ///
+/// Degenerate envelopes follow PostGIS: a zero-size box is a `Point`, and a
+/// zero-width or zero-height box is a `LineString` from its min to max corner.
 /// For a geometry with no bounding rect (e.g. an empty geometry collection)
 /// this returns null.
 fn apply_envelope(g: &Geometry) -> Option<Geometry> {
-    g.bounding_rect().map(|r| Geometry::Polygon(r.to_polygon()))
+    if crate::utils::is_empty_geom(g) {
+        // PostGIS returns the empty input itself (e.g. POINT EMPTY).
+        return Some(g.clone());
+    }
+    let r = g.bounding_rect()?;
+    Some(match (r.width() == 0.0, r.height() == 0.0) {
+        (true, true) => Geometry::Point(geo::Point::from(r.min())),
+        (true, false) | (false, true) => {
+            Geometry::LineString(geo::LineString::new(vec![r.min(), r.max()]))
+        }
+        (false, false) => Geometry::Polygon(r.to_polygon()),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

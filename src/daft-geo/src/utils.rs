@@ -10,13 +10,45 @@ use daft_core::{
     series::Series,
 };
 use daft_dsl::{functions::FunctionArgs, ExprRef};
-use geo::{Geometry, MultiPolygon};
+use geo::Geometry;
 use geo_traits::{to_geo::ToGeoGeometry, GeometryTrait};
+
+/// Rewrite the geo-only variants WKB has no type for (`Rect`, `Triangle`, `Line`)
+/// as `Polygon` / `LineString`. wkb 0.9.3 writes a `Rect` without its ring's point
+/// count, producing corrupt bytes that read back as NULL or `POLYGON EMPTY`.
+fn wkb_compatible(geom: &Geometry) -> std::borrow::Cow<'_, Geometry> {
+    use std::borrow::Cow;
+    match geom {
+        Geometry::Rect(r) => Cow::Owned(Geometry::Polygon(r.to_polygon())),
+        Geometry::Triangle(t) => Cow::Owned(Geometry::Polygon(t.to_polygon())),
+        Geometry::Line(l) => Cow::Owned(Geometry::LineString(geo::LineString::new(vec![l.start, l.end]))),
+        Geometry::GeometryCollection(gc)
+            if gc.iter().any(|m| matches!(wkb_compatible(m), Cow::Owned(_))) =>
+        {
+            Cow::Owned(Geometry::GeometryCollection(
+                gc.iter().map(|m| wkb_compatible(m).into_owned()).collect(),
+            ))
+        }
+        _ => Cow::Borrowed(geom),
+    }
+}
+
+/// True for an empty geometry, including `POINT EMPTY`, which `parse_wkb`
+/// represents as a Point with NaN coordinates (geo's `is_empty` says false).
+pub(crate) fn is_empty_geom(g: &Geometry) -> bool {
+    use geo::HasDimensions;
+    match g {
+        Geometry::Point(p) => p.x().is_nan() && p.y().is_nan(),
+        Geometry::GeometryCollection(gc) => gc.iter().all(is_empty_geom),
+        other => other.is_empty(),
+    }
+}
 
 /// Encode a `geo::Geometry` into standard (ISO) little-endian WKB bytes.
 pub fn geom_to_wkb(geom: &Geometry) -> DaftResult<Vec<u8>> {
     let mut buf = Vec::new();
-    wkb::writer::write_geometry(&mut buf, geom, &wkb::writer::WriteOptions::default())
+    let geom = wkb_compatible(geom);
+    wkb::writer::write_geometry(&mut buf, geom.as_ref(), &wkb::writer::WriteOptions::default())
         .map_err(|e| DaftError::ComputeError(format!("WKB write error: {e:?}")))?;
     Ok(buf)
 }
@@ -80,20 +112,6 @@ pub fn read_f64_arg_expr(
         .ok_or_else(|| {
             DaftError::ValueError(format!("{fn_name}: {name} must be a numeric literal"))
         })
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Shared overlay operation helper
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Convert a Geometry to a MultiPolygon if it is a Polygon or MultiPolygon.
-/// Returns None for non-polygon geometries.
-pub(crate) fn as_multipolygon(g: &Geometry) -> Option<MultiPolygon> {
-    match g {
-        Geometry::Polygon(p) => Some(MultiPolygon(vec![p.clone()])),
-        Geometry::MultiPolygon(mp) => Some(mp.clone()),
-        _ => None,
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -184,7 +202,13 @@ pub fn parse_wkb(bytes: &[u8]) -> DaftResult<Geometry> {
     let stripped = strip_ewkb_srid(bytes);
     let wkb = wkb::reader::read_wkb(stripped.as_ref())
         .map_err(|e| DaftError::ComputeError(format!("WKB parse error: {e:?}")))?;
+    // geo has no empty Point; WKB `POINT EMPTY` (NaN coordinates) becomes a NaN Point,
+    // which `st_astext` prints as `POINT EMPTY` again.
     wkb.try_to_geometry()
+        .or_else(|| {
+            crate::st_geohash_covers::wkb_is_point(stripped.as_ref())
+                .then(|| Geometry::Point(geo::Point::new(f64::NAN, f64::NAN)))
+        })
         .ok_or_else(|| DaftError::ComputeError("WKB parse error: empty geometry".to_string()))
 }
 
@@ -234,9 +258,10 @@ pub fn unary_geom_to_f64(
     let mut validity = NullBufferBuilder::new(len);
 
     for opt in binary.into_iter() {
-        match opt.and_then(|b| parse_wkb(b).ok()) {
-            Some(geom) => {
-                values.push(f(&geom));
+        // NaN means "undefined" (e.g. st_x of a non-point): emit null.
+        match opt.and_then(|b| parse_wkb(b).ok()).map(|g| f(&g)).filter(|v| !v.is_nan()) {
+            Some(v) => {
+                values.push(v);
                 validity.append_non_null();
             }
             None => {
@@ -438,52 +463,103 @@ pub fn unary_geom_to_list_dump_item(
     )
 }
 
+/// Output length of a broadcasting binary op over columns of length `l` and `r`.
+///
+/// Either side may be length 1 (a literal) and is then broadcast over the
+/// other side; otherwise the lengths must match.
+pub(crate) fn broadcast_len(l: usize, r: usize, out_name: &str) -> DaftResult<usize> {
+    match (l, r) {
+        (l, r) if l == r => Ok(l),
+        (1, r) => Ok(r),
+        (l, 1) => Ok(l),
+        (l, r) => Err(DaftError::ValueError(format!(
+            "{out_name}: expected inputs of equal length or length 1, got {l} and {r}"
+        ))),
+    }
+}
+
+/// Call `f` for every row of two geometry columns, with broadcasting.
+///
+/// Each geometry is parsed and passed through `prepare`; a length-1 side is
+/// parsed and prepared once and reused for every row. Null or unparseable
+/// geometries are passed to `f` as `None`. Returns the row count.
+fn for_each_prepared_pair<T>(
+    lhs: &Series,
+    rhs: &Series,
+    out_name: &str,
+    prepare: impl Fn(Geometry) -> T,
+    mut f: impl FnMut(Option<&T>, Option<&T>),
+) -> DaftResult<usize> {
+    let lhs_bin = get_geometry_binary(lhs)?;
+    let rhs_bin = get_geometry_binary(rhs)?;
+    let len = broadcast_len(lhs_bin.len(), rhs_bin.len(), out_name)?;
+    let parse = |b: Option<&[u8]>| b.and_then(|b| parse_wkb(b).ok()).map(&prepare);
+    let scalar = |arr: &BinaryArray| -> Option<Option<T>> {
+        (arr.len() == 1 && len != 1).then(|| parse(arr.into_iter().next().flatten()))
+    };
+    match (scalar(lhs_bin), scalar(rhs_bin)) {
+        (Some(lg), _) => {
+            for ropt in rhs_bin {
+                f(lg.as_ref(), parse(ropt).as_ref());
+            }
+        }
+        (None, Some(rg)) => {
+            for lopt in lhs_bin {
+                f(parse(lopt).as_ref(), rg.as_ref());
+            }
+        }
+        (None, None) => {
+            for (lopt, ropt) in lhs_bin.into_iter().zip(rhs_bin) {
+                f(parse(lopt).as_ref(), parse(ropt).as_ref());
+            }
+        }
+    }
+    Ok(len)
+}
+
+fn for_each_geom_pair(
+    lhs: &Series,
+    rhs: &Series,
+    out_name: &str,
+    f: impl FnMut(Option<&Geometry>, Option<&Geometry>),
+) -> DaftResult<usize> {
+    for_each_prepared_pair(lhs, rhs, out_name, |g| g, f)
+}
+
+/// Like [`binary_geom_to_geom`], but each operand is first converted with
+/// `prepare` (e.g. decomposed and indexed) — once for a broadcast literal.
+pub(crate) fn binary_prepared_to_geom<T>(
+    lhs: &Series,
+    rhs: &Series,
+    out_name: &str,
+    prepare: impl Fn(Geometry) -> T,
+    f: impl Fn(&T, &T) -> Option<Geometry>,
+) -> DaftResult<Series> {
+    let mut wkb_values: Vec<Option<Vec<u8>>> = Vec::new();
+    for_each_prepared_pair(lhs, rhs, out_name, prepare, |l, r| {
+        wkb_values.push(
+            l.zip(r)
+                .and_then(|(l, r)| f(l, r))
+                .and_then(|g| geom_to_wkb(&g).ok()),
+        );
+    })?;
+    wkb_opts_to_geometry_series(out_name, wkb_values)
+}
+
 /// Apply a binary predicate over two geometry columns → Boolean Series.
+///
+/// `f` returns `None` when the predicate cannot be evaluated (e.g. the
+/// geometry engine panicked); that row is null rather than a wrong answer.
 pub fn binary_geom_to_bool(
     lhs: &Series,
     rhs: &Series,
     out_name: &str,
-    f: impl Fn(&Geometry, &Geometry) -> bool,
+    f: impl Fn(&Geometry, &Geometry) -> Option<bool>,
 ) -> DaftResult<Series> {
-    let lhs_bin = get_geometry_binary(lhs)?;
-    let rhs_bin = get_geometry_binary(rhs)?;
-
-    // support scalar broadcast: rhs may be length 1
-    let rhs_scalar = rhs_bin.len() == 1;
-
-    let rhs_geom_scalar: Option<Option<Geometry>> = if rhs_scalar {
-        Some(
-            rhs_bin
-                .into_iter()
-                .next()
-                .flatten()
-                .and_then(|b| parse_wkb(b).ok()),
-        )
-    } else {
-        None
-    };
-
-    let values: Vec<Option<bool>> = if let Some(rhs_opt) = rhs_geom_scalar {
-        lhs_bin
-            .into_iter()
-            .map(|lopt| {
-                let lg = lopt.and_then(|b| parse_wkb(b).ok())?;
-                let rg = rhs_opt.as_ref()?;
-                Some(f(&lg, rg))
-            })
-            .collect()
-    } else {
-        lhs_bin
-            .into_iter()
-            .zip(rhs_bin.into_iter())
-            .map(|(lopt, ropt)| {
-                let lg = lopt.and_then(|b| parse_wkb(b).ok())?;
-                let rg = ropt.and_then(|b| parse_wkb(b).ok())?;
-                Some(f(&lg, &rg))
-            })
-            .collect()
-    };
-
+    let mut values: Vec<Option<bool>> = Vec::new();
+    for_each_geom_pair(lhs, rhs, out_name, |l, r| {
+        values.push(l.zip(r).and_then(|(l, r)| f(l, r)));
+    })?;
     Ok(BooleanArray::from_iter(out_name, values.into_iter()).into_series())
 }
 
@@ -494,105 +570,41 @@ pub fn binary_geom_to_geom(
     out_name: &str,
     f: impl Fn(&Geometry, &Geometry) -> Option<Geometry>,
 ) -> DaftResult<Series> {
-    let lhs_bin = get_geometry_binary(lhs)?;
-    let rhs_bin = get_geometry_binary(rhs)?;
-
-    // support scalar broadcast: rhs may be length 1
-    let rhs_scalar = rhs_bin.len() == 1;
-
-    let rhs_geom_scalar: Option<Option<Geometry>> = if rhs_scalar {
-        Some(
-            rhs_bin
-                .into_iter()
-                .next()
-                .flatten()
-                .and_then(|b| parse_wkb(b).ok()),
-        )
-    } else {
-        None
-    };
-
-    let len = lhs_bin.len();
-    let mut wkb_values: Vec<Option<Vec<u8>>> = Vec::with_capacity(len);
-
-    let compute = |lopt: Option<&[u8]>, rg: Option<&Geometry>| -> Option<Vec<u8>> {
-        let lg = lopt.and_then(|b| parse_wkb(b).ok())?;
-        let rg = rg?;
-        f(&lg, rg).and_then(|g| geom_to_wkb(&g).ok())
-    };
-
-    if let Some(rhs_opt) = rhs_geom_scalar {
-        for lopt in lhs_bin.into_iter() {
-            wkb_values.push(compute(lopt, rhs_opt.as_ref()));
-        }
-    } else {
-        for (lopt, ropt) in lhs_bin.into_iter().zip(rhs_bin.into_iter()) {
-            let rg = ropt.and_then(|b| parse_wkb(b).ok());
-            wkb_values.push(compute(lopt, rg.as_ref()));
-        }
-    }
-
+    let mut wkb_values: Vec<Option<Vec<u8>>> = Vec::new();
+    for_each_geom_pair(lhs, rhs, out_name, |l, r| {
+        wkb_values.push(
+            l.zip(r)
+                .and_then(|(l, r)| f(l, r))
+                .and_then(|g| geom_to_wkb(&g).ok()),
+        );
+    })?;
     wkb_opts_to_geometry_series(out_name, wkb_values)
 }
 
 /// Apply a binary geometry → Float64 function (e.g. distance).
+///
+/// `f` returns `None` when the value is undefined (e.g. an empty geometry);
+/// that row is null.
 pub fn binary_geom_to_f64(
     lhs: &Series,
     rhs: &Series,
     out_name: &str,
-    f: impl Fn(&Geometry, &Geometry) -> f64,
+    f: impl Fn(&Geometry, &Geometry) -> Option<f64>,
 ) -> DaftResult<Series> {
-    let lhs_bin = get_geometry_binary(lhs)?;
-    let rhs_bin = get_geometry_binary(rhs)?;
-    let len = lhs_bin.len();
-    let rhs_scalar = rhs_bin.len() == 1;
-
-    let rhs_geom_scalar: Option<Option<Geometry>> = if rhs_scalar {
-        Some(
-            rhs_bin
-                .into_iter()
-                .next()
-                .flatten()
-                .and_then(|b| parse_wkb(b).ok()),
-        )
-    } else {
-        None
-    };
-
-    let mut values = Vec::with_capacity(len);
-    let mut validity = NullBufferBuilder::new(len);
-
-    if let Some(rhs_opt) = rhs_geom_scalar {
-        for lopt in lhs_bin.into_iter() {
-            match (lopt.and_then(|b| parse_wkb(b).ok()), rhs_opt.as_ref()) {
-                (Some(lg), Some(rg)) => {
-                    values.push(f(&lg, &rg));
-                    validity.append_non_null();
-                }
-                _ => {
-                    values.push(0.0);
-                    validity.append_null();
-                }
+    let mut values = Vec::new();
+    let mut validity = NullBufferBuilder::new(0);
+    for_each_geom_pair(lhs, rhs, out_name, |l, r| {
+        match l.zip(r).and_then(|(l, r)| f(l, r)) {
+            Some(v) => {
+                values.push(v);
+                validity.append_non_null();
+            }
+            None => {
+                values.push(0.0);
+                validity.append_null();
             }
         }
-    } else {
-        for (lopt, ropt) in lhs_bin.into_iter().zip(rhs_bin.into_iter()) {
-            match (
-                lopt.and_then(|b| parse_wkb(b).ok()),
-                ropt.and_then(|b| parse_wkb(b).ok()),
-            ) {
-                (Some(lg), Some(rg)) => {
-                    values.push(f(&lg, &rg));
-                    validity.append_non_null();
-                }
-                _ => {
-                    values.push(0.0);
-                    validity.append_null();
-                }
-            }
-        }
-    }
-
+    })?;
     let field = Arc::new(Field::new(out_name, DataType::Float64));
     let arr = Float64Array::from_field_and_values(field, values).with_nulls(validity.finish())?;
     Ok(arr.into_series())

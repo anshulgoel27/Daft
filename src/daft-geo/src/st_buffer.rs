@@ -12,114 +12,45 @@ use serde::{Deserialize, Serialize};
 
 use crate::utils::{read_f64_arg, read_f64_arg_expr, unary_geom_to_geom, validate_geometry_field};
 
-/// Apply a planar buffer of `distance` units to geometry `g`.
+/// Apply a planar buffer of `distance` units to geometry `g`, PostGIS-style.
 ///
-/// - **Point**: returns a 64-vertex circular polygon (exact circle approximation).
-/// - **Polygon**: uses `geo_buffer::buffer_polygon` (straight-skeleton offset) for a real
-///   planar offset; falls back to bbox-envelope expansion if the crate returns an empty result.
-/// - **MultiPolygon**: uses `geo_buffer::buffer_multi_polygon`.
-/// - **All others**: falls back to expanding the bounding-box envelope by `distance`.
+/// Uses `geo::Buffer` (i_overlay outline/stroke) with round joins and round end
+/// caps, ~32 segments per full circle (PostGIS `quad_segs=8`). i_overlay snaps to
+/// an integer grid sized relative to the input's extent, so the result does not
+/// depend on the coordinate scale (degrees or metres).
+///
+/// - **Point / MultiPoint**: a circle per point; `distance <= 0` gives EMPTY.
+/// - **LineString / MultiLineString**: a corridor with round caps; `distance <= 0`
+///   gives EMPTY.
+/// - **Polygon / MultiPolygon**: an outward (or, for negative distances, inward)
+///   offset. An inward offset that consumes the polygon gives EMPTY.
+/// - **GeometryCollection**: the union of its members' buffers.
+///
+/// A single-part result is a `Polygon`, otherwise a `MultiPolygon` (EMPTY when
+/// nothing is left). Returns null if the engine panics on degenerate input.
 ///
 /// All buffer operations are **planar** (Cartesian). For geodesic buffers, project your
 /// coordinates to a local metric CRS before calling this function.
 fn apply_buffer(g: &Geometry, distance: f64) -> Option<Geometry> {
-    use geo::BoundingRect;
+    use geo::Buffer;
 
-    match g {
-        // Point → 64-vertex circle (a correct planar buffer for points)
-        Geometry::Point(p) => {
-            let n_points = 64usize;
-            let coords: Vec<geo::Coord<f64>> = (0..=n_points)
-                .map(|i| {
-                    let angle = 2.0 * std::f64::consts::PI * i as f64 / n_points as f64;
-                    geo::Coord {
-                        x: p.x() + distance * angle.cos(),
-                        y: p.y() + distance * angle.sin(),
-                    }
-                })
-                .collect();
-            let ring = geo::LineString(coords);
-            Some(Geometry::Polygon(geo::Polygon::new(ring, vec![])))
-        }
-
-        // Polygon → real planar offset via geo_buffer straight-skeleton.
-        //
-        // `geo_buffer` / `i_overlay` can panic on certain degenerate polygon inputs
-        // (self-intersecting rings, zero-area spikes, etc.).  A panic inside a
-        // `ScalarUDF::call` would unwind across Daft's compute thread, which is far
-        // worse than returning an error or null.  We therefore wrap the call in
-        // `catch_unwind` so that any panic becomes `None`, consistent with the
-        // existing null-on-failure semantics used throughout this crate.  On the
-        // happy path `catch_unwind` adds essentially zero overhead.
-        Geometry::Polygon(poly) => {
-            // SAFETY: `poly` is a shared reference; `AssertUnwindSafe` is correct
-            // because we do not observe any side-effects from a potential panic.
-            let mp_opt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                geo_buffer::buffer_polygon(poly, distance)
-            }))
-            .ok();
-            match mp_opt.filter(|mp| !mp.0.is_empty()) {
-                Some(mp) => Some(Geometry::MultiPolygon(mp)),
-                None => {
-                    // Fallback: bbox envelope (degenerate polygon, full shrink, or panic)
-                    let bbox = g.bounding_rect()?;
-                    let expanded = geo::Rect::new(
-                        geo::Coord {
-                            x: bbox.min().x - distance,
-                            y: bbox.min().y - distance,
-                        },
-                        geo::Coord {
-                            x: bbox.max().x + distance,
-                            y: bbox.max().y + distance,
-                        },
-                    );
-                    Some(Geometry::Rect(expanded))
-                }
-            }
-        }
-
-        // MultiPolygon → real planar offset via geo_buffer.
-        // Same catch_unwind rationale as the Polygon branch above.
-        Geometry::MultiPolygon(mp) => {
-            let result_opt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                geo_buffer::buffer_multi_polygon(mp, distance)
-            }))
-            .ok();
-            match result_opt.filter(|r| !r.0.is_empty()) {
-                Some(result) => Some(Geometry::MultiPolygon(result)),
-                None => {
-                    let bbox = g.bounding_rect()?;
-                    let expanded = geo::Rect::new(
-                        geo::Coord {
-                            x: bbox.min().x - distance,
-                            y: bbox.min().y - distance,
-                        },
-                        geo::Coord {
-                            x: bbox.max().x + distance,
-                            y: bbox.max().y + distance,
-                        },
-                    );
-                    Some(Geometry::Rect(expanded))
-                }
-            }
-        }
-
-        // All other types (LineString, etc.) → expand bounding-box envelope
-        _ => {
-            let bbox = g.bounding_rect()?;
-            let expanded = geo::Rect::new(
-                geo::Coord {
-                    x: bbox.min().x - distance,
-                    y: bbox.min().y - distance,
-                },
-                geo::Coord {
-                    x: bbox.max().x + distance,
-                    y: bbox.max().y + distance,
-                },
-            );
-            Some(Geometry::Rect(expanded))
-        }
+    if !distance.is_finite() {
+        return None;
     }
+    if crate::utils::is_empty_geom(g) {
+        return Some(Geometry::MultiPolygon(geo::MultiPolygon::empty()));
+    }
+    // Buffering a geometry with no area inward (or by zero) leaves nothing.
+    let areal = matches!(
+        g,
+        Geometry::Polygon(_) | Geometry::MultiPolygon(_) | Geometry::Rect(_) | Geometry::Triangle(_)
+    ) || matches!(g, Geometry::GeometryCollection(gc) if gc.iter().any(|m| matches!(m, Geometry::Polygon(_) | Geometry::MultiPolygon(_) | Geometry::Rect(_) | Geometry::Triangle(_))));
+    if distance <= 0.0 && !areal {
+        return Some(Geometry::MultiPolygon(geo::MultiPolygon::empty()));
+    }
+
+    let mp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.buffer(distance))).ok()?;
+    Some(crate::overlay::areal_geometry(mp))
 }
 
 /// Zero-field unit struct; the `distance` parameter is read from the trailing
@@ -159,10 +90,11 @@ impl ScalarUDF for StBuffer {
     }
 
     fn docstring(&self) -> &'static str {
-        "Returns a geometry that is the given distance from the input geometry (planar Cartesian). \
-         For Point geometries this produces a 64-vertex circular polygon approximation; \
-         for Polygon/MultiPolygon a real planar offset is computed via straight-skeleton; \
-         for other types the bounding-box envelope is expanded by distance."
+        "Returns a geometry covering all points within the given distance of the input \
+         (planar Cartesian), with round joins and end caps (~32 segments per circle, like \
+         PostGIS quad_segs=8). Works for every geometry type; points and lines buffered by \
+         distance <= 0 and polygons fully eroded by a negative distance give MULTIPOLYGON EMPTY. \
+         A single part is returned as a POLYGON, several as a MULTIPOLYGON."
     }
 }
 
@@ -180,12 +112,11 @@ mod tests {
     fn test_point_buffer_area_approx_pi_r2() {
         let p = Geometry::Point(Point::new(0.0_f64, 0.0));
         let buf = apply_buffer(&p, 1.0).unwrap();
-        // area of a radius-1 buffer ≈ π (64-gon approximation is very close)
+        // A 32-segment circle (PostGIS quad_segs=8) of radius 1 has area
+        // 16 * sin(2π/32) ≈ 3.1214, matching ST_Area(ST_Buffer('POINT(0 0)', 1)).
         let a = buf.unsigned_area();
-        assert!(
-            (a - std::f64::consts::PI).abs() < 0.01,
-            "expected area ≈ π, got {a}"
-        );
+        let expected = 16.0 * (2.0 * std::f64::consts::PI / 32.0).sin();
+        assert!((a - expected).abs() < 1e-3, "expected area ≈ {expected}, got {a}");
     }
 
     #[test]

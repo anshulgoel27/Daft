@@ -7,7 +7,7 @@ import pytest
 
 import daft
 import daft.functions
-from daft.functions import st_touches, st_disjoint, st_dump, st_dumprings, st_equals, st_crosses, st_overlaps, st_geomfromtext, st_distance, st_buffer, st_area, st_isvalid, st_envelope
+from daft.functions import st_touches, st_disjoint, st_dump, st_dumprings, st_equals, st_crosses, st_overlaps, st_geomfromtext, st_distance, st_buffer, st_area, st_isvalid, st_envelope, list_count
 
 
 def _great_circle_distance(
@@ -838,12 +838,12 @@ def test_st_makeline_sql():
 
 
 def test_st_buffer_point_area_approx_pi():
-    """Buffer of radius-1 around a point should have area ≈ π (64-gon circle)."""
+    """Buffer of radius-1 around a point is a 32-segment circle, as PostGIS (quad_segs=8)."""
     df = daft.from_pydict({"w": ["POINT(0 0)"]})
     geom = st_geomfromtext(daft.col("w"))
     result = df.select(st_area(st_buffer(geom, 1.0)).alias("a")).to_pydict()
     area = result["a"][0]
-    assert abs(area - math.pi) < 0.01, f"Expected area ≈ π, got {area}"
+    assert area == pytest.approx(16 * math.sin(2 * math.pi / 32), abs=1e-3)
 
 
 def test_st_buffer_point_area_approx_pi_sql():
@@ -853,7 +853,7 @@ def test_st_buffer_point_area_approx_pi_sql():
         "SELECT st_area(st_buffer(st_geomfromtext(w), 1.0)) AS a FROM df"
     ).to_pydict()
     area = result["a"][0]
-    assert abs(area - math.pi) < 0.01, f"SQL: expected area ≈ π, got {area}"
+    assert area == pytest.approx(16 * math.sin(2 * math.pi / 32), abs=1e-3)
 
 
 def test_st_buffer_polygon_expands():
@@ -910,13 +910,13 @@ def test_difference_symdifference_area():
     assert abs(df["sd"][0] - 6.0) < 1e-6, f"symdifference area: {df['sd'][0]}"
 
 
-def test_overlay_non_polygon_yields_null():
-    """Non-polygon geometries (Point) return null for overlay ops."""
-    from daft.functions import st_union
+def test_overlay_point_union_is_multipoint():
+    """Overlays accept non-polygon inputs, as PostGIS does: two points union to a MultiPoint."""
+    from daft.functions import st_union, st_astext
     df = daft.from_pydict({"a": ["POINT(0 0)"], "b": ["POINT(1 1)"]}).select(
-        st_union(st_geomfromtext(daft.col("a")), st_geomfromtext(daft.col("b"))).alias("u"),
+        st_astext(st_union(st_geomfromtext(daft.col("a")), st_geomfromtext(daft.col("b")))).alias("u"),
     ).to_pydict()
-    assert df["u"][0] is None, f"Expected null for point union, got {df['u'][0]}"
+    assert df["u"] == ["MULTIPOINT((0 0),(1 1))"]
 
 
 def test_overlay_sql_parity():
@@ -1062,6 +1062,140 @@ def test_st_makevalid_passes_through_non_polygon():
     out = df.select(st_astext(st_makevalid(geom)).alias("w")).to_pydict()
     assert "POINT" in out["w"][0].upper()
     assert "1" in out["w"][0] and "2" in out["w"][0]
+
+
+def _rect_ring(w, h, x0=-77.03, y0=38.90):
+    return f"(({x0} {y0},{x0 + w} {y0},{x0 + w} {y0 + h},{x0} {y0 + h},{x0} {y0}))"
+
+
+# Small valid polygons in EPSG:4326 degrees. geo's MakeValid snaps vertices within an
+# absolute 1e-4 units (~10 m), which used to collapse these to MULTIPOLYGON EMPTY.
+_SMALL_VALID_POLYGONS = {
+    "square_1e-4": _rect_ring(1e-4, 1e-4),
+    "square_6e-5": _rect_ring(6e-5, 6e-5),
+    "lot_17x6m": _rect_ring(203e-6, 57.5e-6),
+    "lot_35x13m": _rect_ring(406e-6, 115e-6),
+    "lot_at_origin": _rect_ring(203e-6, 57.5e-6, 0.0, 0.0),
+    "square_1m": _rect_ring(1e-5, 1e-5),
+    "lot_projected_metres": _rect_ring(17.0, 6.0, 500_000.0, 4_300_000.0),
+}
+
+
+@pytest.mark.parametrize("ring", list(_SMALL_VALID_POLYGONS.values()), ids=list(_SMALL_VALID_POLYGONS))
+def test_st_makevalid_returns_small_valid_polygon_unchanged(ring):
+    """A valid polygon comes back unchanged, as PostGIS ST_MakeValid does."""
+    from daft.functions import st_makevalid, st_astext, st_normalize
+
+    df = daft.from_pydict({"g": [f"POLYGON{ring}"], "expected": [f"POLYGON{ring}"]})
+    out = df.select(
+        list_count(st_dump(st_makevalid(st_geomfromtext(daft.col("g"))))).alias("parts"),
+        st_astext(st_normalize(st_makevalid(st_geomfromtext(daft.col("g"))))).alias("got"),
+        st_astext(st_normalize(st_geomfromtext(daft.col("expected")))).alias("want"),
+    ).to_pydict()
+    assert out["parts"] == [1]
+    assert out["got"] == out["want"]
+
+
+def test_st_makevalid_does_not_move_vertices_of_valid_polygon():
+    """A ~3 m bump on a ~90 m parcel used to be snapped away (1.5% area loss)."""
+    from daft.functions import st_makevalid
+
+    wkt = "POLYGON((-77.0 38.9,-76.999 38.9,-76.999 38.901,-76.99905 38.90103,-77.0 38.901,-77.0 38.9))"
+    df = daft.from_pydict({"g": [wkt]})
+    geom = st_geomfromtext(daft.col("g"))
+    out = df.select(st_area(geom).alias("before"), st_area(st_makevalid(geom)).alias("after")).to_pydict()
+    assert out["after"][0] == out["before"][0]
+
+
+def test_st_makevalid_valid_multipolygon_passes_through():
+    from daft.functions import st_makevalid, st_astext, st_normalize
+
+    mp = f"MULTIPOLYGON({_rect_ring(6e-5, 6e-5)},{_rect_ring(6e-5, 6e-5, -77.0299, 38.90)})"
+    df = daft.from_pydict({"g": [mp]})
+    geom = st_geomfromtext(daft.col("g"))
+    out = df.select(
+        st_astext(st_normalize(st_makevalid(geom))).alias("got"),
+        st_astext(st_normalize(geom)).alias("want"),
+    ).to_pydict()
+    assert out["got"] == out["want"]
+
+
+@pytest.mark.parametrize(
+    "wkt,side",
+    [
+        pytest.param(
+            "POLYGON((-77.04 38.9,-77.03994 38.90006,-77.03994 38.9,-77.04 38.90006,-77.04 38.9))", 6e-5, id="bowtie_6m"
+        ),
+        pytest.param(
+            "POLYGON((-77.000 38.900,-76.999 38.901,-76.999 38.900,-77.000 38.901,-77.000 38.900))",
+            1e-3,
+            id="bowtie_90m",
+        ),
+        pytest.param("POLYGON((0 0, 4 4, 4 0, 0 4, 0 0))", 4.0, id="bowtie_projected"),
+    ],
+)
+def test_st_makevalid_repairs_small_bowtie(wkt, side):
+    """Bowties of any size are repaired into two triangles (the 6 m one used to become empty)."""
+    from daft.functions import st_makevalid
+
+    df = daft.from_pydict({"g": [wkt]})
+    fixed = st_makevalid(st_geomfromtext(daft.col("g")))
+    out = df.select(
+        list_count(st_dump(fixed)).alias("parts"), st_isvalid(fixed).alias("valid"), st_area(fixed).alias("area")
+    ).to_pydict()
+    assert out["parts"] == [2]
+    assert out["valid"] == [True]
+    assert out["area"][0] == pytest.approx(side * side / 2, rel=1e-9)
+
+
+def test_st_makevalid_bowtie_90m_matches_postgis():
+    """PostGIS ST_MakeValid splits this bowtie into exactly these two triangles."""
+    from daft.functions import st_makevalid, st_astext, st_normalize
+
+    bowtie = "POLYGON((-77.000 38.900,-76.999 38.901,-76.999 38.900,-77.000 38.901,-77.000 38.900))"
+    expected = (
+        "MULTIPOLYGON(((-77.0 38.9,-77.0 38.901,-76.9995 38.9005,-77.0 38.9)),"
+        "((-76.999 38.9,-76.9995 38.9005,-76.999 38.901,-76.999 38.9)))"
+    )
+    df = daft.from_pydict({"g": [bowtie], "e": [expected]})
+    out = df.select(
+        st_astext(st_normalize(st_makevalid(st_geomfromtext(daft.col("g"))))).alias("got"),
+        st_astext(st_normalize(st_geomfromtext(daft.col("e")))).alias("want"),
+    ).to_pydict()
+    assert out["got"] == out["want"]
+
+
+def test_st_makevalid_overlapping_small_multipolygon_is_repaired():
+    """An invalid MultiPolygon of two overlapping ~5 m squares is repaired, not emptied.
+
+    geo rebuilds faces from the noded linework with even-odd parity, so the overlap
+    is dropped - the same result as PostGIS ST_MakeValid's default 'linework' method.
+    """
+    from daft.functions import st_makevalid
+
+    mp = f"MULTIPOLYGON({_rect_ring(6e-5, 6e-5)},{_rect_ring(6e-5, 6e-5, -77.03 + 3e-5, 38.90)})"
+    df = daft.from_pydict({"g": [mp]})
+    geom = st_geomfromtext(daft.col("g"))
+    fixed = st_makevalid(geom)
+    out = df.select(
+        st_isvalid(geom).alias("before"),
+        st_isvalid(fixed).alias("after"),
+        list_count(st_dump(fixed)).alias("parts"),
+        st_area(fixed).alias("area"),
+    ).to_pydict()
+    assert out["before"] == [False]
+    assert out["after"] == [True]
+    assert out["parts"] == [2]
+    assert out["area"][0] == pytest.approx(2 * 3e-5 * 6e-5, rel=1e-6)
+
+
+def test_st_makevalid_drops_zero_area_ring():
+    """A collinear (zero-area) ring has no areal repair, so it becomes an empty MultiPolygon."""
+    from daft.functions import st_makevalid
+
+    df = daft.from_pydict({"g": ["POLYGON((-76.998 38.900,-76.997 38.900,-76.996 38.900,-76.998 38.900))"]})
+    out = df.select(list_count(st_dump(st_makevalid(st_geomfromtext(daft.col("g"))))).alias("parts")).to_pydict()
+    assert out["parts"] == [0]
 
 
 def test_st_normalize_ring_orientation_and_start_vertex_invariant():

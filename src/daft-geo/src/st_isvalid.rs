@@ -15,7 +15,8 @@ impl ScalarUDF for StIsValid {
     fn call(&self, inputs: FunctionArgs<Series>, _ctx: &daft_dsl::functions::scalar::EvalContext) -> DaftResult<Series> {
         unary_geom_to_bool(inputs.required(0)?, self.name(), |g| {
             use geo::algorithm::Validation;
-            g.is_valid()
+            // An empty geometry is valid (PostGIS); POINT EMPTY is a NaN Point here.
+            crate::utils::is_empty_geom(g) || g.is_valid()
         })
     }
 

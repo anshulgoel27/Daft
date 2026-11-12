@@ -18,8 +18,7 @@ impl ScalarUDF for StDwithin {
         let d = read_f64_arg(&inputs, 2, "distance", self.name())?;
         binary_geom_to_bool(inputs.required(0)?, inputs.required(1)?, self.name(),
             move |a: &Geometry, b: &Geometry| {
-                let dist = geom_distance(a, b);
-                dist.is_finite() && dist <= d
+                Some(geom_distance(a, b)? <= d)
             })
     }
 
@@ -49,21 +48,28 @@ mod tests {
     fn test_dwithin_boundary() {
         let a = Geometry::Point(Point::new(0.0, 0.0));
         let b = Geometry::Point(Point::new(3.0, 4.0)); // distance = 5.0
-        assert!(geom_distance(&a, &b) <= 5.0 + 1e-9);
-        assert!(geom_distance(&a, &b) > 4.9);
+        let d = geom_distance(&a, &b).unwrap();
+        assert!(d <= 5.0 + 1e-9);
+        assert!(d > 4.9);
     }
 
     #[test]
-    fn test_dwithin_unsupported_pair_is_not_finite() {
-        // geom_distance returns NaN for unsupported geometry-type pairs (its `_ => f64::NAN` arm).
-        // st_dwithin's predicate guards with `dist.is_finite() && dist <= d`, so such pairs are never "within".
+    fn test_distance_defined_for_line_pairs() {
+        // Previously only Point/Polygon/LineString-Point pairs were handled and every
+        // other pair was NaN, so st_dwithin silently returned false for them.
         let line_a = Geometry::LineString(LineString(vec![
-            Coord { x: 0.0, y: 0.0 }, Coord { x: 1.0, y: 1.0 },
+            Coord { x: 0.0, y: 0.0 }, Coord { x: 1.0, y: 0.0 },
         ]));
         let line_b = Geometry::LineString(LineString(vec![
-            Coord { x: 5.0, y: 5.0 }, Coord { x: 6.0, y: 6.0 },
+            Coord { x: 0.0, y: 3.0 }, Coord { x: 1.0, y: 3.0 },
         ]));
-        let dist = geom_distance(&line_a, &line_b);
-        assert!(!dist.is_finite(), "expected non-finite distance for unsupported (LineString, LineString) pair, got {dist}");
+        assert_eq!(geom_distance(&line_a, &line_b), Some(3.0));
+    }
+
+    #[test]
+    fn test_distance_empty_is_none() {
+        let empty = Geometry::MultiPolygon(geo::MultiPolygon::empty());
+        let p = Geometry::Point(Point::new(0.0, 0.0));
+        assert_eq!(geom_distance(&empty, &p), None);
     }
 }

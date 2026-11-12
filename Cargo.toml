@@ -328,8 +328,10 @@ daft-sql = {path = "src/daft-sql"}
 dashmap = "=6.2"
 educe = "^0.8"
 futures = "0.3.30"
-geo = "0.33.1"
-geo-buffer = "0.2"
+# Fork (branch daft-geo-fixes) with two MakeValid fixes: a relative snap radius
+# (georust/geo#1640) and splitting segments at T-junctions. Go back to a
+# crates.io release once both are merged and published.
+geo = {git = "https://github.com/anshulgoel27/geo", rev = "cd2889a28b967b2ebc7491465709cbdc7abda428"}
 geo-traits = "0.3"
 geohash = "0.13"
 geojson = "1.0"

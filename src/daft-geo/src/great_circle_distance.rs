@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_buffer::{NullBuffer, NullBufferBuilder};
+use arrow_buffer::NullBufferBuilder;
 use daft_core::prelude::{Float64Array, IntoSeries};
 use daft_dsl::functions::{prelude::*, scalar::ScalarFn};
 use serde::{Deserialize, Serialize};
@@ -58,42 +58,28 @@ impl ScalarUDF for GreatCircleDistance {
         let lat2 = lat2.f64().expect("type should have been validated already");
         let lon2 = lon2.f64().expect("type should have been validated already");
 
-        let len = lat1.len();
-
-        let input_nulls = [lat1.nulls(), lon1.nulls(), lat2.nulls(), lon2.nulls()]
-            .into_iter()
-            .fold(None, |acc, next| NullBuffer::union(acc.as_ref(), next));
-
-        let lat1_v = lat1.values();
-        let lon1_v = lon1.values();
-        let lat2_v = lat2.values();
-        let lon2_v = lon2.values();
+        // Any argument may be a length-1 literal broadcast over the others.
+        let cols = [lat1, lon1, lat2, lon2];
+        let len = cols.iter().try_fold(1usize, |acc, c| {
+            crate::utils::broadcast_len(acc, c.len(), self.name())
+        })?;
+        let at = |arr: &Float64Array, i: usize| arr.get(if arr.len() == 1 { 0 } else { i });
 
         let mut values = Vec::with_capacity(len);
         let mut validity = NullBufferBuilder::new(len);
 
         for i in 0..len {
-            let row_is_present = input_nulls.as_ref().map(|n| !n.is_null(i)).unwrap_or(true);
-
-            if !row_is_present {
-                values.push(0.0);
-                validity.append_null();
-                continue;
-            }
-
-            let a = lat1_v[i];
-            let b = lon1_v[i];
-            let c = lat2_v[i];
-            let d = lon2_v[i];
-
-            let row_is_valid = is_valid_lat_lon(a, b) && is_valid_lat_lon(c, d);
-
-            if row_is_valid {
-                values.push(haversine_meters(a, b, c, d));
-                validity.append_non_null();
-            } else {
-                values.push(0.0);
-                validity.append_null();
+            match (at(lat1, i), at(lon1, i), at(lat2, i), at(lon2, i)) {
+                (Some(a), Some(b), Some(c), Some(d))
+                    if is_valid_lat_lon(a, b) && is_valid_lat_lon(c, d) =>
+                {
+                    values.push(haversine_meters(a, b, c, d));
+                    validity.append_non_null();
+                }
+                _ => {
+                    values.push(0.0);
+                    validity.append_null();
+                }
             }
         }
 

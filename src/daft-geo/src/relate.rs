@@ -1,6 +1,6 @@
 use geo::coordinate_position::{CoordPos, CoordinatePosition};
 use geo::relate::Relate;
-use geo::{Contains, Geometry, Intersects};
+use geo::{Contains, CoordsIter, Geometry, Intersects};
 
 /// The DE-9IM spatial predicate to evaluate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,15 +69,46 @@ fn point_fast_path(a: &Geometry, b: &Geometry, pred: RelatePred) -> Option<bool>
     }
 }
 
+/// Vertex fast path for `Intersects` / `Disjoint` between two non-point geometries.
+///
+/// A vertex of a non-empty geometry is a point of that geometry, so if one
+/// vertex of `a` is not in the exterior of `b` (or vice versa) the two
+/// intersect, which proves `Intersects` without the full topology graph that
+/// `relate` builds. That one point-in-geometry test is O(vertices), against
+/// relate's graph construction and noding of BOTH operands. In a spatial join
+/// (an isochrone or buffer against the many small polygons it covers) most
+/// true candidate pairs have one operand inside the other, so they stop at the
+/// first test. A miss proves nothing (the boundaries may still cross), so it
+/// returns `None` and the caller falls back to relate. Hence this never changes
+/// a result, it only skips work. Empty operands have no vertex and also fall
+/// back.
+fn vertex_fast_path(a: &Geometry, b: &Geometry, pred: RelatePred) -> Option<bool> {
+    if !matches!(pred, RelatePred::Intersects | RelatePred::Disjoint) {
+        return None;
+    }
+    let hit = |of: &Geometry, inside: &Geometry| {
+        of.coords_iter()
+            .next()
+            .is_some_and(|c| inside.coordinate_position(&c) != CoordPos::Outside)
+    };
+    if hit(a, b) || hit(b, a) {
+        return Some(matches!(pred, RelatePred::Intersects));
+    }
+    None
+}
+
 /// Evaluate a DE-9IM predicate between two geometries. Correct for all geometry-type pairs.
 ///
 /// Wrapped in `catch_unwind` so that a panic on degenerate input (e.g. a self-intersecting
-/// ring triggering a bug in the `geo` relate implementation) yields `false` rather than
-/// unwinding the compute thread — consistent with the catch_unwind convention used by
-/// buffer, BooleanOps, convexhull, and simplify in this crate.
-pub fn relate_pred(a: &Geometry, b: &Geometry, pred: RelatePred) -> bool {
+/// ring triggering a bug in the `geo` relate implementation) does not unwind the compute
+/// thread. A panic yields `None` (a null result), never a guessed `false` — otherwise
+/// `st_intersects` and `st_disjoint` could both be false for the same pair.
+pub fn relate_pred(a: &Geometry, b: &Geometry, pred: RelatePred) -> Option<bool> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(fast) = point_fast_path(a, b, pred) {
+            return fast;
+        }
+        if let Some(fast) = vertex_fast_path(a, b, pred) {
             return fast;
         }
         let m = a.relate(b); // geo 0.33: Geometry: Relate -> IntersectionMatrix
@@ -94,7 +125,7 @@ pub fn relate_pred(a: &Geometry, b: &Geometry, pred: RelatePred) -> bool {
             RelatePred::CoveredBy => m.is_coveredby(),
         }
     }))
-    .unwrap_or(false)
+    .ok()
 }
 
 #[cfg(test)]
@@ -102,6 +133,10 @@ mod tests {
     use super::*;
     use geo::relate::Relate;
     use geo::{Geometry, MultiPolygon, Point, Polygon, LineString, Coord};
+
+    fn rp(a: &Geometry, b: &Geometry, pred: RelatePred) -> bool {
+        relate_pred(a, b, pred).expect("relate should not panic on these inputs")
+    }
 
     fn square() -> Geometry {
         // unit square (0,0)-(2,2)
@@ -262,14 +297,14 @@ mod tests {
         let poly = square();
         let boundary = Geometry::Point(Point::new(0.0, 1.0));
         let inside = Geometry::Point(Point::new(1.0, 1.0));
-        assert!(!relate_pred(&poly, &boundary, RelatePred::Contains));
-        assert!(relate_pred(&poly, &boundary, RelatePred::Covers));
-        assert!(relate_pred(&poly, &boundary, RelatePred::Intersects));
-        assert!(!relate_pred(&poly, &boundary, RelatePred::Disjoint));
-        assert!(relate_pred(&poly, &inside, RelatePred::Contains));
-        assert!(relate_pred(&inside, &poly, RelatePred::Within));
-        assert!(!relate_pred(&boundary, &poly, RelatePred::Within));
-        assert!(relate_pred(&boundary, &poly, RelatePred::CoveredBy));
+        assert!(!rp(&poly, &boundary, RelatePred::Contains));
+        assert!(rp(&poly, &boundary, RelatePred::Covers));
+        assert!(rp(&poly, &boundary, RelatePred::Intersects));
+        assert!(!rp(&poly, &boundary, RelatePred::Disjoint));
+        assert!(rp(&poly, &inside, RelatePred::Contains));
+        assert!(rp(&inside, &poly, RelatePred::Within));
+        assert!(!rp(&boundary, &poly, RelatePred::Within));
+        assert!(rp(&boundary, &poly, RelatePred::CoveredBy));
     }
 
     #[test]
@@ -278,17 +313,17 @@ mod tests {
         let inside = Geometry::Point(Point::new(1.0, 1.0));
         // previously st_contains returned false for Polygon/Point only via hand-coding;
         // relate must handle it and within is the mirror.
-        assert!(relate_pred(&poly, &inside, RelatePred::Contains));
-        assert!(relate_pred(&inside, &poly, RelatePred::Within));
-        assert!(!relate_pred(&inside, &poly, RelatePred::Contains));
+        assert!(rp(&poly, &inside, RelatePred::Contains));
+        assert!(rp(&inside, &poly, RelatePred::Within));
+        assert!(!rp(&inside, &poly, RelatePred::Contains));
     }
 
     #[test]
     fn test_disjoint_is_not_intersects() {
         let poly = square();
         let far = Geometry::Point(Point::new(100.0, 100.0));
-        assert!(relate_pred(&poly, &far, RelatePred::Disjoint));
-        assert!(!relate_pred(&poly, &far, RelatePred::Intersects));
+        assert!(rp(&poly, &far, RelatePred::Disjoint));
+        assert!(!rp(&poly, &far, RelatePred::Intersects));
     }
 
     #[test]
@@ -298,7 +333,7 @@ mod tests {
         let line = Geometry::LineString(LineString(vec![
             Coord { x: -1.0, y: 1.0 }, Coord { x: 3.0, y: 1.0 },
         ]));
-        assert!(relate_pred(&poly, &line, RelatePred::Intersects));
+        assert!(rp(&poly, &line, RelatePred::Intersects));
     }
 
     #[test]
@@ -306,11 +341,111 @@ mod tests {
         let poly = square(); // (0,0)-(2,2)
         // Boundary point: contained-by-covers but NOT contains (interior only).
         let boundary = Geometry::Point(Point::new(0.0, 1.0));
-        assert!(relate_pred(&poly, &boundary, RelatePred::Covers));
-        assert!(relate_pred(&boundary, &poly, RelatePred::CoveredBy));
-        assert!(!relate_pred(&poly, &boundary, RelatePred::Contains)); // interior-only
+        assert!(rp(&poly, &boundary, RelatePred::Covers));
+        assert!(rp(&boundary, &poly, RelatePred::CoveredBy));
+        assert!(!rp(&poly, &boundary, RelatePred::Contains)); // interior-only
         // A far point is neither covered nor covering.
         let far = Geometry::Point(Point::new(100.0, 100.0));
-        assert!(!relate_pred(&poly, &far, RelatePred::Covers));
+        assert!(!rp(&poly, &far, RelatePred::Covers));
+    }
+
+    // ── Vertex fast-path tests ────────────────────────────────────────────
+
+    /// A closed polygon ring through `pts`.
+    fn ring(pts: &[(f64, f64)]) -> Geometry {
+        let mut c: Vec<Coord> = pts.iter().map(|&(x, y)| Coord { x, y }).collect();
+        c.push(c[0]);
+        Geometry::Polygon(Polygon::new(LineString(c), vec![]))
+    }
+
+    /// A regular n-gon of radius r around (cx, cy): a buffer / isochrone stand-in.
+    fn ngon(cx: f64, cy: f64, r: f64, n: usize) -> Geometry {
+        let pts: Vec<(f64, f64)> = (0..n)
+            .map(|i| {
+                let t = std::f64::consts::TAU * i as f64 / n as f64;
+                (cx + r * t.cos(), cy + r * t.sin())
+            })
+            .collect();
+        ring(&pts)
+    }
+
+    #[test]
+    fn vertex_fast_path_agrees_with_relate_matrix() {
+        // Every relation the join meets: inside, containing, crossing, sharing an
+        // edge, touching at a corner, disjoint inside the bbox, inside a hole,
+        // around a hole, multi-part, empty and degenerate (zero-area) operands.
+        let big = ngon(0.0, 0.0, 10.0, 64);
+        let holed = holed_square();
+        let mut geoms = vec![
+            big.clone(),
+            ngon(0.0, 0.0, 1.0, 16),                                    // inside big
+            ngon(10.0, 0.0, 1.0, 16),                                   // crosses big's boundary
+            ring(&[(9.0, 9.0), (10.0, 9.0), (10.0, 10.0), (9.0, 10.0)]), // in big's bbox corner, outside big
+            square(),
+            ring(&[(2.0, 0.0), (4.0, 0.0), (4.0, 2.0), (2.0, 2.0)]),     // shares an edge with square
+            ring(&[(2.0, 2.0), (3.0, 2.0), (3.0, 3.0), (2.0, 3.0)]),     // touches square at a corner
+            ring(&[(-1.0, -1.0), (3.0, -1.0), (3.0, 3.0), (-1.0, 3.0)]), // contains square, no shared vertex
+            ring(&[(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]),                 // zero-area polygon
+            Geometry::Polygon(Polygon::new(LineString(vec![]), vec![])), // empty
+            Geometry::MultiPolygon(MultiPolygon(vec![
+                Polygon::new(LineString(vec![Coord { x: 30.0, y: 30.0 }, Coord { x: 31.0, y: 30.0 }, Coord { x: 31.0, y: 31.0 }, Coord { x: 30.0, y: 30.0 }]), vec![]),
+                Polygon::new(LineString(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 0.5, y: 0.0 }, Coord { x: 0.5, y: 0.5 }, Coord { x: 0.0, y: 0.0 }]), vec![]),
+            ])),
+            Geometry::LineString(LineString(vec![Coord { x: -20.0, y: 0.5 }, Coord { x: 20.0, y: 0.5 }])), // crosses everything near y=0.5
+        ];
+        geoms.push(holed);
+        geoms.extend(containers());
+        for a in &geoms {
+            for b in &geoms {
+                for pred in [RelatePred::Intersects, RelatePred::Disjoint] {
+                    if let Some(fast) = vertex_fast_path(a, b, pred) {
+                        assert_eq!(fast, relate_baseline(a, b, pred), "{pred:?} disagrees for\n  a = {a:?}\n  b = {b:?}");
+                    }
+                    assert_eq!(rp(a, b, pred), relate_baseline(a, b, pred), "{pred:?} for\n  a = {a:?}\n  b = {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vertex_fast_path_only_answers_intersects_and_disjoint() {
+        let big = ngon(0.0, 0.0, 10.0, 64);
+        let small = ngon(0.0, 0.0, 1.0, 16);
+        assert_eq!(vertex_fast_path(&big, &small, RelatePred::Intersects), Some(true));
+        assert_eq!(vertex_fast_path(&small, &big, RelatePred::Disjoint), Some(false));
+        for pred in [RelatePred::Contains, RelatePred::Within, RelatePred::Covers, RelatePred::Touches] {
+            assert_eq!(vertex_fast_path(&big, &small, pred), None);
+        }
+        // A pair whose vertices are all outside the other proves nothing: defer to relate.
+        let corner = ring(&[(9.0, 9.0), (10.0, 9.0), (10.0, 10.0), (9.0, 10.0)]);
+        assert_eq!(vertex_fast_path(&big, &corner, RelatePred::Intersects), None);
+    }
+
+    /// Timing of the case that dominates the adjacency join: a detailed isochrone
+    /// against the small polygons it covers. `cargo test -p daft-geo --release
+    /// vertex_fast_path_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn vertex_fast_path_bench() {
+        let iso = ngon(0.0, 0.0, 10.0, 4000);
+        let das: Vec<Geometry> = (0..400)
+            .map(|i| ngon(-7.0 + 0.035 * i as f64, 0.0, 0.03, 200))
+            .collect();
+        let edge: Vec<Geometry> = (0..400)
+            .map(|i| {
+                let t = std::f64::consts::TAU * i as f64 / 400.0;
+                ngon(10.0 * t.cos(), 10.0 * t.sin(), 0.03, 200)
+            })
+            .collect();
+        for (name, set) in [("inside", &das), ("crossing boundary", &edge)] {
+            let t0 = std::time::Instant::now();
+            let n_relate = set.iter().filter(|d| relate_baseline(&iso, d, RelatePred::Intersects)).count();
+            let t_relate = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let n_fast = set.iter().filter(|d| rp(&iso, d, RelatePred::Intersects)).count();
+            let t_fast = t1.elapsed();
+            assert_eq!(n_relate, n_fast);
+            println!("{name}: relate {t_relate:?}, relate_pred {t_fast:?} ({:.1}x) for {} pairs", t_relate.as_secs_f64() / t_fast.as_secs_f64(), set.len());
+        }
     }
 }
