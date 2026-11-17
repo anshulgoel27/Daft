@@ -7,7 +7,7 @@ use daft_dsl::{
     ExprRef,
     functions::{FunctionArgs, ScalarUDF, scalar::ScalarFn},
 };
-use geo::{Centroid, Geometry};
+use geo::{Geometry, Point};
 use serde::{Deserialize, Serialize};
 
 use crate::utils::validate_geometry_field;
@@ -28,8 +28,9 @@ impl ScalarUDF for StCentroid {
     ) -> DaftResult<Series> {
         use crate::utils::unary_geom_to_geom;
 
+        // GEOS's algorithm, so results match PostGIS `ST_Centroid` bit for bit.
         unary_geom_to_geom(inputs.required(0)?, self.name(), |g| {
-            g.centroid().map(|pt| Geometry::Point(pt))
+            crate::geos_points::centroid(g).map(|c| Geometry::Point(Point(c)))
         })
     }
 
@@ -43,7 +44,9 @@ impl ScalarUDF for StCentroid {
     }
 
     fn docstring(&self) -> &'static str {
-        "Returns the geometric centroid (center of mass) of a geometry as a Point."
+        "Returns the geometric centroid (center of mass) of a geometry as a Point, computed \
+         as GEOS/PostGIS ST_Centroid computes it: area-weighted for polygons, else \
+         length-weighted for lines, else the mean of the points."
     }
 }
 

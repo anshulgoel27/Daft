@@ -5,18 +5,18 @@ use daft_dsl::{
     ExprRef,
     functions::{FunctionArgs, ScalarUDF, scalar::ScalarFn},
 };
-use geo::{Geometry, InteriorPoint};
+use geo::{Geometry, Point};
 use serde::{Deserialize, Serialize};
 
 use crate::utils::{unary_geom_to_geom, validate_geometry_field};
 
 /// Compute a representative point guaranteed to lie on the geometry's surface.
 ///
-/// Backed by `geo::InteriorPoint`, which returns `Option<Point>` — `None` for
-/// empty geometries. Unlike the centroid, the returned point is always on the
-/// geometry itself (matching PostGIS `ST_PointOnSurface`).
+/// A port of GEOS `Geometry::getInteriorPoint`, so the point is the one PostGIS
+/// `ST_PointOnSurface` returns, bit for bit. `None` for empty geometries. Unlike
+/// the centroid, the point is always on the geometry itself.
 fn apply_pointonsurface(g: &Geometry) -> Option<Geometry> {
-    g.interior_point().map(Geometry::Point)
+    crate::geos_points::interior_point(g).map(|c| Geometry::Point(Point(c)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

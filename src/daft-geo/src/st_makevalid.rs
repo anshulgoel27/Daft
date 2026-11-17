@@ -37,7 +37,9 @@ fn apply_makevalid(g: &Geometry) -> Option<Geometry> {
         Some(if is_unchanged(input, &repaired) {
             g.clone()
         } else {
-            areal_geometry(repaired)
+            // The repair computes new vertices (where rings cross) in plain
+            // f64; recompute them as GEOS does so results hash identically.
+            areal_geometry(crate::overlay::snap_to_input(g, repaired))
         })
     }));
     result.ok().flatten()
@@ -127,4 +129,39 @@ impl ScalarUDF for StMakeValid {
 #[must_use]
 pub fn st_makevalid(geom: ExprRef) -> ExprRef {
     ScalarFn::builtin(StMakeValid, vec![geom]).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use geo::{CoordsIter, Geometry};
+    use wkt::TryFromWkt;
+
+    use super::apply_makevalid;
+
+    fn vertex_bits(g: &Geometry) -> Vec<(u64, u64)> {
+        let mut v: Vec<(u64, u64)> = g
+            .coords_iter()
+            .map(|c| (c.x.to_bits(), c.y.to_bits()))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// The crossing of a bowtie is GEOS's (PostGIS 3.5.4 / GEOS 3.14.1
+    /// `ST_MakeValid`), not plain f64's `38.90095`.
+    #[test]
+    fn bowtie_crossing_matches_geos() {
+        let bowtie = Geometry::try_from_wkt_str(
+            "POLYGON((-77.007 38.9006,-77.0061 38.9013,-77.0061 38.9006,-77.007 38.9013,-77.007 38.9006))",
+        )
+        .unwrap();
+        let geos = Geometry::try_from_wkt_str(
+            "MULTIPOLYGON(((-77.00655 38.900949999999995,-77.0061 38.9013,-77.0061 38.9006,-77.00655 38.900949999999995)),\
+             ((-77.007 38.9006,-77.007 38.9013,-77.00655 38.900949999999995,-77.007 38.9006)))",
+        )
+        .unwrap();
+        let out = apply_makevalid(&bowtie).unwrap();
+        assert_eq!(vertex_bits(&out), vertex_bits(&geos), "{out:?}");
+    }
 }

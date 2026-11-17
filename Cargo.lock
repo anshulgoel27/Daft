@@ -3062,6 +3062,7 @@ dependencies = [
  "geohash",
  "geojson",
  "h3o",
+ "i_overlay",
  "ordered-float",
  "rstar 0.13.0",
  "serde",

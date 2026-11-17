@@ -3,6 +3,8 @@ use daft_dsl::functions::FunctionModule;
 pub mod great_circle_distance;
 pub mod h3_index;
 pub mod mbr;
+mod crossing;
+mod geos_points;
 mod overlay;
 pub mod relate;
 pub mod st_area;

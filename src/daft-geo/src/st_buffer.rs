@@ -23,7 +23,9 @@ use crate::utils::{read_f64_arg, read_f64_arg_expr, unary_geom_to_geom, validate
 /// - **LineString / MultiLineString**: a corridor with round caps; `distance <= 0`
 ///   gives EMPTY.
 /// - **Polygon / MultiPolygon**: an outward (or, for negative distances, inward)
-///   offset. An inward offset that consumes the polygon gives EMPTY.
+///   offset. An inward offset that consumes the polygon gives EMPTY. A zero
+///   distance dissolves the polygons and keeps every input vertex exact, as
+///   GEOS does.
 /// - **GeometryCollection**: the union of its members' buffers.
 ///
 /// A single-part result is a `Polygon`, otherwise a `MultiPolygon` (EMPTY when
@@ -49,6 +51,11 @@ fn apply_buffer(g: &Geometry, distance: f64) -> Option<Geometry> {
         return Some(Geometry::MultiPolygon(geo::MultiPolygon::empty()));
     }
 
+    // A zero buffer only dissolves the polygons; i_overlay's outline would
+    // move every vertex onto its grid, so use the exact overlay path instead.
+    if distance == 0.0 {
+        return crate::overlay::dissolve_areas(g.clone()).map(crate::overlay::areal_geometry);
+    }
     let mp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.buffer(distance))).ok()?;
     Some(crate::overlay::areal_geometry(mp))
 }
@@ -132,5 +139,42 @@ mod tests {
         // Result should have larger area than the unit square (area = 1)
         let a = buf.unsigned_area();
         assert!(a > 1.0, "buffered polygon area {a} should exceed unit square area");
+    }
+
+    /// `ST_Buffer(g, 0)` in PostGIS 3.5.4 / GEOS 3.14.1 keeps every input vertex
+    /// (collinear ones too) and dissolves touching parts, keeping their nodes.
+    #[test]
+    fn zero_buffer_keeps_input_vertices_exact() {
+        use std::str::FromStr;
+        let vertex_set = |g: &Geometry| {
+            use geo::CoordsIter;
+            let mut v: Vec<(u64, u64)> = g
+                .coords_iter()
+                .map(|c| (c.x.to_bits(), c.y.to_bits()))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let parse =
+            |w: &str| -> Geometry { wkt::Wkt::<f64>::from_str(w).unwrap().try_into().unwrap() };
+        for (input, geos) in [
+            (
+                "POLYGON((-77.0073 38.9004,-77.0067 38.9004,-77.0067 38.9006,-77.0073 38.9006,-77.0073 38.9004))",
+                "POLYGON((-77.0073 38.9004,-77.0073 38.9006,-77.0067 38.9006,-77.0067 38.9004,-77.0073 38.9004))",
+            ),
+            (
+                "POLYGON((0 0,5 0,10 0,10 10,0 10,0 0))",
+                "POLYGON((0 0,0 10,10 10,10 0,5 0,0 0))",
+            ),
+            (
+                "MULTIPOLYGON(((0 0,1 0,1 1,0 1,0 0)),((1 0,2 0,2 1,1 1,1 0)))",
+                "POLYGON((0 0,0 1,1 1,2 1,2 0,1 0,0 0))",
+            ),
+        ] {
+            let out = apply_buffer(&parse(input), 0.0).unwrap();
+            assert!(matches!(out, Geometry::Polygon(_)), "{out:?}");
+            assert_eq!(vertex_set(&out), vertex_set(&parse(geos)), "{input}");
+        }
     }
 }

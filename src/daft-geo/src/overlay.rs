@@ -2,9 +2,12 @@
 //! and `st_symdifference`.
 //!
 //! - **Areal × areal** goes through `geo::BooleanOps` (i_overlay), followed by
-//!   snapping so that output vertices which came from an input are
-//!   bit-identical to it (i_overlay rounds everything to an integer grid sized
-//!   by the inputs' extent).
+//!   snapping (i_overlay rounds everything to an integer grid sized and
+//!   centred by the inputs' extent): output vertices which came from an input
+//!   are made bit-identical to it, and new vertices where an edge of one input
+//!   crosses an edge of the other are recomputed from those two segments
+//!   exactly as GEOS computes them ([`crate::crossing`]). Results therefore do
+//!   not depend on the grid, and match GEOS.
 //! - **Lines** are noded against the other input's lines (split at crossings
 //!   and at the ends of shared segments), so line × line results follow GEOS:
 //!   shared parts are found exactly, and results are split at the nodes.
@@ -29,6 +32,8 @@ use geo::{
     line_intersection::{LineIntersection, line_intersection},
     unary_union,
 };
+
+use crate::crossing::proper_crossing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OverlayOp {
@@ -58,6 +63,9 @@ pub(crate) struct Prepared {
     /// R-tree of the polygon rings, for large polygonal operands only (built
     /// once per broadcast literal); enables the disjoint/contained fast path.
     rings: Option<Segs>,
+    /// R-tree of all ring and line segments, built on first use by the
+    /// snapper (once per broadcast literal) when a result has a crossing vertex.
+    segs: std::sync::OnceLock<Segs>,
 }
 
 /// Polygonal operands with more ring segments than this get a ring index.
@@ -74,7 +82,13 @@ impl Prepared {
         // outside. Dissolve them first (unary_union uses the non-zero rule). A
         // MultiPolygon is kept as-is: an overlapping one is invalid input.
         if matches!(geom, Geometry::GeometryCollection(_)) && parts.areas.0.len() > 1 {
-            let snap = Snapper::new(rect, None, &coords, &[]);
+            let rings = segments(&boundary_lines(&parts.areas));
+            let snap = Snapper::new(
+                rect,
+                None,
+                [&coords, &[]],
+                [Some(SegSource::Ready(&rings)), None],
+            );
             parts.areas = snap.snap(unary_union(parts.areas.0.iter()));
         }
         let areal = is_areal_type(&geom);
@@ -88,13 +102,63 @@ impl Prepared {
             coords,
             areal,
             rings,
+            segs: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Every ring and line segment of this operand, R-tree indexed.
+    fn segs(&self) -> &Segs {
+        // `rings` exists only for polygon-only operands, where it is all the linework.
+        if let Some(rings) = &self.rings {
+            return rings;
+        }
+        self.segs.get_or_init(|| {
+            let mut lines = boundary_lines(&self.parts.areas);
+            lines.extend(self.parts.lines.iter().cloned());
+            segments(&lines)
+        })
     }
 }
 
 /// Run `op` on two prepared geometries. Returns `None` if the engine panics.
 pub(crate) fn overlay(a: &Prepared, b: &Prepared, op: OverlayOp) -> Option<Geometry> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| overlay_inner(a, b, op))).ok()
+}
+
+/// The union of `g`'s polygons (overlaps and shared edges dissolved) with every
+/// input vertex kept exact, as GEOS returns `buffer(g, 0)`. Returns `None` if
+/// the engine panics.
+pub(crate) fn dissolve_areas(g: Geometry) -> Option<MultiPolygon> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let p = Prepared::new(g);
+        let snap = Snapper::new(
+            p.rect,
+            None,
+            [&p.coords, &[]],
+            [Some(SegSource::Lazy(&p)), None],
+        );
+        snap.snap_areal(boolean_op(
+            &p.parts.areas,
+            &MultiPolygon::empty(),
+            OverlayOp::Union,
+        ))
+    }))
+    .ok()
+}
+
+/// Make `out`, an areal result computed from `input` by some other engine, use
+/// exact coordinates: a vertex within rounding distance of an input vertex
+/// becomes that vertex, and one at a crossing of two input segments becomes
+/// the crossing as GEOS computes it (see [`Snapper`]).
+pub(crate) fn snap_to_input(input: &Geometry, out: MultiPolygon) -> MultiPolygon {
+    let p = Prepared::new(input.clone());
+    let snap = Snapper::new(
+        p.rect,
+        None,
+        [&p.coords, &[]],
+        [Some(SegSource::Lazy(&p)), None],
+    );
+    snap.snap_areal(out)
 }
 
 /// True for polygonal geometry types (and collections made only of them).
@@ -263,17 +327,16 @@ fn overlay_inner(a: &Prepared, b: &Prepared, op: OverlayOp) -> Geometry {
         return fast;
     }
     let (pa, pb) = (&a.parts, &b.parts);
-    let snap = Snapper::new(a.rect, b.rect, &a.coords, &b.coords);
+    let snap = Snapper::new(
+        a.rect,
+        b.rect,
+        [&a.coords, &b.coords],
+        [Some(SegSource::Lazy(a)), Some(SegSource::Lazy(b))],
+    );
     let areal_inputs = a.areal && b.areal;
 
     let bool_op = |x: &MultiPolygon, y: &MultiPolygon| -> MultiPolygon {
-        let raw = match op {
-            OverlayOp::Union => x.union(y),
-            OverlayOp::Intersection => x.intersection(y),
-            OverlayOp::Difference => x.difference(y),
-            OverlayOp::SymDifference => x.xor(y),
-        };
-        snap.snap_areal(raw)
+        snap.snap_areal(boolean_op(x, y, op))
     };
     // Parts of `lines` outside (`invert`) or inside `areas`.
     let clip = |lines: Vec<LineString>, areas: &MultiPolygon, invert: bool| -> Vec<LineString> {
@@ -377,6 +440,73 @@ fn overlay_inner(a: &Prepared, b: &Prepared, op: OverlayOp) -> Geometry {
         }
     };
     out.into_geometry(areal_inputs)
+}
+
+/// A coordinate i_overlay can read (orphan-rule newtype).
+#[derive(Clone, Copy)]
+struct OverlayPt(Coord);
+
+impl i_overlay::i_float::float::compatible::FloatPointCompatible<f64> for OverlayPt {
+    fn from_xy(x: f64, y: f64) -> Self {
+        Self(Coord { x, y })
+    }
+
+    fn x(&self) -> f64 {
+        self.0.x
+    }
+
+    fn y(&self) -> f64 {
+        self.0.y
+    }
+}
+
+/// `geo::BooleanOps::boolean_op` (even-odd fill, OGC output), except that
+/// collinear vertices are kept, as GEOS keeps them: every input vertex on the
+/// result's boundary, and every node where the other input touches or crosses
+/// an edge. geo's options drop both, which changes the result's bytes.
+fn boolean_op(x: &MultiPolygon, y: &MultiPolygon, op: OverlayOp) -> MultiPolygon {
+    use i_overlay::{
+        core::{fill_rule::FillRule, overlay_rule::OverlayRule},
+        float::overlay::{FloatOverlay, OverlayOptions},
+    };
+    // i_overlay paths are implicitly closed: drop each ring's closing vertex.
+    let paths = |mp: &MultiPolygon| -> Vec<Vec<OverlayPt>> {
+        mp.iter()
+            .flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()))
+            .map(|r| match r.0.split_last() {
+                Some((_, open)) => open.iter().copied().map(OverlayPt).collect(),
+                None => vec![],
+            })
+            .collect()
+    };
+    let rule = match op {
+        OverlayOp::Union => OverlayRule::Union,
+        OverlayOp::Intersection => OverlayRule::Intersect,
+        OverlayOp::Difference => OverlayRule::Difference,
+        OverlayOp::SymDifference => OverlayRule::Xor,
+    };
+    let options = OverlayOptions {
+        preserve_input_collinear: true,
+        preserve_output_collinear: true,
+        ..OverlayOptions::ogc()
+    };
+    let shapes =
+        FloatOverlay::with_subj_and_clip_custom(&paths(x), &paths(y), options, Default::default())
+            .overlay(rule, FillRule::EvenOdd);
+    MultiPolygon::new(
+        shapes
+            .into_iter()
+            .map(|shape| {
+                let mut rings = shape.into_iter().map(|path| {
+                    let mut ring = LineString::new(path.into_iter().map(|p| p.0).collect());
+                    ring.close();
+                    ring
+                });
+                let exterior = rings.next().unwrap_or_else(LineString::empty);
+                geo::Polygon::new(exterior, rings.collect())
+            })
+            .collect(),
+    )
 }
 
 /// Clips lines by polygons: `(lines, areas, invert)` → the parts outside
@@ -788,24 +918,60 @@ fn dedupe_points(points: &mut Vec<Point>) {
     points.dedup();
 }
 
-/// Snaps overlay output vertices back onto the exact input vertex they were
-/// rounded from.
+/// Where the snapper finds an operand's segments.
+enum SegSource<'a> {
+    /// Built on first use and cached on the operand.
+    Lazy(&'a Prepared),
+    Ready(&'a Segs),
+}
+
+impl SegSource<'_> {
+    fn get(&self) -> &Segs {
+        match self {
+            SegSource::Lazy(p) => p.segs(),
+            SegSource::Ready(s) => s,
+        }
+    }
+}
+
+/// Grid steps a crossing vertex may move per unit of `1 / sin(angle)`.
+const CROSSING_STEPS_PER_SIN: f64 = 2.0;
+/// Cap on how far (in grid steps) a vertex is moved onto a crossing.
+const CROSSING_MAX_STEPS: f64 = 64.0;
+
+/// Makes overlay output vertices independent of i_overlay's grid.
 ///
 /// i_overlay converts coordinates to integers with a power-of-two scale of
-/// `2^(29 - floor(log2(half_extent)))` (`i_float::adapter::FloatPointAdapter`),
-/// so every input vertex moves by up to half a grid step — ~3 mm for a parcel
-/// intersected with a 60°-wide region. Any output vertex within two grid steps
-/// of an input vertex is replaced by that input vertex; new (intersection)
-/// vertices further away are left alone.
+/// `2^(29 - round(log2(half_extent)))`, centred on the inputs' bounding box
+/// (`i_float::adapter::FloatPointAdapter`), so every input vertex moves by up
+/// to half a grid step — ~3 mm for a parcel intersected with a 60°-wide
+/// region — and every crossing lands on the nearest grid point. Each output
+/// vertex is replaced by:
+/// 1. the nearest input vertex within two grid steps, else
+/// 2. the nearest point where two input segments properly cross, computed as
+///    GEOS computes it ([`proper_crossing`]), within the distance rounding can
+///    move that crossing (it grows as the segments get closer to parallel),
+///
+/// and is left alone otherwise.
 struct Snapper<'a> {
+    /// One grid step (an upper bound on i_overlay's).
+    step: f64,
+    /// Radius for snapping to input vertices: two grid steps.
     tolerance: f64,
-    a: &'a [Coord],
-    b: &'a [Coord],
+    /// Each operand's vertices, sorted by x.
+    coords: [&'a [Coord]; 2],
+    /// Each operand's segments, for crossing vertices.
+    segs: [Option<SegSource<'a>>; 2],
 }
 
 impl<'a> Snapper<'a> {
-    /// `a` and `b` must be sorted by x.
-    fn new(ra: Option<Rect>, rb: Option<Rect>, a: &'a [Coord], b: &'a [Coord]) -> Self {
+    /// `coords` must be sorted by x.
+    fn new(
+        ra: Option<Rect>,
+        rb: Option<Rect>,
+        coords: [&'a [Coord]; 2],
+        segs: [Option<SegSource<'a>>; 2],
+    ) -> Self {
         let rect = match (ra, rb) {
             (Some(ra), Some(rb)) => Some(Rect::new(
                 Coord {
@@ -820,22 +986,34 @@ impl<'a> Snapper<'a> {
             (r, None) | (None, r) => r,
         };
         let half = rect.map_or(0.0, |r| r.width().max(r.height()) / 2.0);
-        let tolerance = if half.is_finite() && half > 0.0 {
-            // Twice the grid step: covers the half-step rounding with margin.
-            2f64.powi(half.log2().floor() as i32 - 29) * 2.0
+        let step = if half.is_finite() && half > 0.0 {
+            // i_float rounds log2 half away from zero (`FloatNumber::to_i32`).
+            let log2 = half.log2();
+            2f64.powi((log2 + 0.5f64.copysign(log2)) as i32 - 29)
         } else {
             0.0
         };
-        Self { tolerance, a, b }
+        Self {
+            step,
+            tolerance: 2.0 * step,
+            coords,
+            segs,
+        }
     }
 
     fn snap_coord(&self, c: Coord) -> Coord {
-        if self.tolerance == 0.0 {
+        if self.step == 0.0 {
             return c;
         }
+        self.nearest_vertex(c)
+            .or_else(|| self.nearest_crossing(c))
+            .unwrap_or(c)
+    }
+
+    fn nearest_vertex(&self, c: Coord) -> Option<Coord> {
         let tol = self.tolerance;
         let mut best: Option<(f64, Coord)> = None;
-        for sorted in [self.a, self.b] {
+        for sorted in self.coords {
             let from = sorted.partition_point(|v| v.x < c.x - tol);
             for &cand in sorted[from..].iter().take_while(|v| v.x <= c.x + tol) {
                 let d = (cand.x - c.x).hypot(cand.y - c.y);
@@ -844,30 +1022,88 @@ impl<'a> Snapper<'a> {
                 }
             }
         }
-        best.map_or(c, |(_, cand)| cand)
+        best.map(|(_, cand)| cand)
+    }
+
+    /// The crossing of two input segments that `c` was rounded from, if any.
+    fn nearest_crossing(&self, c: Coord) -> Option<Coord> {
+        let reach = CROSSING_MAX_STEPS * self.step;
+        let probe = Rect::new(
+            Coord {
+                x: c.x - reach,
+                y: c.y - reach,
+            },
+            Coord {
+                x: c.x + reach,
+                y: c.y + reach,
+            },
+        );
+        let near: Vec<Line> = self
+            .segs
+            .iter()
+            .flatten()
+            .flat_map(|s| s.get().near(probe).copied())
+            .collect();
+        let mut best: Option<(f64, Coord)> = None;
+        for (i, &p) in near.iter().enumerate() {
+            for &q in &near[i + 1..] {
+                let Some(x) = proper_crossing(p, q) else {
+                    continue;
+                };
+                let d = (x.x - c.x).hypot(x.y - c.y);
+                if best.is_some_and(|(bd, _)| d >= bd) {
+                    continue;
+                }
+                // Rounding the endpoints by half a step moves the crossing by
+                // up to ~1/sin(angle) steps along the other segment.
+                let (dp, dq) = (p.delta(), q.delta());
+                let sin = (dp.x * dq.y - dp.y * dq.x).abs() / (dp.x.hypot(dp.y) * dq.x.hypot(dq.y));
+                let allowed =
+                    (self.tolerance + CROSSING_STEPS_PER_SIN * self.step / sin).min(reach);
+                if d <= allowed {
+                    best = Some((d, x));
+                }
+            }
+        }
+        best.map(|(_, x)| x)
     }
 
     fn snap<G: MapCoords<f64, f64, Output = G>>(&self, g: G) -> G {
         g.map_coords(|c| self.snap_coord(c))
     }
 
-    /// Snap an areal result. Vertices move by at most two grid steps (~1e-9 of
-    /// the inputs' extent), the same scale as i_overlay's own rounding, so a full
+    /// Snap an areal result. Input vertices move by at most two grid steps
+    /// (~1e-9 of the inputs' extent) and crossings by at most
+    /// `CROSSING_MAX_STEPS`, the scale of i_overlay's own rounding, so a full
     /// validity re-check (super-linear, ~30x the overlay itself on large
     /// polygons) is not run. A ring whose winding flips or area vanishes is the
-    /// one cheap-to-detect failure; then the grid result is kept.
+    /// one cheap-to-detect failure; then that polygon keeps its grid result.
     fn snap_areal(&self, mp: MultiPolygon) -> MultiPolygon {
         let snapped = self.snap(mp.clone());
-        let twice_area = |r: &LineString| -> f64 { r.lines().map(|l| l.determinant()).sum() };
-        let rings_ok = mp.iter().zip(snapped.iter()).all(|(raw, new)| {
-            std::iter::once((raw.exterior(), new.exterior()))
-                .chain(raw.interiors().iter().zip(new.interiors()))
-                .all(|(r, n)| {
-                    let (ra, na) = (twice_area(r), twice_area(n));
-                    na != 0.0 && ra.signum() == na.signum()
-                })
-        });
-        if rings_ok { snapped } else { mp }
+        // Shoelace relative to the ring's first vertex: with raw lon/lat
+        // (~1e2) each term is ~1e4 and its rounding error (~1e-12) swamps the
+        // area of a sliver, so the sign check would reject valid results.
+        let twice_area = |r: &LineString| -> f64 {
+            let Some(&o) = r.0.first() else { return 0.0 };
+            r.lines()
+                .map(|l| (l.start - o).x * (l.end - o).y - (l.end - o).x * (l.start - o).y)
+                .sum()
+        };
+        // Checked per polygon, so one bad part does not leave the others on the grid.
+        let polygons = mp
+            .into_iter()
+            .zip(snapped)
+            .map(|(raw, new)| {
+                let ok = std::iter::once((raw.exterior(), new.exterior()))
+                    .chain(raw.interiors().iter().zip(new.interiors()))
+                    .all(|(r, n)| {
+                        let (ra, na) = (twice_area(r), twice_area(n));
+                        na != 0.0 && ra.signum() == na.signum()
+                    });
+                if ok { new } else { raw }
+            })
+            .collect();
+        MultiPolygon::new(polygons)
     }
 }
 
@@ -1036,6 +1272,75 @@ mod tests {
         assert_eq!(
             lines(run(a.clone(), a, OverlayOp::Union)),
             vec![vec![(0., 0.), (10., 0.)]]
+        );
+    }
+
+    /// Sorted, deduplicated vertex bit patterns of an areal result.
+    fn vertex_bits(g: &Geometry) -> Vec<(u64, u64)> {
+        let mut v: Vec<(u64, u64)> = g.coords_iter().map(bits).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn wkt_geom(w: &str) -> Geometry {
+        use std::str::FromStr;
+        wkt::Wkt::<f64>::from_str(w).unwrap().try_into().unwrap()
+    }
+
+    /// New vertices where an edge of one input crosses an edge of the other are
+    /// exact (GEOS gives the same coordinates), whatever grid i_overlay used.
+    #[test]
+    fn crossing_vertices_are_exact_and_grid_independent() {
+        let p2 = wkt_geom(
+            "POLYGON((-77.008 38.900,-77.007 38.900,-77.007 38.901,-77.008 38.901,-77.008 38.900))",
+        );
+        let p3 = wkt_geom(
+            "POLYGON((-77.007 38.900,-77.006 38.900,-77.006 38.901,-77.007 38.901,-77.007 38.900))",
+        );
+        let straddle = wkt_geom(
+            "POLYGON((-77.0073 38.9004,-77.0067 38.9004,-77.0067 38.9006,-77.0073 38.9006,-77.0073 38.9004))",
+        );
+        let overlap_x = wkt_geom(
+            "POLYGON((-77.0075 38.9001,-77.0065 38.9001,-77.0065 38.9003,-77.0075 38.9003,-77.0075 38.9001))",
+        );
+        let overlap_y = wkt_geom(
+            "POLYGON((-77.0075 38.9001,-77.0068 38.9001,-77.0068 38.9003,-77.0075 38.9003,-77.0075 38.9001))",
+        );
+        let rect = |x0: f64, y0: f64, x1: f64, y1: f64| {
+            let r: Geometry = Rect::new(Coord { x: x0, y: y0 }, Coord { x: x1, y: y1 })
+                .to_polygon()
+                .into();
+            vertex_bits(&r)
+        };
+        let cases = [
+            (&straddle, &p2, rect(-77.0073, 38.9004, -77.007, 38.9006)),
+            (&straddle, &p3, rect(-77.007, 38.9004, -77.0067, 38.9006)),
+            (&overlap_x, &p2, rect(-77.0075, 38.9001, -77.007, 38.9003)),
+            (&overlap_y, &p2, rect(-77.0075, 38.9001, -77.007, 38.9003)),
+        ];
+        for (a, b, want) in cases {
+            for (x, y) in [(a, b), (b, a)] {
+                let out = run(x.clone(), y.clone(), OverlayOp::Intersection);
+                assert_eq!(vertex_bits(&out), want, "{out:?}");
+            }
+        }
+        // Difference and union cut at the same crossings.
+        let diff = run(p2.clone(), overlap_x.clone(), OverlayOp::Difference);
+        assert!(
+            vertex_bits(&diff).contains(&bits(Coord {
+                x: -77.007,
+                y: 38.9003
+            })),
+            "{diff:?}"
+        );
+        let union = run(straddle.clone(), p2.clone(), OverlayOp::Union);
+        assert!(
+            vertex_bits(&union).contains(&bits(Coord {
+                x: -77.007,
+                y: 38.9004
+            })),
+            "{union:?}"
         );
     }
 }
