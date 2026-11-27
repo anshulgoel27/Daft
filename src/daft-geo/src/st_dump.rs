@@ -78,6 +78,7 @@ impl ScalarUDF for StDump {
         offsets.push(0);
 
         for opt in binary.into_iter() {
+            let _row = crate::slow_rows::watch_row(self.name(), opt, None);
             match opt.and_then(|b| parse_wkb(b).ok()) {
                 Some(geom) => {
                     outer_validity.push(true);

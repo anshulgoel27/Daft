@@ -6,6 +6,7 @@ pub mod mbr;
 mod crossing;
 mod geos_points;
 mod overlay;
+mod slow_rows;
 pub mod relate;
 pub mod st_area;
 pub mod st_astext;

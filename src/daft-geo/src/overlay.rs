@@ -939,6 +939,18 @@ const CROSSING_STEPS_PER_SIN: f64 = 2.0;
 /// Cap on how far (in grid steps) a vertex is moved onto a crossing.
 const CROSSING_MAX_STEPS: f64 = 64.0;
 
+/// Euclidean distance from `c` to segment `l`.
+fn point_segment_distance(c: Coord, l: Line) -> f64 {
+    let d = l.delta();
+    let len2 = d.x * d.x + d.y * d.y;
+    let t = if len2 > 0.0 {
+        (((c.x - l.start.x) * d.x + (c.y - l.start.y) * d.y) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (l.start.x + t * d.x - c.x).hypot(l.start.y + t * d.y - c.y)
+}
+
 /// Makes overlay output vertices independent of i_overlay's grid.
 ///
 /// i_overlay converts coordinates to integers with a power-of-two scale of
@@ -1038,11 +1050,20 @@ impl<'a> Snapper<'a> {
                 y: c.y + reach,
             },
         );
+        // A crossing accepted below lies within `reach` of `c` and on both of
+        // its segments, so both pass within `reach` of `c`. The R-tree matches
+        // bounding boxes, and a long diagonal segment's box covers points far
+        // from the segment: on dense inputs thousands of such boxes met the
+        // probe and the pair loop below went O(k^2) per vertex (on pbldg one
+        // cut pair ran for hours). Dropping segments farther than `2 * reach`
+        // (slack for rounding) removes only pairs that are never accepted, so
+        // the result is unchanged.
         let near: Vec<Line> = self
             .segs
             .iter()
             .flatten()
             .flat_map(|s| s.get().near(probe).copied())
+            .filter(|l| point_segment_distance(c, *l) <= 2.0 * reach)
             .collect();
         let mut best: Option<(f64, Coord)> = None;
         for (i, &p) in near.iter().enumerate() {
@@ -1115,6 +1136,18 @@ mod tests {
 
     fn run(a: Geometry, b: Geometry, op: OverlayOp) -> Geometry {
         overlay(&Prepared::new(a), &Prepared::new(b), op).unwrap()
+    }
+
+    #[test]
+    fn point_segment_distance_uses_the_segment_not_its_box() {
+        let diagonal = Line::new(Coord { x: 0.0, y: 0.0 }, Coord { x: 10.0, y: 10.0 });
+        // Inside the segment's bounding box but far from the segment itself.
+        assert!((point_segment_distance(Coord { x: 0.0, y: 10.0 }, diagonal) - 50f64.sqrt()).abs() < 1e-12);
+        assert_eq!(point_segment_distance(Coord { x: 5.0, y: 5.0 }, diagonal), 0.0);
+        // Past an end: distance to that end.
+        assert_eq!(point_segment_distance(Coord { x: 13.0, y: 14.0 }, diagonal), 5.0);
+        let point = Line::new(Coord { x: 1.0, y: 1.0 }, Coord { x: 1.0, y: 1.0 });
+        assert_eq!(point_segment_distance(Coord { x: 4.0, y: 5.0 }, point), 5.0);
     }
 
     #[test]

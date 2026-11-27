@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::slow_rows::watch_row;
 use arrow_buffer::NullBufferBuilder;
 use common_error::{DaftError, DaftResult};
 use daft_core::{
@@ -258,6 +259,7 @@ pub fn unary_geom_to_f64(
     let mut validity = NullBufferBuilder::new(len);
 
     for opt in binary.into_iter() {
+        let _row = watch_row(out_name, opt, None);
         // NaN means "undefined" (e.g. st_x of a non-point): emit null.
         match opt.and_then(|b| parse_wkb(b).ok()).map(|g| f(&g)).filter(|v| !v.is_nan()) {
             Some(v) => {
@@ -291,6 +293,7 @@ pub fn unary_geom_to_bool(
 
     let mut values: Vec<Option<bool>> = Vec::with_capacity(len);
     for opt in binary.into_iter() {
+        let _row = watch_row(out_name, opt, None);
         values.push(opt.and_then(|b| parse_wkb(b).ok()).map(|g| f(&g)));
     }
 
@@ -306,7 +309,10 @@ pub fn unary_geom_to_utf8(
     let binary = get_geometry_binary(series)?;
     let values: Vec<Option<String>> = binary
         .into_iter()
-        .map(|opt| opt.and_then(|b| parse_wkb(b).ok()).map(|g| f(&g)))
+        .map(|opt| {
+            let _row = watch_row(out_name, opt, None);
+            opt.and_then(|b| parse_wkb(b).ok()).map(|g| f(&g))
+        })
         .collect();
 
     Ok(Utf8Array::from_iter(out_name, values.iter().map(|v| v.as_deref())).into_series())
@@ -414,6 +420,7 @@ pub fn unary_geom_to_geom(
     let mut wkb_values: Vec<Option<Vec<u8>>> = Vec::with_capacity(len);
 
     for opt in binary.into_iter() {
+        let _row = watch_row(out_name, opt, None);
         let result = opt
             .and_then(|b| parse_wkb(b).ok())
             .and_then(|g| f(&g))
@@ -440,6 +447,7 @@ pub fn unary_geom_to_list_dump_item(
     offsets.push(0);
 
     for opt in binary.into_iter() {
+        let _row = watch_row(out_name, opt, None);
         let row_result = opt.and_then(|b| parse_wkb(b).ok()).and_then(&f);
         match row_result {
             Some(items) => {
@@ -497,19 +505,27 @@ fn for_each_prepared_pair<T>(
     let scalar = |arr: &BinaryArray| -> Option<Option<T>> {
         (arr.len() == 1 && len != 1).then(|| parse(arr.into_iter().next().flatten()))
     };
+    fn first(arr: &BinaryArray) -> Option<&[u8]> {
+        arr.into_iter().next().flatten()
+    }
     match (scalar(lhs_bin), scalar(rhs_bin)) {
         (Some(lg), _) => {
+            let lbytes = first(lhs_bin);
             for ropt in rhs_bin {
+                let _row = watch_row(out_name, lbytes, ropt);
                 f(lg.as_ref(), parse(ropt).as_ref());
             }
         }
         (None, Some(rg)) => {
+            let rbytes = first(rhs_bin);
             for lopt in lhs_bin {
+                let _row = watch_row(out_name, lopt, rbytes);
                 f(parse(lopt).as_ref(), rg.as_ref());
             }
         }
         (None, None) => {
             for (lopt, ropt) in lhs_bin.into_iter().zip(rhs_bin) {
+                let _row = watch_row(out_name, lopt, ropt);
                 f(parse(lopt).as_ref(), parse(ropt).as_ref());
             }
         }
