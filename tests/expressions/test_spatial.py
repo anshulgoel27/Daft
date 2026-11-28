@@ -240,6 +240,32 @@ def test_geodesic_distance_meters():
     assert abs(df["geo"][0] - 110574.0) < 200.0   # geodesic meters, WGS84 (geo crate)
 
 
+def test_geodesic_area_ignores_ring_winding():
+    # A ~10 m x 11 m lot. Clockwise exteriors (ESRI/shapefile convention) used to
+    # measure the rest of the globe (~5.1e14 m^2).
+    ccw = "POLYGON((-85.9 33.76,-85.8999 33.76,-85.8999 33.7601,-85.9 33.7601,-85.9 33.76))"
+    cw = "POLYGON((-85.9 33.76,-85.9 33.7601,-85.8999 33.7601,-85.8999 33.76,-85.9 33.76))"
+    # 0.002 deg square with a 0.001 deg hole; the hole is wound counter-clockwise
+    # (same as the exterior), so it must still be subtracted.
+    holed = (
+        "POLYGON((-85.9 33.76,-85.898 33.76,-85.898 33.762,-85.9 33.762,-85.9 33.76),"
+        "(-85.8995 33.7605,-85.8985 33.7605,-85.8985 33.7615,-85.8995 33.7615,-85.8995 33.7605))"
+    )
+    solid = "POLYGON((-85.9 33.76,-85.898 33.76,-85.898 33.762,-85.9 33.762,-85.9 33.76))"
+    hole = "POLYGON((-85.8995 33.7605,-85.8985 33.7605,-85.8985 33.7615,-85.8995 33.7615,-85.8995 33.7605))"
+    # The same lot twice, 0.001 deg apart: one part counter-clockwise, one clockwise.
+    multi = (
+        "MULTIPOLYGON(((-85.9 33.76,-85.8999 33.76,-85.8999 33.7601,-85.9 33.7601,-85.9 33.76)),"
+        "((-85.899 33.76,-85.899 33.7601,-85.8989 33.7601,-85.8989 33.76,-85.899 33.76)))"
+    )
+    df = daft.from_pydict({"g": [ccw, cw, holed, solid, hole, multi]})
+    a = df.select(st_area(st_geomfromtext(daft.col("g")), use_spheroid=True).alias("a")).to_pydict()["a"]
+    assert 90 < a[0] < 115
+    assert a[1] == pytest.approx(a[0], rel=1e-9)
+    assert a[2] == pytest.approx(a[3] - a[4], rel=1e-9)
+    assert a[5] == pytest.approx(2 * a[0], rel=1e-9)
+
+
 def test_st_overlaps():
     # Two partially overlapping same-dimension polygons → True
     poly_a = "POLYGON((0 0,2 0,2 2,0 2,0 0))"
@@ -971,6 +997,93 @@ def test_envelope_sql_parity():
     sql_result = daft.sql("SELECT st_astext(st_envelope(st_geomfromtext(g))) AS e FROM df").to_pydict()
     assert "POLYGON" in py_result["e"][0].upper()
     assert py_result["e"][0] == sql_result["e"][0]
+
+
+# ── st_boundary ─────────────────────────────────────────────────────────────
+
+# A lon/lat parcel with a hole: outer -73.99..-73.97 x 40.74..40.76, hole
+# -73.982..-73.978 x 40.748..40.752.
+_PARCEL_WITH_HOLE = (
+    "POLYGON((-73.99 40.74,-73.97 40.74,-73.97 40.76,-73.99 40.76,-73.99 40.74),"
+    "(-73.982 40.748,-73.978 40.748,-73.978 40.752,-73.982 40.752,-73.982 40.748))"
+)
+
+
+def _edge_distance(points, polygon=_PARCEL_WITH_HOLE):
+    from daft.functions import st_boundary
+
+    df = daft.from_pydict({"p": points, "g": [polygon] * len(points)})
+    return df.select(
+        st_distance(
+            st_geomfromtext(daft.col("p")),
+            st_boundary(st_geomfromtext(daft.col("g"))),
+            use_spheroid=True,
+        ).alias("d"),
+        st_distance(st_geomfromtext(daft.col("p")), st_geomfromtext(daft.col("g"))).alias("inside"),
+    ).to_pydict()
+
+
+def _metres(a, b):
+    df = daft.from_pydict({"a": [a], "b": [b]})
+    return df.select(
+        st_distance(st_geomfromtext(daft.col("a")), st_geomfromtext(daft.col("b")), use_spheroid=True).alias("d")
+    ).to_pydict()["d"][0]
+
+
+def test_boundary_gives_metre_distance_to_nearest_edge_from_inside():
+    # Inside, 0.0025° of longitude west of the east edge; the hole is 0.0055° away.
+    out = _edge_distance(["POINT(-73.9725 40.75)"])
+    assert out["inside"] == [0.0]  # why st_boundary is needed
+    want = _metres("POINT(-73.9725 40.75)", "POINT(-73.97 40.75)")
+    assert 200 < want < 225
+    assert out["d"][0] == pytest.approx(want, rel=1e-4)
+
+
+def test_boundary_counts_holes_as_edges():
+    # 0.0005° west of the hole's west edge; the outer ring is >= 0.0075° away.
+    out = _edge_distance(["POINT(-73.9825 40.75)"])
+    want = _metres("POINT(-73.9825 40.75)", "POINT(-73.982 40.75)")
+    assert 35 < want < 50
+    assert out["d"][0] == pytest.approx(want, rel=1e-4)
+
+
+def test_boundary_point_on_edge_is_zero():
+    out = _edge_distance(["POINT(-73.97 40.75)", "POINT(-73.98 40.748)", "POINT(-73.99 40.74)"])
+    assert out["d"] == [0.0, 0.0, 0.0]
+
+
+def test_boundary_rings_and_nulls():
+    from daft.functions import st_astext, st_boundary
+
+    wkts = [
+        "POLYGON((0 0,4 0,4 4,0 4,0 0),(1 1,2 1,2 2,1 1))",
+        "POLYGON((0 0,1 0,1 1,0 0))",
+        "MULTIPOLYGON(((0 0,1 0,1 1,0 0)),((5 5,6 5,6 6,5 5),(5.2 5.1,5.8 5.1,5.8 5.7,5.2 5.1)))",
+        "POINT(1 1)",
+        "LINESTRING(0 0,1 1)",
+        "POLYGON EMPTY",
+        None,
+    ]
+    df = daft.from_pydict({"g": wkts})
+    got = df.select(st_astext(st_boundary(st_geomfromtext(daft.col("g")))).alias("b")).to_pydict()["b"]
+    assert got == [
+        "MULTILINESTRING((0 0,4 0,4 4,0 4,0 0),(1 1,2 1,2 2,1 1))",
+        "MULTILINESTRING((0 0,1 0,1 1,0 0))",
+        "MULTILINESTRING((0 0,1 0,1 1,0 0),(5 5,6 5,6 6,5 5),(5.2 5.1,5.8 5.1,5.8 5.7,5.2 5.1))",
+        None,
+        None,
+        None,
+        None,
+    ]
+    sql = daft.sql("SELECT st_astext(st_boundary(st_geomfromtext(g))) AS b FROM df").to_pydict()["b"]
+    assert sql == got
+
+
+def test_boundary_unparseable_wkb_is_null():
+    from daft.functions import st_boundary
+
+    df = daft.from_pydict({"g": [b"\x00\x01\x02", None]})
+    assert df.select(st_boundary(daft.col("g")).alias("b")).to_pydict()["b"] == [None, None]
 
 
 def test_st_bbox_sql_parity():

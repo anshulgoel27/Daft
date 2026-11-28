@@ -91,6 +91,7 @@ Legend: **P** = Python, **S** = SQL.
 | Function | Signature (Python) | P | S | Description |
 |---|---|:-:|:-:|---|
 | `st_envelope` | `st_envelope(geom)` | ✅ | ✅ | Minimum bounding rectangle as a polygon. |
+| `st_boundary` | `st_boundary(geom)` | ✅ | ✅ | Rings of a Polygon/MultiPolygon as a MultiLineString (exterior then holes). `st_distance(point, st_boundary(poly), use_spheroid=True)` gives metres to the nearest edge for a point inside. Null for non-polygonal or malformed input. |
 | `st_convexhull` | `st_convexhull(geom)` | ✅ | ✅ | Convex hull polygon. |
 | `st_simplify` | `st_simplify(geom, tolerance)` | ✅ | ✅ | Ramer–Douglas–Peucker simplification. |
 | `st_buffer` | `st_buffer(geom, distance)` | ✅ | ✅ | Planar buffer by `distance`. |

@@ -9,7 +9,7 @@ geohash = {workspace = true}
 geojson = {workspace = true}
 h3o = {workspace = true}
 # Same version geo's BooleanOps uses; called directly to set overlay options.
-i_overlay = {version = "4.5.2", default-features = false}
+i_overlay = {version = "9.2.1", default-features = false}
 wkt = {workspace = true}
 ordered-float = {workspace = true}
 rstar = {workspace = true}

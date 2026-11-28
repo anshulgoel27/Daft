@@ -3,9 +3,28 @@ use daft_core::{prelude::{DataType, Field, Schema}, series::Series};
 use daft_dsl::{ExprRef, functions::{FunctionArgs, ScalarUDF, scalar::ScalarFn}};
 use geo::Area;
 use geo::algorithm::geodesic_area::GeodesicArea;
+use geo::orient::{Direction, Orient};
+use geo::{Geometry, Polygon};
 use serde::{Deserialize, Serialize};
 
 use crate::utils::{unary_geom_to_f64, validate_geometry_field, read_bool_arg, read_bool_arg_expr};
+
+/// WGS84 geodesic area in m², independent of ring winding.
+///
+/// geo's unsigned geodesic area takes a clockwise exterior ring to enclose the
+/// rest of the globe, so a clockwise (ESRI/shapefile-wound) building measured
+/// ~5.1e14 m². Each polygon is re-wound to the Simple Features order (exterior
+/// counter-clockwise, holes clockwise) first, so its smaller side is measured,
+/// as PostGIS `ST_Area(geography)` does.
+fn geodesic_area_m2(g: &Geometry) -> f64 {
+    let poly = |p: &Polygon| p.orient(Direction::Default).geodesic_area_unsigned();
+    match g {
+        Geometry::Polygon(p) => poly(p),
+        Geometry::MultiPolygon(mp) => mp.iter().map(poly).sum(),
+        Geometry::GeometryCollection(gc) => gc.iter().map(geodesic_area_m2).sum(),
+        _ => 0.0,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct StArea;
@@ -18,7 +37,7 @@ impl ScalarUDF for StArea {
         let use_spheroid = read_bool_arg(&inputs, 1, "use_spheroid", self.name())?;
         unary_geom_to_f64(inputs.required(0)?, self.name(), |g| {
             if use_spheroid {
-                g.geodesic_area_unsigned()
+                geodesic_area_m2(g)
             } else {
                 g.unsigned_area()
             }

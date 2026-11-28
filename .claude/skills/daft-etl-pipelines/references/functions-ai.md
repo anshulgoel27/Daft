@@ -101,6 +101,85 @@ Note:
 Returns:
     Expression (Embedding Expression): An expression representing the embedded text vectors.
 
+## jev
+
+```python
+jev(row: Expression, condition: str, threshold: float=0.5, *, model: str | None=None, api_key: str | None=None, base_url: str | None=None, timeout: float=60.0) -> Expression
+```
+
+Whether each row satisfies a plain-English condition, i.e. `jev_prob(row, condition) >= threshold`.
+
+Args:
+    row (Expression): The value to judge. Pass `to_struct(...)` to judge several columns; field names are visible to the model.
+    condition (str): A plain-English condition, e.g. "the name is European".
+    threshold (float): The minimum probability that counts as true. Defaults to 0.5.
+    model (str | None): The Jev model. Defaults to `TYPESAFE_DEFAULT_MODEL`, else `jev-latest`.
+    api_key (str | None): TypeSafe API key. Defaults to `TYPESAFE_API_KEY`.
+    base_url (str | None): API root, e.g. to route through a proxy. Defaults to `TYPESAFE_BASE_URL`, else `https://api.typesafe.ai`.
+    timeout (float): Seconds allowed for each request, which carries up to 25 rows. Defaults to 60.
+
+Returns:
+    Expression: A Boolean, or null where `row` is null.
+
+## jev_choice
+
+```python
+jev_choice(row: Expression, question: str, options: list[str], *, model: str | None=None, api_key: str | None=None, base_url: str | None=None, timeout: float=60.0) -> Expression
+```
+
+The most probable of `options` as the answer to `question` for each row.
+
+Args:
+    row (Expression): The value to classify. Pass `to_struct(...)` to classify on several columns.
+    question (str): A plain-English question, e.g. "which team should handle this?".
+    options (list[str]): Between 1 and 255 distinct candidate answers; duplicates are dropped.
+    model (str | None): The Jev model. Defaults to `TYPESAFE_DEFAULT_MODEL`, else `jev-latest`.
+    api_key (str | None): TypeSafe API key. Defaults to `TYPESAFE_API_KEY`.
+    base_url (str | None): API root, e.g. to route through a proxy. Defaults to `TYPESAFE_BASE_URL`, else `https://api.typesafe.ai`.
+    timeout (float): Seconds allowed for each request, which carries up to 25 rows. Defaults to 60.
+
+Returns:
+    Expression: A String drawn from `options`, or null where `row` is null.
+
+## jev_prob
+
+```python
+jev_prob(row: Expression, condition: str, *, model: str | None=None, api_key: str | None=None, base_url: str | None=None, timeout: float=60.0) -> Expression
+```
+
+Probability that each row satisfies a plain-English condition.
+
+Args:
+    row (Expression): The value to judge. Pass `to_struct(...)` to judge several columns; field names are visible to the model.
+    condition (str): A plain-English condition, e.g. "the customer is angry".
+    model (str | None): The Jev model. Defaults to `TYPESAFE_DEFAULT_MODEL`, else `jev-latest`.
+    api_key (str | None): TypeSafe API key. Defaults to `TYPESAFE_API_KEY`.
+    base_url (str | None): API root, e.g. to route through a proxy. Defaults to `TYPESAFE_BASE_URL`, else `https://api.typesafe.ai`.
+    timeout (float): Seconds allowed for each request, which carries up to 25 rows. Defaults to 60.
+
+Returns:
+    Expression: A Float64 probability in [0, 1], or null where `row` is null.
+
+## jev_score
+
+```python
+jev_score(row: Expression, question: str, levels: list[str], *, model: str | None=None, api_key: str | None=None, base_url: str | None=None, timeout: float=60.0) -> Expression
+```
+
+Where each row falls on an ordered rubric, as a probability-weighted level index.
+
+Args:
+    row (Expression): The value to score. Pass `to_struct(...)` to score on several columns.
+    question (str): A plain-English question, e.g. "how luxurious is this product?".
+    levels (list[str]): Between 2 and 10 rubric levels, lowest first.
+    model (str | None): The Jev model. Defaults to `TYPESAFE_DEFAULT_MODEL`, else `jev-latest`.
+    api_key (str | None): TypeSafe API key. Defaults to `TYPESAFE_API_KEY`.
+    base_url (str | None): API root, e.g. to route through a proxy. Defaults to `TYPESAFE_BASE_URL`, else `https://api.typesafe.ai`.
+    timeout (float): Seconds allowed for each request, which carries up to 25 rows. Defaults to 60.
+
+Returns:
+    Expression: A Float64 in [0, len(levels) - 1] that may fall between levels, or null where `row` is null.
+
 ## prompt
 
 ```python

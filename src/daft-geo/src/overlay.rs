@@ -446,7 +446,9 @@ fn overlay_inner(a: &Prepared, b: &Prepared, op: OverlayOp) -> Geometry {
 #[derive(Clone, Copy)]
 struct OverlayPt(Coord);
 
-impl i_overlay::i_float::float::compatible::FloatPointCompatible<f64> for OverlayPt {
+impl i_overlay::i_float::float::compatible::FloatPointCompatible for OverlayPt {
+    type Scalar = f64;
+
     fn from_xy(x: f64, y: f64) -> Self {
         Self(Coord { x, y })
     }
@@ -485,11 +487,13 @@ fn boolean_op(x: &MultiPolygon, y: &MultiPolygon, op: OverlayOp) -> MultiPolygon
         OverlayOp::Difference => OverlayRule::Difference,
         OverlayOp::SymDifference => OverlayRule::Xor,
     };
-    let options = OverlayOptions {
-        preserve_input_collinear: true,
-        preserve_output_collinear: true,
-        ..OverlayOptions::ogc()
-    };
+    // i_overlay 4.5.2 looped forever in its OGC shape extraction with
+    // `preserve_input_collinear` on some valid inputs (on pbldg, a 7-vertex
+    // building against a 23,881-vertex raster-traced parcel ran for hours);
+    // 9.2.1 returns in milliseconds.
+    let mut options = OverlayOptions::ogc();
+    options.preserve_input_collinear = true;
+    options.preserve_output_collinear = true;
     let shapes =
         FloatOverlay::with_subj_and_clip_custom(&paths(x), &paths(y), options, Default::default())
             .overlay(rule, FillRule::EvenOdd);
@@ -939,11 +943,26 @@ const CROSSING_STEPS_PER_SIN: f64 = 2.0;
 /// Cap on how far (in grid steps) a vertex is moved onto a crossing.
 const CROSSING_MAX_STEPS: f64 = 64.0;
 
+/// Euclidean distance from `c` to segment `l`.
+fn point_segment_distance(c: Coord, l: Line) -> f64 {
+    let d = l.delta();
+    let len2 = d.x * d.x + d.y * d.y;
+    let t = if len2 > 0.0 {
+        (((c.x - l.start.x) * d.x + (c.y - l.start.y) * d.y) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (l.start.x + t * d.x - c.x).hypot(l.start.y + t * d.y - c.y)
+}
+
 /// Makes overlay output vertices independent of i_overlay's grid.
 ///
-/// i_overlay converts coordinates to integers with a power-of-two scale of
-/// `2^(29 - round(log2(half_extent)))`, centred on the inputs' bounding box
-/// (`i_float::adapter::FloatPointAdapter`), so every input vertex moves by up
+/// i_overlay converts coordinates to integers with a power-of-two scale,
+/// centred on the inputs' bounding box (`i_float::adapter::FloatPointAdapter`):
+/// `2^(29 - ceil(log2(radius)))` in i_overlay 9 (the boolean ops here) and
+/// `2^(29 - round(log2(half_extent)))` in 4.5 (geo's own ops, e.g.
+/// `unary_union`, whose results are snapped too). `step` is the coarser of the
+/// two, so it bounds either engine's grid. Every input vertex moves by up
 /// to half a grid step — ~3 mm for a parcel intersected with a 60°-wide
 /// region — and every crossing lands on the nearest grid point. Each output
 /// vertex is replaced by:
@@ -987,9 +1006,12 @@ impl<'a> Snapper<'a> {
         };
         let half = rect.map_or(0.0, |r| r.width().max(r.height()) / 2.0);
         let step = if half.is_finite() && half > 0.0 {
-            // i_float rounds log2 half away from zero (`FloatNumber::to_i32`).
-            let log2 = half.log2();
-            2f64.powi((log2 + 0.5f64.copysign(log2)) as i32 - 29)
+            // i_float 5 (i_overlay 9) uses ceil(log2 radius), measuring from a
+            // rounded centre that can make the radius a hair larger than
+            // `half`; i_float 1.x (i_overlay 4.5) rounds log2, which is never
+            // larger.
+            let ceil = (half * (1.0 + 1e-12)).log2().ceil() as i32;
+            2f64.powi(ceil - 29)
         } else {
             0.0
         };
@@ -1038,11 +1060,20 @@ impl<'a> Snapper<'a> {
                 y: c.y + reach,
             },
         );
+        // A crossing accepted below lies within `reach` of `c` and on both of
+        // its segments, so both pass within `reach` of `c`. The R-tree matches
+        // bounding boxes, and a long diagonal segment's box covers points far
+        // from the segment: on dense inputs thousands of such boxes met the
+        // probe and the pair loop below went O(k^2) per vertex (on pbldg one
+        // cut pair ran for hours). Dropping segments farther than `2 * reach`
+        // (slack for rounding) removes only pairs that are never accepted, so
+        // the result is unchanged.
         let near: Vec<Line> = self
             .segs
             .iter()
             .flatten()
             .flat_map(|s| s.get().near(probe).copied())
+            .filter(|l| point_segment_distance(c, *l) <= 2.0 * reach)
             .collect();
         let mut best: Option<(f64, Coord)> = None;
         for (i, &p) in near.iter().enumerate() {
@@ -1115,6 +1146,59 @@ mod tests {
 
     fn run(a: Geometry, b: Geometry, op: OverlayOp) -> Geometry {
         overlay(&Prepared::new(a), &Prepared::new(b), op).unwrap()
+    }
+
+    #[test]
+    fn point_segment_distance_uses_the_segment_not_its_box() {
+        let diagonal = Line::new(Coord { x: 0.0, y: 0.0 }, Coord { x: 10.0, y: 10.0 });
+        // Inside the segment's bounding box but far from the segment itself.
+        assert!((point_segment_distance(Coord { x: 0.0, y: 10.0 }, diagonal) - 50f64.sqrt()).abs() < 1e-12);
+        assert_eq!(point_segment_distance(Coord { x: 5.0, y: 5.0 }, diagonal), 0.0);
+        // Past an end: distance to that end.
+        assert_eq!(point_segment_distance(Coord { x: 13.0, y: 14.0 }, diagonal), 5.0);
+        let point = Line::new(Coord { x: 1.0, y: 1.0 }, Coord { x: 1.0, y: 1.0 });
+        assert_eq!(point_segment_distance(Coord { x: 4.0, y: 5.0 }, point), 5.0);
+    }
+
+    #[test]
+    fn snapper_step_is_i_overlays_grid_step() {
+        // Half-extents with log2 fractions on both sides of .5, above and below 1.
+        for half in [0.0087, 0.3, 1.7, 5.1, 18.4, 25.0, 40.0, 100.0] {
+            let a: Polygon = polygon![
+                (x: 0.0, y: 0.0), (x: 2.0 * half, y: 0.0),
+                (x: 2.0 * half, y: 1.3123456789 * half), (x: 0.0, y: 1.3123456789 * half),
+            ];
+            let b: Polygon = polygon![
+                (x: 0.1234567891 * half, y: 0.3333333 * half),
+                (x: 1.7123456 * half, y: 0.77777777 * half),
+                (x: half + 0.017 * half, y: 2.0 * half),
+            ];
+            let (a, b) = (MultiPolygon::new(vec![a]), MultiPolygon::new(vec![b]));
+            let out = boolean_op(&a, &b, OverlayOp::Intersection);
+            let rect = Rect::new(
+                Coord { x: 0.0, y: 0.0 },
+                Coord {
+                    x: 2.0 * half,
+                    y: 2.0 * half,
+                },
+            );
+            let step = Snapper::new(Some(rect), None, [&[], &[]], [None, None]).step;
+            let on_grid = |step: f64| {
+                out.iter().flat_map(|p| p.exterior().0.iter()).all(|c| {
+                    [c.x - half, c.y - half].iter().all(|d| {
+                        let q = d / step;
+                        (q - q.round()).abs() < 1e-3
+                    })
+                })
+            };
+            assert!(on_grid(step), "half {half}: output is off the step grid");
+            // A step twice as coarse would make the output off-grid, so `step` is
+            // i_overlay's step and not a finer one.
+            assert!(
+                !on_grid(2.0 * step),
+                "half {half}: step is finer than i_overlay's"
+            );
+        }
     }
 
     #[test]

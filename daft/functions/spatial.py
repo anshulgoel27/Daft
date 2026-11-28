@@ -437,6 +437,38 @@ def st_envelope(geom: Expression) -> Expression:
     return Expression._call_builtin_scalar_fn("st_envelope", geom)
 
 
+def st_boundary(geom: Expression) -> Expression:
+    """Return the rings of a polygon as a MultiLineString.
+
+    Each polygon's exterior ring comes first, followed by its interior rings
+    (holes); a ``MULTIPOLYGON`` gives every ring of every part, in order. The
+    result is always a ``MULTILINESTRING``, even for a polygon with one ring.
+
+    Use it to measure how far a point inside a polygon is from the polygon's
+    nearest edge, holes included. ``st_distance(point, polygon)`` is 0 for an
+    inside point; ``st_distance(point, st_boundary(polygon), use_spheroid=True)``
+    is the distance in metres to the nearest edge, and 0 for a point on an edge.
+
+    Args:
+        geom: A column of type ``DataType.geometry()`` or ``DataType.binary()`` (WKB).
+
+    Returns:
+        Geometry column of ``MULTILINESTRING`` values. Null for null,
+        unparseable, empty or non-polygonal input, and for a polygon with a
+        ring that is open, has fewer than 4 positions, or has a non-finite
+        coordinate. Self-intersection is not checked, as in PostGIS
+        ``ST_Boundary``.
+
+    Examples:
+        >>> import daft
+        >>> from daft.functions import st_astext, st_boundary, st_geomfromtext
+        >>> df = daft.from_pydict({"wkt": ["POLYGON((0 0,4 0,4 4,0 4,0 0),(1 1,2 1,2 2,1 1))"]})
+        >>> df.select(st_astext(st_boundary(st_geomfromtext(df["wkt"]))).alias("b")).to_pydict()
+        {'b': ['MULTILINESTRING((0 0,4 0,4 4,0 4,0 0),(1 1,2 1,2 2,1 1))']}
+    """
+    return Expression._call_builtin_scalar_fn("st_boundary", geom)
+
+
 def st_convexhull(geom: Expression) -> Expression:
     """Return the convex hull of a geometry as a Polygon.
 
