@@ -29,7 +29,7 @@ coalesce(*args: Expression) -> Expression
 Returns the first non-null value in a list of expressions. If all inputs are null, returns null.
 
 Args:
-    *args: Two or more expressions to coalesce
+    *args: One or more expressions to coalesce
 
 Returns:
     Expression: Expression containing first non-null value encountered when evaluating arguments in order
@@ -163,6 +163,37 @@ The behavior depends on the input type:
 
 Returns:
     Expression (UInt64 Expression): an expression with the length
+
+## map
+
+```python
+map(*entries: Expression) -> Expression
+```
+
+Constructs a map from alternating key/value expressions.
+
+This follows Spark-style map construction semantics and matches ``daft.sql``:
+``map('street', col('address'), 'city', col('city'))``.
+
+Args:
+    *entries: Alternating key and value expressions.
+
+Returns:
+    Expression: A ``Map[key_dtype: value_dtype]`` expression.
+
+Raises:
+    ValueError: If no entries are provided, if entries are not alternating key/value pairs,
+        or if any key position is not a string literal.
+
+## map_extract
+
+```python
+map_extract(expr: Expression, key: Expression) -> Expression
+```
+
+Alias for :func:`daft.functions.map_get`.
+
+This matches SQL naming where both ``map_get`` and ``map_extract`` are supported.
 
 ## map_get
 

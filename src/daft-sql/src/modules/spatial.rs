@@ -5,7 +5,7 @@ use daft_dsl::{
     lit, ExprRef,
 };
 use daft_geo::{
-    StArea, StAsText, StBbox, StBuffer, StCentroid, StContains, StConvexHull, StCoveredBy,
+    StArea, StAsText, StBbox, StBoundary, StBuffer, StCentroid, StContains, StConvexHull, StCoveredBy,
     StCovers, StCrosses, StDifference, StDisjoint, StDistance, StDump, StDumpRings, StDwithin,
     StEnvelope, StEquals, StGeoJsonFromGeom, StGeohash, StGeomFromGeoJson, StGeomFromText,
     StGeometryType, StIntersection, StIntersects, StIsValid, StLength, StMakeLine, StMakeValid,
@@ -67,6 +67,7 @@ impl SQLModule for SQLModuleSpatial {
         parent.add_fn("st_point", SQLStPoint);
         parent.add_fn("st_makeline", SQLSpatialBinary(Arc::new(StMakeLine)));
         parent.add_fn("st_envelope", SQLSpatialUnary(Arc::new(StEnvelope)));
+        parent.add_fn("st_boundary", SQLSpatialUnary(Arc::new(StBoundary)));
         parent.add_fn("st_convexhull", SQLSpatialUnary(Arc::new(StConvexHull)));
         parent.add_fn("st_simplify", SQLStSimplify);
         parent.add_fn("st_dwithin", SQLStDwithin);
